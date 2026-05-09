@@ -1,0 +1,55 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  v2312                                 |
+|   \\  /    A nd           | Web:      www.OpenFOAM.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       volScalarField;
+    object      p;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+// 단위 셀 모드: 압력장 (운동압력 p/rho, 단위: m^2/s^2)
+
+dimensions      [0 2 -2 0 0 0 0];
+
+internalField   uniform 0;
+
+boundaryField
+{
+    xMin
+    {
+        type            cyclic;
+    }
+    xMax
+    {
+        type            cyclic;
+    }
+    yMin
+    {
+        type            cyclic;
+    }
+    yMax
+    {
+        type            cyclic;
+    }
+    zMin
+    {
+        type            fixedValue;
+        value           uniform 0;
+    }
+    zMax
+    {
+        type            zeroGradient;
+    }
+    netSurface
+    {
+        type            zeroGradient;
+    }
+}
+
+// ************************************************************************* //

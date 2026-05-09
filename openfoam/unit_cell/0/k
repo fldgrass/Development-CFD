@@ -1,0 +1,58 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  v2312                                 |
+|   \\  /    A nd           | Web:      www.OpenFOAM.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       volScalarField;
+    object      k;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+// 난류 운동 에너지 k
+// k = 1.5 * (I * U)^2  여기서 I = 난류 강도(turbulence intensity) = 0.05
+
+dimensions      [0 2 -2 0 0 0 0];
+
+internalField   uniform 3.75e-3;   // k = 1.5*(0.05*1.0)^2 = 3.75e-3 m^2/s^2
+
+boundaryField
+{
+    xMin
+    {
+        type            cyclic;
+    }
+    xMax
+    {
+        type            cyclic;
+    }
+    yMin
+    {
+        type            cyclic;
+    }
+    yMax
+    {
+        type            cyclic;
+    }
+    zMin
+    {
+        type            turbulentIntensityKineticEnergyInlet;
+        intensity       0.05;
+        value           uniform 3.75e-3;
+    }
+    zMax
+    {
+        type            zeroGradient;
+    }
+    netSurface
+    {
+        type            kqRWallFunction;
+        value           uniform 3.75e-3;
+    }
+}
+
+// ************************************************************************* //

@@ -1,0 +1,59 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  v2312                                 |
+|   \\  /    A nd           | Web:      www.OpenFOAM.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       volScalarField;
+    object      omega;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+// 비소산율 omega (specific dissipation rate)
+// omega = k^0.5 / (Cmu^0.25 * L)
+// L = 격자 특성 길이 (단위 셀 크기, 약 0.02m 가정)
+
+dimensions      [0 0 -1 0 0 0 0];
+
+internalField   uniform 3.45;   // omega = sqrt(3.75e-3)/(0.09^0.25 * 0.02)
+
+boundaryField
+{
+    xMin
+    {
+        type            cyclic;
+    }
+    xMax
+    {
+        type            cyclic;
+    }
+    yMin
+    {
+        type            cyclic;
+    }
+    yMax
+    {
+        type            cyclic;
+    }
+    zMin
+    {
+        type            turbulentMixingLengthFrequencyInlet;
+        mixingLength    0.02;
+        value           uniform 3.45;
+    }
+    zMax
+    {
+        type            zeroGradient;
+    }
+    netSurface
+    {
+        type            omegaWallFunction;
+        value           uniform 3.45;
+    }
+}
+
+// ************************************************************************* //

@@ -1,0 +1,61 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  v2312                                 |
+|   \\  /    A nd           | Web:      www.OpenFOAM.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       volVectorField;
+    object      U;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+// 단위 셀 모드: 입구 속도 벡터 (유속/영각 조합으로 자동 계산됨)
+// U = (U*cos(AoA), 0, U*sin(AoA))
+// 이 파일은 run_unit_cell.sh 스크립트에 의해 자동으로 수정됩니다.
+
+dimensions      [0 1 -1 0 0 0 0];
+
+internalField   uniform (1.0 0 0);  // 기본값: 1.0 m/s, 0도 영각
+
+boundaryField
+{
+    // ─── 주기 경계 조건 (Cyclic) ───────────────────────────────────────
+    // 그물 단위 셀의 반복 구조를 표현하는 핵심 설정
+    xMin
+    {
+        type            cyclic;
+    }
+    xMax
+    {
+        type            cyclic;
+    }
+    yMin
+    {
+        type            cyclic;
+    }
+    yMax
+    {
+        type            cyclic;
+    }
+    // ─── 유입/유출 경계 (유동 방향) ────────────────────────────────────
+    zMin
+    {
+        type            fixedValue;
+        value           uniform (1.0 0 0);
+    }
+    zMax
+    {
+        type            zeroGradient;
+    }
+    // ─── STL 그물 표면 ──────────────────────────────────────────────────
+    netSurface
+    {
+        type            noSlip;
+    }
+}
+
+// ************************************************************************* //

@@ -1,0 +1,65 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  v2312                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       volVectorField;
+    object      U;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+// 전체 구조 모드: 원통형 가두리 유동 해석
+// 입구(Inlet): 균일 유속 / 출구(Outlet): zeroGradient / 벽(Wall): noSlip
+
+dimensions      [0 1 -1 0 0 0 0];
+
+internalField   uniform (1.0 0 0);
+
+boundaryField
+{
+    // ─── 입구 경계 (Inlet) ─────────────────────────────────────────────
+    inlet
+    {
+        type            fixedValue;
+        value           uniform (1.0 0 0);   // Python에서 자동 교체
+    }
+
+    // ─── 출구 경계 (Outlet) ────────────────────────────────────────────
+    outlet
+    {
+        type            inletOutlet;
+        inletValue      uniform (0 0 0);
+        value           uniform (1.0 0 0);
+    }
+
+    // ─── 상하좌우 외부 경계 (대칭/자유 슬립) ──────────────────────────
+    top
+    {
+        type            slip;
+    }
+    bottom
+    {
+        type            slip;
+    }
+    sides
+    {
+        type            slip;
+    }
+
+    // ─── 가두리 림(Rim) 표면 ──────────────────────────────────────────
+    cageSurface
+    {
+        type            noSlip;
+    }
+
+    // ─── 그물 표면 ─────────────────────────────────────────────────────
+    netSurface
+    {
+        type            noSlip;
+    }
+}
+
+// ************************************************************************* //

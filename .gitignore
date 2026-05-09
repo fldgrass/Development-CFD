@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# OpenFOAM run directories (large result files)
+results/unit_cell/*/[0-9]*/
+results/unit_cell/*/processor*/
+results/unit_cell/*/constant/polyMesh/
+results/full_structure/*/[0-9]*/
+results/full_structure/*/processor*/
+results/full_structure/*/constant/polyMesh/
+
+# Logs
+logs/*.log
+
+# Uploaded STL files
+stl_uploads/*.stl
+
+# Temporary visualisation output
+/tmp/cfd_viz/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Streamlit state
+.streamlit/
+
+# Keep result CSV files and empty dirs
+!results/unit_cell/.gitkeep
+!results/full_structure/.gitkeep
+!stl_uploads/.gitkeep
+!logs/.gitkeep

@@ -1,0 +1,114 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  v2312                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      controlDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+application     simpleFoam;
+
+startFrom       startTime;
+startTime       0;
+stopAt          endTime;
+endTime         3000;
+
+deltaT          1;
+writeControl    timeStep;
+writeInterval   100;
+purgeWrite      5;
+
+writeFormat     binary;
+writePrecision  8;
+writeCompression off;
+
+timeFormat      general;
+timePrecision   6;
+
+runTimeModifiable true;
+
+functions
+{
+    // ─── 전체 가두리 항력/양력 계산 ──────────────────────────────────
+    forceCoeffs_cage
+    {
+        type            forceCoeffs;
+        libs            ("libforces.so");
+        writeControl    timeStep;
+        writeInterval   10;
+        log             true;
+
+        patches         (cageSurface netSurface);
+        rho             rhoInf;
+        rhoInf          1025;
+
+        liftDir         (0 0 1);
+        dragDir         (1 0 0);
+        CofR            (0 0 0);
+
+        magUInf         1.0;
+        lRef            10.0;      // 가두리 직경 [m] - Python에서 교체
+        Aref            50.0;      // 가두리 단면적 [m^2] - Python에서 교체
+    }
+
+    // ─── 유속 감쇠 측정 (가두리 전/후 샘플링 라인) ────────────────────
+    velocitySampling
+    {
+        type            sets;
+        libs            ("libsampling.so");
+        writeControl    timeStep;
+        writeInterval   100;
+
+        interpolationScheme cellPoint;
+        setFormat       csv;
+
+        fields  (U p k);
+
+        sets
+        {
+            // 가두리 중심선 (유동 방향)
+            centerLine
+            {
+                type        lineUniform;
+                axis        x;
+                start       (-30 0 -2.5);
+                end         ( 70 0 -2.5);
+                nPoints     100;
+            }
+            // 가두리 후방 웨이크 단면
+            wake_1D
+            {
+                type        lineUniform;
+                axis        y;
+                start       (15 -15 -2.5);
+                end         (15  15 -2.5);
+                nPoints     60;
+            }
+            wake_3D
+            {
+                type        lineUniform;
+                axis        y;
+                start       (35 -15 -2.5);
+                end         (35  15 -2.5);
+                nPoints     60;
+            }
+        }
+    }
+
+    residuals
+    {
+        type            solverInfo;
+        libs            ("libutilityFunctionObjects.so");
+        fields          (U p k omega);
+        writeControl    timeStep;
+        writeInterval   1;
+    }
+}
+
+// ************************************************************************* //

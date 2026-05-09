@@ -1,0 +1,143 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  v2312                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      snappyHexMeshDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+castellatedMesh true;
+snap            true;
+addLayers       true;
+
+geometry
+{
+    cageSurface.stl
+    {
+        type    triSurfaceMesh;
+        name    cageSurface;
+    }
+    netSurface.stl
+    {
+        type    triSurfaceMesh;
+        name    netSurface;
+    }
+    // 가두리 주변 정밀화 박스 (rimBox)
+    rimBox
+    {
+        type    searchableBox;
+        min     (-6 -6 -6);   // Python에서 가두리 크기에 맞게 자동 교체
+        max     ( 6  6  1);
+    }
+}
+
+castellatedMeshControls
+{
+    maxLocalCells       5000000;
+    maxGlobalCells      20000000;
+    minRefinementCells  10;
+    maxLoadUnbalance    0.10;
+    nCellsBetweenLevels 3;
+
+    features
+    (
+        { file "cageSurface.eMesh"; level 2; }
+        { file "netSurface.eMesh";  level 3; }
+    );
+
+    refinementSurfaces
+    {
+        cageSurface
+        {
+            level (2 3);
+            patchInfo { type wall; inGroups (wall); }
+        }
+        netSurface
+        {
+            level (3 5);
+            patchInfo { type wall; inGroups (wall); }
+        }
+    }
+
+    refinementRegions
+    {
+        rimBox
+        {
+            mode    inside;
+            levels  ((1e10 2));
+        }
+        cageSurface
+        {
+            mode    inside;
+            levels  ((1e10 3));
+        }
+    }
+
+    locationInMesh (0 0 -2.5);   // 가두리 내부 기준점
+    allowFreeStandingZoneFaces true;
+}
+
+snapControls
+{
+    nSmoothPatch        3;
+    tolerance           2.0;
+    nSolveIter          30;
+    nRelaxIter          5;
+    nFeatureSnapIter    10;
+    implicitFeatureSnap false;
+    explicitFeatureSnap true;
+    multiRegionFeatureSnap false;
+}
+
+addLayersControls
+{
+    relativeSizes true;
+    layers
+    {
+        cageSurface { nSurfaceLayers 3; }
+        netSurface  { nSurfaceLayers 3; }
+    }
+    expansionRatio          1.2;
+    finalLayerThickness     0.3;
+    minThickness            0.1;
+    nGrow                   0;
+    featureAngle            60;
+    nRelaxIter              3;
+    nSmoothSurfaceNormals   1;
+    nSmoothNormals          3;
+    nSmoothThickness        10;
+    maxFaceThicknessRatio   0.5;
+    maxThicknessToMedialRatio 0.3;
+    minMedialAxisAngle      90;
+    nBufferCellsNoExtrude   0;
+    nLayerIter              50;
+}
+
+meshQualityControls
+{
+    maxNonOrtho             65;
+    maxBoundarySkewness     20;
+    maxInternalSkewness     4;
+    maxConcave              80;
+    minVol                  1e-13;
+    minTetQuality           1e-15;
+    minArea                 -1;
+    minTwist                0.02;
+    minDeterminant          0.001;
+    minFaceWeight           0.05;
+    minVolRatio             0.01;
+    minTriangleTwist        -1;
+    nSmoothScale            4;
+    errorReduction          0.75;
+}
+
+writeFlags ( scalarLevels meshQuality );
+mergeTolerance 1e-6;
+
+// ************************************************************************* //
