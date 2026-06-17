@@ -23,6 +23,17 @@ from typing import Optional, Dict, List
 import streamlit as st
 from streamlit import session_state as ss
 
+# 백그라운드 스레드에서 Streamlit session_state 접근을 가능하게 하는 컨텍스트 API.
+# Streamlit 버전에 따라 경로가 다를 수 있어 예외 처리로 안전하게 import.
+try:
+    from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+except Exception:  # pragma: no cover - 구버전 호환
+    try:
+        from streamlit.scriptrunner import add_script_run_ctx, get_script_run_ctx
+    except Exception:
+        add_script_run_ctx = None
+        get_script_run_ctx = None
+
 # ─── 경로 설정 ────────────────────────────────────────────────────────────
 APP_DIR  = Path(__file__).resolve().parent
 sys.path.insert(0, str(APP_DIR / "modules"))
@@ -935,6 +946,11 @@ def _start_single_analysis(
             add_log(f"❌ 오류: {e}")
 
     thread = threading.Thread(target=_run, daemon=True)
+    # 백그라운드 스레드에서도 Streamlit session_state(ss)에 접근할 수 있도록
+    # 현재 스크립트 실행 컨텍스트를 스레드에 부착한다. (이 호출이 없으면
+    # 스레드 내부의 ss 접근이 NoSessionContext로 실패해 해석이 조용히 멈춘다)
+    if add_script_run_ctx is not None:
+        add_script_run_ctx(thread)
     ss.job_thread = thread
     thread.start()
     st.rerun()
@@ -982,6 +998,10 @@ def _start_batch_analysis(mode, speeds, angles, csv_path, n_cores, rho, ti):
             add_log(f"❌ 배치 오류: {e}")
 
     thread = threading.Thread(target=_run, daemon=True)
+    # 백그라운드 스레드에서도 Streamlit session_state(ss)에 접근할 수 있도록
+    # 현재 스크립트 실행 컨텍스트를 스레드에 부착한다.
+    if add_script_run_ctx is not None:
+        add_script_run_ctx(thread)
     ss.job_thread = thread
     thread.start()
     st.rerun()
