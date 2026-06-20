@@ -14,7 +14,7 @@ FoamFile
 
 castellatedMesh true;
 snap            true;
-addLayers       true;
+addLayers       false;  // 그물망 와이어가 도메인 경계에 근접 시 getFaceOrder FATAL ERROR 발생 — 비활성화
 
 geometry
 {
