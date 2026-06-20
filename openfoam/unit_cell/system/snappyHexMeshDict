@@ -33,7 +33,7 @@ castellatedMeshControls
     maxLocalCells       2000000;
     maxGlobalCells      10000000;
     minRefinementCells  10;
-    maxLoadUnbalance    0.10;
+    maxLoadUnbalance    -1;     // -1 = balance 비활성화 (cyclic+소형도메인 segfault 방지)
     nCellsBetweenLevels 3;
 
     features
