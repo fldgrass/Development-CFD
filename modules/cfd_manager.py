@@ -395,7 +395,8 @@ class OpenFOAMRunner:
     def _of_cmd(self, cmd: str) -> str:
         bashrc = self.find_openfoam_bashrc()
         if bashrc:
-            return f"source {bashrc} && {cmd}"
+            # bash -c로 명시적 실행 (shell=True 환경에서도 확실히 소스 적용)
+            return f'bash -c "source {bashrc} && {cmd}"'
         return cmd  # 이미 PATH에 포함된 경우
 
     # ─── 단계별 실행 메서드 ────────────────────────────────────────────────
@@ -467,7 +468,8 @@ class OpenFOAMRunner:
 
         try:
             self._proc = subprocess.Popen(
-                full_cmd, shell=True, cwd=str(self.case_dir),
+                full_cmd, shell=True, executable="/bin/bash",
+                cwd=str(self.case_dir),
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1,
                 env={**os.environ, "MPI_NUM_PROCS": str(self.n_cores)}

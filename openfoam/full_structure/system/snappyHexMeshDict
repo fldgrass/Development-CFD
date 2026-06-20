@@ -18,15 +18,18 @@ addLayers       true;
 
 geometry
 {
+    // scale 0.001: Rhino3D에서 mm 단위로 내보낸 STL을 m으로 변환
     cageSurface.stl
     {
         type    triSurfaceMesh;
         name    cageSurface;
+        scale   0.001;
     }
     netSurface.stl
     {
         type    triSurfaceMesh;
         name    netSurface;
+        scale   0.001;
     }
     // 가두리 주변 정밀화 박스 (rimBox)
     rimBox
@@ -78,6 +81,8 @@ castellatedMeshControls
             levels  ((1e10 3));
         }
     }
+
+    resolveFeatureAngle 30;
 
     locationInMesh (0 0 -2.5);   // 가두리 내부 기준점
     allowFreeStandingZoneFaces true;
@@ -137,7 +142,7 @@ meshQualityControls
     errorReduction          0.75;
 }
 
-writeFlags ( scalarLevels meshQuality );
+writeFlags ( scalarLevels );
 mergeTolerance 1e-6;
 
 // ************************************************************************* //

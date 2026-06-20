@@ -23,6 +23,17 @@ from typing import Optional, Dict, List
 import streamlit as st
 from streamlit import session_state as ss
 
+# 백그라운드 스레드에서 Streamlit session_state 접근을 가능하게 하는 컨텍스트 API.
+# Streamlit 버전에 따라 경로가 다를 수 있어 예외 처리로 안전하게 import.
+try:
+    from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+except Exception:  # pragma: no cover - 구버전 호환
+    try:
+        from streamlit.scriptrunner import add_script_run_ctx, get_script_run_ctx
+    except Exception:
+        add_script_run_ctx = None
+        get_script_run_ctx = None
+
 # ─── 경로 설정 ────────────────────────────────────────────────────────────
 APP_DIR  = Path(__file__).resolve().parent
 sys.path.insert(0, str(APP_DIR / "modules"))
@@ -282,6 +293,168 @@ elif ss.job_status == "error":
 st.divider()
 
 # ─── 탭 구성 ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _start_single_analysis(
+    mode, speed, angle,
+    cell_size, cage_d, cage_h,
+    end_time, n_cores, rho, ti
+):
+    """단일 해석 케이스 실행 (백그라운드 스레드)"""
+    if ss.job_status == "running":
+        st.warning("이미 해석이 실행 중입니다.")
+        return
+
+    if not check_openfoam():
+        st.error("❌ OpenFOAM이 설치되지 않았습니다. 설치 후 다시 시도하세요.")
+        return
+
+    stl_net  = ss.stl_net_path
+    stl_cage = ss.stl_cage_path
+
+    if mode == "unit_cell" and not stl_net:
+        st.error("❌ 그물 STL 파일을 먼저 업로드하세요.")
+        return
+
+    set_status("running", "케이스 준비 중...")
+    ss.progress   = 0
+    ss.log_lines  = []
+    add_log(f"해석 시작: 모드={mode}, U={speed}m/s, α={angle}°")
+
+    # 케이스 디렉토리 생성
+    case_name = f"{mode}_U{speed:.2f}_A{angle:.1f}_{datetime.now():%H%M%S}"
+    case_dir  = RESULTS_DIR / mode / case_name
+    ss.last_result_dir = str(case_dir)
+
+    def _run():
+        try:
+            # 케이스 빌드
+            if mode == "unit_cell":
+                builder = UnitCellCaseBuilder(
+                    case_dir=case_dir,
+                    stl_path=stl_net,
+                    speed=speed, angle_deg=angle,
+                    cell_size=cell_size or 0.02,
+                    n_cores=n_cores
+                )
+            else:
+                builder = FullStructureCaseBuilder(
+                    case_dir=case_dir,
+                    cage_stl=stl_cage,
+                    net_stl=stl_net,
+                    speed=speed, angle_deg=angle,
+                    cage_diameter=cage_d or 10.0,
+                    cage_depth=cage_h or 5.0,
+                    n_cores=n_cores
+                )
+            builder.build()
+            add_log("✅ 케이스 빌드 완료")
+
+            # 해석 실행
+            runner = OpenFOAMRunner(
+                case_dir=case_dir,
+                n_cores=n_cores,
+                progress_cb=lambda p, s, e: (
+                    setattr(ss, "progress", p),
+                    setattr(ss, "current_step", f"simpleFoam: {s}/{e}")
+                ),
+                log_cb=add_log
+            )
+            ss.job_runner = runner
+
+            runner.run_blockMesh()
+            set_status("running", "snappyHexMesh 실행 중...")
+            runner.run_surfaceFeatureExtract()
+            runner.run_snappyHexMesh()
+            set_status("running", "CFD 해석 중...")
+            runner.run_solver(end_time=end_time)
+            runner.run_reconstructPar()
+
+            # 결과 추출
+            extractor = ResultExtractor(case_dir, speed, angle, rho)
+            csv_out   = RESULTS_DIR / mode / f"results_{mode}.csv"
+            extractor.save_csv(csv_out)
+            ss.results_csv = str(csv_out)
+
+            set_status("done", "해석 완료!")
+            add_log(f"✅ 해석 완료! 결과: {csv_out}")
+
+        except Exception as e:
+            set_status("error", str(e))
+            add_log(f"❌ 오류: {e}")
+
+    thread = threading.Thread(target=_run, daemon=True)
+    # 백그라운드 스레드에서도 Streamlit session_state(ss)에 접근할 수 있도록
+    # 현재 스크립트 실행 컨텍스트를 스레드에 부착한다. (이 호출이 없으면
+    # 스레드 내부의 ss 접근이 NoSessionContext로 실패해 해석이 조용히 멈춘다)
+    if add_script_run_ctx is not None:
+        add_script_run_ctx(thread)
+    ss.job_thread = thread
+    thread.start()
+    st.rerun()
+
+
+def _start_batch_analysis(mode, speeds, angles, csv_path, n_cores, rho, ti):
+    """배치 해석 실행 (백그라운드 스레드)"""
+    if ss.job_status == "running":
+        st.warning("이미 해석이 실행 중입니다.")
+        return
+
+    stl_paths = {}
+    if ss.stl_net_path:
+        stl_paths["net"] = Path(ss.stl_net_path)
+    if ss.stl_cage_path:
+        stl_paths["cage"] = Path(ss.stl_cage_path)
+
+    set_status("running", "배치 해석 초기화 중...")
+    ss.progress  = 0
+    ss.log_lines = []
+    add_log(f"배치 해석 시작: {len(speeds)*len(angles)}개 케이스")
+
+    manager = BatchAnalysisManager(
+        mode=mode,
+        stl_paths=stl_paths,
+        speeds=speeds,
+        angles=angles,
+        output_csv=csv_path,
+        common_params={"n_cores": n_cores},
+        progress_cb=lambda p, s, e: (
+            setattr(ss, "progress", p),
+            setattr(ss, "current_step", f"케이스 {s}/{e}")
+        ),
+        log_cb=add_log
+    )
+    ss.batch_manager = manager
+
+    def _run():
+        try:
+            manager.run_batch()
+            set_status("done", "배치 해석 완료!")
+            add_log(f"✅ 배치 완료! CSV: {csv_path}")
+        except Exception as e:
+            set_status("error", str(e))
+            add_log(f"❌ 배치 오류: {e}")
+
+    thread = threading.Thread(target=_run, daemon=True)
+    # 백그라운드 스레드에서도 Streamlit session_state(ss)에 접근할 수 있도록
+    # 현재 스크립트 실행 컨텍스트를 스레드에 부착한다.
+    if add_script_run_ctx is not None:
+        add_script_run_ctx(thread)
+    ss.job_thread = thread
+    thread.start()
+    st.rerun()
+
+
+def _stop_analysis():
+    """해석 중지"""
+    if ss.job_runner:
+        ss.job_runner.stop()
+    if ss.batch_manager:
+        ss.batch_manager.stop()
+    set_status("idle", "사용자에 의해 중지됨")
+    add_log("⏹️ 해석 중지됨")
+    st.rerun()
+
 tab_input, tab_batch, tab_monitor, tab_results, tab_help = st.tabs([
     "📂 입력 설정",
     "🔄 배치 해석",
@@ -844,155 +1017,3 @@ MPI 병렬화 → CPU 코어 수에 맞게 자동 설정
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  백엔드 함수 (버튼 핸들러)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _start_single_analysis(
-    mode, speed, angle,
-    cell_size, cage_d, cage_h,
-    end_time, n_cores, rho, ti
-):
-    """단일 해석 케이스 실행 (백그라운드 스레드)"""
-    if ss.job_status == "running":
-        st.warning("이미 해석이 실행 중입니다.")
-        return
-
-    if not check_openfoam():
-        st.error("❌ OpenFOAM이 설치되지 않았습니다. 설치 후 다시 시도하세요.")
-        return
-
-    stl_net  = ss.stl_net_path
-    stl_cage = ss.stl_cage_path
-
-    if mode == "unit_cell" and not stl_net:
-        st.error("❌ 그물 STL 파일을 먼저 업로드하세요.")
-        return
-
-    set_status("running", "케이스 준비 중...")
-    ss.progress   = 0
-    ss.log_lines  = []
-    add_log(f"해석 시작: 모드={mode}, U={speed}m/s, α={angle}°")
-
-    # 케이스 디렉토리 생성
-    case_name = f"{mode}_U{speed:.2f}_A{angle:.1f}_{datetime.now():%H%M%S}"
-    case_dir  = RESULTS_DIR / mode / case_name
-    ss.last_result_dir = str(case_dir)
-
-    def _run():
-        try:
-            # 케이스 빌드
-            if mode == "unit_cell":
-                builder = UnitCellCaseBuilder(
-                    case_dir=case_dir,
-                    stl_path=stl_net,
-                    speed=speed, angle_deg=angle,
-                    cell_size=cell_size or 0.02,
-                    n_cores=n_cores
-                )
-            else:
-                builder = FullStructureCaseBuilder(
-                    case_dir=case_dir,
-                    cage_stl=stl_cage,
-                    net_stl=stl_net,
-                    speed=speed, angle_deg=angle,
-                    cage_diameter=cage_d or 10.0,
-                    cage_depth=cage_h or 5.0,
-                    n_cores=n_cores
-                )
-            builder.build()
-            add_log("✅ 케이스 빌드 완료")
-
-            # 해석 실행
-            runner = OpenFOAMRunner(
-                case_dir=case_dir,
-                n_cores=n_cores,
-                progress_cb=lambda p, s, e: (
-                    setattr(ss, "progress", p),
-                    setattr(ss, "current_step", f"simpleFoam: {s}/{e}")
-                ),
-                log_cb=add_log
-            )
-            ss.job_runner = runner
-
-            runner.run_blockMesh()
-            set_status("running", "snappyHexMesh 실행 중...")
-            runner.run_surfaceFeatureExtract()
-            runner.run_snappyHexMesh()
-            set_status("running", "CFD 해석 중...")
-            runner.run_solver(end_time=end_time)
-            runner.run_reconstructPar()
-
-            # 결과 추출
-            extractor = ResultExtractor(case_dir, speed, angle, rho)
-            csv_out   = RESULTS_DIR / mode / f"results_{mode}.csv"
-            extractor.save_csv(csv_out)
-            ss.results_csv = str(csv_out)
-
-            set_status("done", "해석 완료!")
-            add_log(f"✅ 해석 완료! 결과: {csv_out}")
-
-        except Exception as e:
-            set_status("error", str(e))
-            add_log(f"❌ 오류: {e}")
-
-    thread = threading.Thread(target=_run, daemon=True)
-    ss.job_thread = thread
-    thread.start()
-    st.rerun()
-
-
-def _start_batch_analysis(mode, speeds, angles, csv_path, n_cores, rho, ti):
-    """배치 해석 실행 (백그라운드 스레드)"""
-    if ss.job_status == "running":
-        st.warning("이미 해석이 실행 중입니다.")
-        return
-
-    stl_paths = {}
-    if ss.stl_net_path:
-        stl_paths["net"] = Path(ss.stl_net_path)
-    if ss.stl_cage_path:
-        stl_paths["cage"] = Path(ss.stl_cage_path)
-
-    set_status("running", "배치 해석 초기화 중...")
-    ss.progress  = 0
-    ss.log_lines = []
-    add_log(f"배치 해석 시작: {len(speeds)*len(angles)}개 케이스")
-
-    manager = BatchAnalysisManager(
-        mode=mode,
-        stl_paths=stl_paths,
-        speeds=speeds,
-        angles=angles,
-        output_csv=csv_path,
-        common_params={"n_cores": n_cores},
-        progress_cb=lambda p, s, e: (
-            setattr(ss, "progress", p),
-            setattr(ss, "current_step", f"케이스 {s}/{e}")
-        ),
-        log_cb=add_log
-    )
-    ss.batch_manager = manager
-
-    def _run():
-        try:
-            manager.run_batch()
-            set_status("done", "배치 해석 완료!")
-            add_log(f"✅ 배치 완료! CSV: {csv_path}")
-        except Exception as e:
-            set_status("error", str(e))
-            add_log(f"❌ 배치 오류: {e}")
-
-    thread = threading.Thread(target=_run, daemon=True)
-    ss.job_thread = thread
-    thread.start()
-    st.rerun()
-
-
-def _stop_analysis():
-    """해석 중지"""
-    if ss.job_runner:
-        ss.job_runner.stop()
-    if ss.batch_manager:
-        ss.batch_manager.stop()
-    set_status("idle", "사용자에 의해 중지됨")
-    add_log("⏹️ 해석 중지됨")
-    st.rerun()
