@@ -40,7 +40,7 @@ castellatedMeshControls
     (
         {
             file    "netSurface.eMesh";
-            level   3;
+            level   2;
         }
     );
 
@@ -48,8 +48,8 @@ castellatedMeshControls
     {
         netSurface
         {
-            // 그물발 표면: 레벨 3~5 (직경 대비 충분한 해상도)
-            level (3 5);
+            // 그물발 표면: 레벨 2~3 (3mm 와이어에 0.25mm 셀, ~50만 셀 수준)
+            level (2 3);
             patchInfo
             {
                 type    wall;
@@ -63,7 +63,7 @@ castellatedMeshControls
         netSurface
         {
             mode    inside;
-            levels  ((1e-3 5));  // 그물발 직경 수준 이내 최고 해상도
+            levels  ((2e-3 3));  // 와이어 직경 이내 레벨 3
         }
     }
 
