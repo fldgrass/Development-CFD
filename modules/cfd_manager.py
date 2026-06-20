@@ -425,7 +425,19 @@ class OpenFOAMRunner:
         self._write_surfaceFeatureExtractDict()
         return self._run_step("surfaceFeatureExtract", "표면 피처 추출")
 
+    def _has_cyclic_patches(self) -> bool:
+        """blockMesh 생성 후 boundary 파일에서 cyclic 패치 존재 여부 확인"""
+        boundary = self.case_dir / "constant" / "polyMesh" / "boundary"
+        if boundary.exists():
+            return "cyclic" in boundary.read_text()
+        return False
+
     def run_snappyHexMesh(self) -> bool:
+        if self._has_cyclic_patches():
+            # OpenFOAM v2312 버그: 병렬 snappyHexMesh + cyclic 패치 →
+            # globalIndexAndTransform 충돌(transform sign mismatch) → serial로 우회
+            return self._run_step(
+                "snappyHexMesh -overwrite", "격자 스냅 (snappyHexMesh, 직렬)")
         cmd = f"mpirun --oversubscribe -np {self.n_cores} snappyHexMesh -overwrite -parallel"
         return self._run_step(cmd, "격자 스냅 (snappyHexMesh)", parallel=True,
                               pre_cmd="decomposePar -force")
@@ -436,7 +448,10 @@ class OpenFOAMRunner:
     def run_solver(self, end_time: int = 2000) -> bool:
         """병렬 simpleFoam 실행 + 실시간 잔차 모니터링"""
         cmd = f"mpirun --oversubscribe -np {self.n_cores} simpleFoam -parallel"
+        # cyclic 케이스는 serial snappyHexMesh 후 분할이 안 됐으므로 여기서 decomposePar 실행
+        pre = "decomposePar -force" if self._has_cyclic_patches() else None
         return self._run_step(cmd, "CFD 해석 (simpleFoam)", parallel=True,
+                              pre_cmd=pre,
                               monitor_residuals=True, end_time=end_time)
 
     def run_reconstructPar(self) -> bool:
