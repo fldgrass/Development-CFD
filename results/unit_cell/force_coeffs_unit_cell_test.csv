@@ -1,0 +1,2 @@
+speed_m_s,angle_deg,Cd,Cl,Cm,Fx_N,Fy_N,Fz_N,rho_kg_m3,case_name,timestamp
+1.0,0.0,0.0114061417,2.273729995e-05,-6.305332316999999e-05,nan,nan,nan,1025.0,test_onemesh2,2026-06-21T00:18:13.909306
