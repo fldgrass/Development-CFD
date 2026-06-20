@@ -146,6 +146,8 @@ def init_session():
         "n_cores":            get_cpu_count(),
         "stl_net_path":       None,
         "stl_cage_path":      None,
+        "unit_nx":            1,
+        "unit_ny":            1,
     }
     for k, v in defaults.items():
         if k not in ss:
@@ -298,7 +300,8 @@ st.divider()
 def _start_single_analysis(
     mode, speed, angle,
     cell_size, cage_d, cage_h,
-    end_time, n_cores, rho, ti
+    end_time, n_cores, rho, ti,
+    nx=1, ny=1
 ):
     """단일 해석 케이스 실행 (백그라운드 스레드)"""
     if ss.job_status == "running":
@@ -335,7 +338,8 @@ def _start_single_analysis(
                     stl_path=stl_net,
                     speed=speed, angle_deg=angle,
                     cell_size=cell_size or 0.02,
-                    n_cores=n_cores
+                    n_cores=n_cores,
+                    nx=nx, ny=ny
                 )
             else:
                 builder = FullStructureCaseBuilder(
@@ -362,12 +366,15 @@ def _start_single_analysis(
             )
             ss.job_runner = runner
 
-            runner.run_blockMesh()
+            if not runner.run_blockMesh():
+                raise RuntimeError("blockMesh 실패 — logs/ 폴더의 로그를 확인하세요.")
             set_status("running", "snappyHexMesh 실행 중...")
             runner.run_surfaceFeatureExtract()
-            runner.run_snappyHexMesh()
+            if not runner.run_snappyHexMesh():
+                raise RuntimeError("snappyHexMesh 실패 — logs/ 폴더의 로그를 확인하세요.")
             set_status("running", "CFD 해석 중...")
-            runner.run_solver(end_time=end_time)
+            if not runner.run_solver(end_time=end_time):
+                raise RuntimeError("simpleFoam 실패 — logs/ 폴더의 로그를 확인하세요.")
             runner.run_reconstructPar()
 
             # 결과 추출
@@ -394,7 +401,7 @@ def _start_single_analysis(
     st.rerun()
 
 
-def _start_batch_analysis(mode, speeds, angles, csv_path, n_cores, rho, ti):
+def _start_batch_analysis(mode, speeds, angles, csv_path, n_cores, rho, ti, nx=1, ny=1):
     """배치 해석 실행 (백그라운드 스레드)"""
     if ss.job_status == "running":
         st.warning("이미 해석이 실행 중입니다.")
@@ -417,7 +424,7 @@ def _start_batch_analysis(mode, speeds, angles, csv_path, n_cores, rho, ti):
         speeds=speeds,
         angles=angles,
         output_csv=csv_path,
-        common_params={"n_cores": n_cores},
+        common_params={"n_cores": n_cores, "nx": nx, "ny": ny},
         progress_cb=lambda p, s, e: (
             setattr(ss, "progress", p),
             setattr(ss, "current_step", f"케이스 {s}/{e}")
@@ -551,6 +558,30 @@ with tab_input:
                 f"| Reynolds = {speed_val * cell_size / 1.19e-6:.1f}"
             )
 
+            # 주기 경계조건 반복 수 설정
+            st.markdown("#### 🔁 주기 경계조건 반복 수 (Periodic BC)")
+            col_nx, col_ny = st.columns(2)
+            with col_nx:
+                nx_val = st.number_input(
+                    "X 방향 반복 수 (Nx)",
+                    min_value=1, max_value=10, step=1,
+                    key="unit_nx",
+                    help="STL에 X축(주기) 방향으로 포함된 단위 셀 개수"
+                )
+            with col_ny:
+                ny_val = st.number_input(
+                    "Y 방향 반복 수 (Ny)",
+                    min_value=1, max_value=10, step=1,
+                    key="unit_ny",
+                    help="STL에 Y축(주기) 방향으로 포함된 단위 셀 개수"
+                )
+            domain_x_mm = cell_size * nx_val * 1000
+            domain_y_mm = cell_size * ny_val * 1000
+            st.info(
+                f"📦 **해석 도메인**: {domain_x_mm:.1f} mm (X) × {domain_y_mm:.1f} mm (Y)  "
+                f"| STL에 **{nx_val}×{ny_val} = {nx_val*ny_val}개** 단위 셀 포함 필요"
+            )
+
         else:  # full_structure
             col_a, col_b = st.columns(2)
             with col_a:
@@ -594,6 +625,7 @@ with tab_input:
         }
         if mode == "unit_cell":
             summary_data["단위 셀 크기"] = f"{cell_size*1000:.1f} mm"
+            summary_data["반복 수 (Nx×Ny)"] = f"{ss.unit_nx} × {ss.unit_ny} = {ss.unit_nx*ss.unit_ny}개"
         else:
             summary_data["가두리 직경"] = f"{cage_d:.1f} m"
             summary_data["가두리 수심"] = f"{cage_h:.1f} m"
@@ -635,7 +667,8 @@ with tab_input:
                     cell_size if mode == "unit_cell" else None,
                     cage_d if mode == "full_structure" else None,
                     cage_h if mode == "full_structure" else None,
-                    end_time, n_cores, rho, ti
+                    end_time, n_cores, rho, ti,
+                    nx=ss.unit_nx, ny=ss.unit_ny
                 )
 
         with btn_col2:
@@ -692,6 +725,13 @@ with tab_batch:
     )
     st.dataframe(matrix_df, use_container_width=True)
 
+    # 단위 셀 모드일 때 현재 반복 수 표시
+    if mode == "unit_cell":
+        st.info(
+            f"🔁 **현재 반복 수 설정**: Nx={ss.unit_nx} × Ny={ss.unit_ny} = {ss.unit_nx*ss.unit_ny}개  "
+            f"— 변경하려면 **입력 설정** 탭에서 수정하세요."
+        )
+
     st.divider()
 
     # ─── CSV 저장 경로 ────────────────────────────────────────────────────
@@ -712,7 +752,8 @@ with tab_batch:
             type="primary"
         ):
             _start_batch_analysis(
-                mode, speeds, angles, csv_path, n_cores, rho, ti
+                mode, speeds, angles, csv_path, n_cores, rho, ti,
+                nx=ss.unit_nx, ny=ss.unit_ny
             )
 
     with col_bb2:

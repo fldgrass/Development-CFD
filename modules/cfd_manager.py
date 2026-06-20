@@ -46,13 +46,24 @@ for _d in [RESULTS_DIR / "unit_cell", RESULTS_DIR / "full_structure",
 # ═══════════════════════════════════════════════════════════════════════════
 
 def get_cpu_count() -> int:
-    """사용 가능한 물리 CPU 코어 수 반환"""
+    """물리 CPU 코어 수 반환 (하이퍼스레딩 제외).
+    Open MPI는 기본적으로 물리 코어 수만큼만 슬롯을 허용하므로,
+    논리 코어(HT) 수로 mpirun을 호출하면 'not enough slots' 오류가 발생한다.
+    """
     try:
-        result = subprocess.run(
-            ["nproc", "--all"], capture_output=True, text=True
-        )
-        n = int(result.stdout.strip())
-        # MPI 병렬화를 위해 짝수로 정렬 (최대 32)
+        # /proc/cpuinfo 에서 물리 소켓 × 코어/소켓 계산
+        with open("/proc/cpuinfo") as f:
+            content = f.read()
+        physical_ids = set(re.findall(r"physical id\s*:\s*(\d+)", content))
+        cores = re.findall(r"cpu cores\s*:\s*(\d+)", content)
+        if physical_ids and cores:
+            n = len(physical_ids) * int(cores[0])
+            return min(max(n, 4), 32)
+    except Exception:
+        pass
+    try:
+        # fallback: os.cpu_count() 의 절반 (HT 감안)
+        n = (os.cpu_count() or 8) // 2
         return min(max(n, 4), 32)
     except Exception:
         return 8
@@ -113,12 +124,15 @@ class UnitCellCaseBuilder:
     def __init__(self, case_dir: Path, stl_path: Path,
                  speed: float, angle_deg: float,
                  cell_size: float = 0.02,
-                 n_cores: Optional[int] = None):
+                 n_cores: Optional[int] = None,
+                 nx: int = 1, ny: int = 1):
         self.case_dir   = case_dir
         self.stl_path   = stl_path
         self.speed      = speed
         self.angle_deg  = angle_deg
         self.cell_size  = cell_size
+        self.nx         = max(1, int(nx))
+        self.ny         = max(1, int(ny))
         self.n_cores    = n_cores or get_cpu_count()
         self.Ux, self.Uy, self.Uz = compute_velocity_vector(speed, angle_deg)
         self.turb       = compute_turbulence_params(speed, length_scale=cell_size)
@@ -171,28 +185,30 @@ class UnitCellCaseBuilder:
             fpath.write_text(text)
 
     def _patch_blockMesh(self):
-        """단위 셀 크기에 맞게 blockMeshDict 수정"""
-        half = self.cell_size * 1000 / 2  # mm 단위
-        depth = half * 5
-        cells_xy = max(10, int(20 * self.cell_size / 0.02))
-        cells_z  = max(50, int(100 * self.cell_size / 0.02))
+        """단위 셀 크기·반복 수에 맞게 blockMeshDict 수정"""
+        half_x = self.cell_size * self.nx * 1000 / 2   # mm (X 방향 전체 절반)
+        half_y = self.cell_size * self.ny * 1000 / 2   # mm (Y 방향 전체 절반)
+        depth  = self.cell_size * 1000 / 2 * 5         # mm (단위 셀 기준 Z 깊이)
+        cells_x = max(10, int(20 * self.cell_size * self.nx / 0.02))
+        cells_y = max(10, int(20 * self.cell_size * self.ny / 0.02))
+        cells_z = max(50, int(100 * self.cell_size / 0.02))
 
         bmd = self.case_dir / "system" / "blockMeshDict"
         replace_in_file(bmd, {
-            "(-10 -10 -50)": f"({-half:.1f} {-half:.1f} {-depth:.1f})",
-            "( 10 -10 -50)": f"({half:.1f} {-half:.1f} {-depth:.1f})",
-            "( 10  10 -50)": f"({half:.1f} {half:.1f} {-depth:.1f})",
-            "(-10  10 -50)": f"({-half:.1f} {half:.1f} {-depth:.1f})",
-            "(-10 -10  50)": f"({-half:.1f} {-half:.1f} {depth:.1f})",
-            "( 10 -10  50)": f"({half:.1f} {-half:.1f} {depth:.1f})",
-            "( 10  10  50)": f"({half:.1f} {half:.1f} {depth:.1f})",
-            "(-10  10  50)": f"({-half:.1f} {half:.1f} {depth:.1f})",
-            "(20 20 100)": f"({cells_xy} {cells_xy} {cells_z})",
+            "(-10 -10 -50)": f"({-half_x:.1f} {-half_y:.1f} {-depth:.1f})",
+            "( 10 -10 -50)": f"({half_x:.1f} {-half_y:.1f} {-depth:.1f})",
+            "( 10  10 -50)": f"({half_x:.1f} {half_y:.1f} {-depth:.1f})",
+            "(-10  10 -50)": f"({-half_x:.1f} {half_y:.1f} {-depth:.1f})",
+            "(-10 -10  50)": f"({-half_x:.1f} {-half_y:.1f} {depth:.1f})",
+            "( 10 -10  50)": f"({half_x:.1f} {-half_y:.1f} {depth:.1f})",
+            "( 10  10  50)": f"({half_x:.1f} {half_y:.1f} {depth:.1f})",
+            "(-10  10  50)": f"({-half_x:.1f} {half_y:.1f} {depth:.1f})",
+            "(20 20 100)": f"({cells_x} {cells_y} {cells_z})",
         })
 
     def _patch_controlDict(self):
         """forceCoeffs 기준값 수정"""
-        aref = self.cell_size ** 2
+        aref = self.cell_size ** 2 * self.nx * self.ny  # 전체 도메인 전면 면적
         ctrl = self.case_dir / "system" / "controlDict"
         # 항력 방향 벡터 (유속 방향)
         drag_dir = f"({self.Ux/self.speed:.4f} 0 {self.Uz/self.speed:.4f})" \
@@ -410,7 +426,7 @@ class OpenFOAMRunner:
         return self._run_step("surfaceFeatureExtract", "표면 피처 추출")
 
     def run_snappyHexMesh(self) -> bool:
-        cmd = f"mpirun -np {self.n_cores} snappyHexMesh -overwrite -parallel"
+        cmd = f"mpirun --oversubscribe -np {self.n_cores} snappyHexMesh -overwrite -parallel"
         return self._run_step(cmd, "격자 스냅 (snappyHexMesh)", parallel=True,
                               pre_cmd="decomposePar -force")
 
@@ -419,7 +435,7 @@ class OpenFOAMRunner:
 
     def run_solver(self, end_time: int = 2000) -> bool:
         """병렬 simpleFoam 실행 + 실시간 잔차 모니터링"""
-        cmd = f"mpirun -np {self.n_cores} simpleFoam -parallel"
+        cmd = f"mpirun --oversubscribe -np {self.n_cores} simpleFoam -parallel"
         return self._run_step(cmd, "CFD 해석 (simpleFoam)", parallel=True,
                               monitor_residuals=True, end_time=end_time)
 
@@ -742,7 +758,7 @@ class BatchAnalysisManager:
                         stl_path=self.stl_paths.get("net"),
                         speed=speed, angle_deg=angle,
                         **{k: v for k, v in self.params.items()
-                           if k in ["cell_size", "n_cores"]}
+                           if k in ["cell_size", "n_cores", "nx", "ny"]}
                     )
                 else:
                     builder = FullStructureCaseBuilder(
@@ -766,14 +782,16 @@ class BatchAnalysisManager:
                     ),
                     log_cb=self.log_cb
                 )
-                runner.run_full_workflow()
+                ok = runner.run_full_workflow()
+                if not ok:
+                    raise RuntimeError("워크플로우 실패 — logs/ 폴더 로그 확인")
 
                 # 결과 추출
                 extractor = ResultExtractor(case_dir, speed, angle)
                 extractor.save_csv(self.output_csv)
 
             except Exception as e:
-                self._log(f"❌ 케이스 오류: {e}")
+                self._log(f"❌ 케이스 오류 [{case_name}]: {e}")
 
             self._progress(int((i+1) / total * 100), i+1, total)
 
