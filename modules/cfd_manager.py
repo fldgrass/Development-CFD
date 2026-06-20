@@ -640,11 +640,12 @@ class ResultExtractor:
             cd_vals, cl_vals, cm_vals = [], [], []
             for line in last_lines:
                 parts = line.split()
-                if len(parts) >= 5:
+                # coefficient.dat 컬럼: Time Cd Cd(f) Cd(r) Cl Cl(f) Cl(r) CmPitch ...
+                if len(parts) >= 8:
                     try:
-                        cd_vals.append(float(parts[2]))  # Cd
-                        cl_vals.append(float(parts[3]))  # Cl
-                        cm_vals.append(float(parts[4]))  # Cm
+                        cd_vals.append(float(parts[1]))  # Cd (total)
+                        cl_vals.append(float(parts[4]))  # Cl (total)
+                        cm_vals.append(float(parts[7]))  # CmPitch
                     except (ValueError, IndexError):
                         pass
 
