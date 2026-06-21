@@ -1,0 +1,87 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  v2312                                 |
+|   \\  /    A nd           | Web:      www.OpenFOAM.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      blockMeshDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+// 단위 셀(Unit Cell) 배경 격자
+// 그물발 직경(d) ≈ 1mm, 단위 셀 크기 = 메쉬 사이즈(a)
+// 기본값: a = 20mm, 도메인 = 1셀 x 1셀 x 5셀 (유동 방향 z)
+// Python 스크립트에서 $CELL_SIZE 변수를 치환하여 자동 조정
+
+scale   0.001;   // mm → m 변환
+
+// 단위 셀 크기 (mm 단위, Python에서 교체됨)
+// CELL_SIZE_MM = 20
+// DOMAIN: x[-10,10], y[-10,10], z[-50,50]
+
+vertices
+(
+    (-20.0 -20.0 -50.0)   // 0
+    (20.0 -20.0 -50.0)   // 1
+    (20.0 20.0 -50.0)   // 2
+    (-20.0 20.0 -50.0)   // 3
+    (-20.0 -20.0 50.0)   // 4
+    (20.0 -20.0 50.0)   // 5
+    (20.0 20.0 50.0)   // 6
+    (-20.0 20.0 50.0)   // 7
+);
+
+blocks
+(
+    // nx ny nz 셀 수 (snappyHexMesh용 배경격자, 비교적 거친 격자)
+    hex (0 1 2 3 4 5 6 7) (40 40 100) simpleGrading (1 1 1)
+);
+
+edges ();
+
+boundary
+(
+    zMin
+    {
+        type    patch;
+        faces   ((0 3 2 1));
+    }
+    zMax
+    {
+        type    patch;
+        faces   ((4 5 6 7));
+    }
+    xMin
+    {
+        type    cyclic;
+        neighbourPatch  xMax;
+        faces   ((0 4 7 3));
+    }
+    xMax
+    {
+        type    cyclic;
+        neighbourPatch  xMin;
+        faces   ((1 2 6 5));
+    }
+    yMin
+    {
+        type    cyclic;
+        neighbourPatch  yMax;
+        faces   ((0 1 5 4));
+    }
+    yMax
+    {
+        type    cyclic;
+        neighbourPatch  yMin;
+        faces   ((3 7 6 2));
+    }
+);
+
+mergePatchPairs ();
+
+// ************************************************************************* //
