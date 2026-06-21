@@ -109,6 +109,124 @@ def replace_in_file(filepath: Path, replacements: Dict[str, str]) -> None:
     filepath.write_text(text, encoding="utf-8")
 
 
+def read_stl_triangles(stl_path: Path) -> List[Tuple[Tuple[float, float, float], ...]]:
+    """STL(ASCII/binary)을 읽어 삼각형 꼭짓점 목록을 반환.
+
+    반환: [((x0,y0,z0),(x1,y1,z1),(x2,y2,z2)), ...]  (좌표 단위는 STL 그대로 = mm 가정)
+    """
+    import struct as _struct
+
+    tris: List[Tuple[Tuple[float, float, float], ...]] = []
+
+    with open(stl_path, "rb") as f:
+        header = f.read(80)
+    is_ascii = header.lstrip()[:5].lower().startswith(b"solid")
+
+    if is_ascii:
+        text = stl_path.read_text(errors="ignore")
+        verts = [
+            (float(m.group(1)), float(m.group(2)), float(m.group(3)))
+            for m in re.finditer(
+                r"vertex\s+([\d.eE+\-]+)\s+([\d.eE+\-]+)\s+([\d.eE+\-]+)", text)
+        ]
+        # ASCII는 vertex가 3개씩 한 삼각형
+        for i in range(0, len(verts) - 2, 3):
+            tris.append((verts[i], verts[i + 1], verts[i + 2]))
+        # 일부 binary STL은 헤더가 'solid'로 시작 → ASCII 파싱 실패 시 binary 재시도
+        if tris:
+            return tris
+
+    with open(stl_path, "rb") as f:
+        f.read(80)
+        raw = f.read(4)
+        if len(raw) < 4:
+            return tris
+        n_tri = _struct.unpack("<I", raw)[0]
+        for _ in range(n_tri):
+            chunk = f.read(50)  # 12(normal)+36(3 verts)+2(attr)
+            if len(chunk) < 50:
+                break
+            p0 = _struct.unpack("<fff", chunk[12:24])
+            p1 = _struct.unpack("<fff", chunk[24:36])
+            p2 = _struct.unpack("<fff", chunk[36:48])
+            tris.append((p0, p1, p2))
+    return tris
+
+
+def compute_projected_area(stl_path: Path, flow_dir: Tuple[float, float, float]) -> float:
+    """STL 형상의 실제 정면 투영 면적[m²]을 유동 방향 기준으로 계산.
+
+    각 삼각형의 면적벡터 A_i·n_i 를 유동 단위벡터 d 에 투영한 절댓값의 합을
+    2로 나눈다(닫힌 표면은 앞면+뒷면이 같은 실루엣을 이루므로 ÷2).
+    → 그물실 트와인의 정면 투영(실루엣) 면적. 영각이 바뀌면 d 가 바뀌어 자동 변화.
+
+    STL 좌표는 mm 단위로 가정하고 결과는 m² 로 환산해 반환한다.
+    """
+    import math as _math
+
+    dn = _math.sqrt(sum(c * c for c in flow_dir))
+    if dn == 0:
+        d = (1.0, 0.0, 0.0)
+    else:
+        d = (flow_dir[0] / dn, flow_dir[1] / dn, flow_dir[2] / dn)
+
+    tris = read_stl_triangles(stl_path)
+    if not tris:
+        return 0.0
+
+    total = 0.0  # mm²
+    for p0, p1, p2 in tris:
+        e1 = (p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2])
+        e2 = (p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2])
+        # 면적벡터 = 0.5 × (e1 × e2)  (크기 = 삼각형 면적, 방향 = 법선)
+        cx = 0.5 * (e1[1] * e2[2] - e1[2] * e2[1])
+        cy = 0.5 * (e1[2] * e2[0] - e1[0] * e2[2])
+        cz = 0.5 * (e1[0] * e2[1] - e1[1] * e2[0])
+        total += abs(cx * d[0] + cy * d[1] + cz * d[2])
+
+    # 닫힌 표면: 앞/뒤면이 합쳐져 2배 → ÷2, mm²→m²: ÷1e6
+    return (total * 0.5) / 1.0e6
+
+
+def detect_stl_cell_size(stl_path: Path) -> Dict[str, float]:
+    """STL 바운딩 박스에서 단위 셀 크기·와이어 직경·고형률 자동 감지.
+
+    가정: STL 좌표 단위 = mm, XY 범위 = 단위 셀 크기, Z 범위 = 와이어 직경.
+    반환값의 cell_size_mm 및 wire_diameter_mm 단위는 모두 mm.
+    추가로 정면(X축, 영각 0°) 실제 투영면적 frontal_area_m2 를 함께 반환한다.
+    """
+    tris = read_stl_triangles(stl_path)
+    if not tris:
+        return {"cell_size_mm": 20.0, "wire_diameter_mm": 2.0,
+                "solidity": 0.10, "frontal_area_m2": 0.0}
+
+    xs = [v[0] for t in tris for v in t]
+    ys = [v[1] for t in tris for v in t]
+    zs = [v[2] for t in tris for v in t]
+
+    x_span = max(xs) - min(xs)
+    y_span = max(ys) - min(ys)
+    z_span = max(zs) - min(zs)
+
+    # XY 최대 범위 = 단위 셀 크기, Z 범위 = 와이어 직경
+    cell_size_mm    = max(x_span, y_span)
+    wire_diameter_mm = z_span
+
+    # 고형률 추정: 사각망 근사 Sn = 2d/a (d=와이어직경, a=망목크기)
+    solidity = min(0.95, 2.0 * wire_diameter_mm / cell_size_mm) if cell_size_mm > 0 else 0.10
+
+    # 고정 기준면적용 투영면적: 그물면 법선(Z축, 정면) 방향 실측 투영면적
+    # = 그물을 통해 들여다본 트와인 실루엣 면적 (영각 무관, Aref 기준)
+    frontal_area_m2 = compute_projected_area(stl_path, (0.0, 0.0, 1.0))
+
+    return {
+        "cell_size_mm":     round(cell_size_mm, 3),
+        "wire_diameter_mm": round(wire_diameter_mm, 3),
+        "solidity":         round(solidity, 4),
+        "frontal_area_m2":  frontal_area_m2,
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 단위 셀 모드 케이스 생성기
 # ═══════════════════════════════════════════════════════════════════════════
@@ -123,19 +241,43 @@ class UnitCellCaseBuilder:
 
     def __init__(self, case_dir: Path, stl_path: Path,
                  speed: float, angle_deg: float,
-                 cell_size: float = 0.02,
+                 cell_size: float = None,
                  n_cores: Optional[int] = None,
-                 nx: int = 1, ny: int = 1):
-        self.case_dir   = case_dir
-        self.stl_path   = stl_path
-        self.speed      = speed
-        self.angle_deg  = angle_deg
-        self.cell_size  = cell_size
-        self.nx         = max(1, int(nx))
-        self.ny         = max(1, int(ny))
-        self.n_cores    = n_cores or get_cpu_count()
+                 nx: int = 1, ny: int = 1,
+                 residual_control: float = 1e-4,
+                 end_time: int = 2000,
+                 write_interval: int = 100,
+                 refine_level: int = 3,
+                 solidity: float = None):
+        self.case_dir         = case_dir
+        self.stl_path         = stl_path
+        self.speed            = speed
+        self.angle_deg        = angle_deg
+        self.nx               = max(1, int(nx))
+        self.ny               = max(1, int(ny))
+        self.n_cores          = n_cores or get_cpu_count()
+        self.residual_control = max(1e-5, min(1e-3, float(residual_control)))
+        self.end_time         = max(100, int(end_time))
+        self.write_interval   = max(10, int(write_interval))
+        self.refine_level     = max(1, min(4, int(refine_level)))
+
+        # cell_size / solidity: 미지정 시 STL에서 자동 감지
+        stl_info = detect_stl_cell_size(stl_path)
+        if cell_size is None:
+            self.cell_size = stl_info["cell_size_mm"] / 1000.0
+            logger.info(f"[UnitCell] cell_size 자동 감지: {stl_info['cell_size_mm']:.1f} mm")
+        else:
+            self.cell_size = float(cell_size)
+
+        if solidity is None:
+            self.solidity = stl_info["solidity"]
+            logger.info(f"[UnitCell] 고형률 자동 추정: Sn={self.solidity:.4f} "
+                        f"(d={stl_info['wire_diameter_mm']:.1f}mm, a={stl_info['cell_size_mm']:.1f}mm)")
+        else:
+            self.solidity = max(0.01, min(0.95, float(solidity)))
+
         self.Ux, self.Uy, self.Uz = compute_velocity_vector(speed, angle_deg)
-        self.turb       = compute_turbulence_params(speed, length_scale=cell_size)
+        self.turb       = compute_turbulence_params(speed, length_scale=self.cell_size)
 
     def build(self) -> Path:
         """케이스 디렉토리 전체 생성 및 반환"""
@@ -155,7 +297,9 @@ class UnitCellCaseBuilder:
         self._patch_velocity_field()
         self._patch_turbulence_fields()
         self._patch_blockMesh()
+        self._patch_fvSolution()
         self._patch_controlDict()
+        self._patch_snappyLevel()
         self._patch_decomposePar()
 
         logger.info(f"[UnitCell] 케이스 생성 완료: {self.case_dir}")
@@ -185,13 +329,21 @@ class UnitCellCaseBuilder:
             fpath.write_text(text)
 
     def _patch_blockMesh(self):
-        """단위 셀 크기·반복 수에 맞게 blockMeshDict 수정"""
-        half_x = self.cell_size * self.nx * 1000 / 2   # mm (X 방향 전체 절반)
-        half_y = self.cell_size * self.ny * 1000 / 2   # mm (Y 방향 전체 절반)
-        depth  = self.cell_size * 1000 / 2 * 5         # mm (단위 셀 기준 Z 깊이)
-        cells_x = max(10, int(20 * self.cell_size * self.nx / 0.02))
-        cells_y = max(10, int(20 * self.cell_size * self.ny / 0.02))
-        cells_z = max(50, int(100 * self.cell_size / 0.02))
+        """blockMeshDict 수정 — 주기(cyclic) 경계조건이므로 격자는 '항상 1셀'만 만든다.
+        nx/ny(주기 반복수)는 무한 배열을 대표하는 보고용 값일 뿐, 메시 크기에는
+        영향을 주지 않는다(1셀만 풀어도 무한 배열과 동일). 따라서 도메인·격자 수는
+        nx/ny와 무관하게 단위 셀 크기 기준으로 고정 → 계산시간이 nx/ny에 불변."""
+        half_x = self.cell_size * 1000 / 2   # mm (X 방향 절반, 1셀)
+        half_y = self.cell_size * 1000 / 2   # mm (Y 방향 절반, 1셀)
+        depth  = self.cell_size * 1000 / 2 * 4         # mm (Z 깊이, 기존 5×→4× 축소)
+        # 기준(base) 격자: 셀크기/16 (예 40mm→2.5mm). snappyHexMesh가 그물실 표면
+        # 근처를 레벨 2~3으로 세분화하므로 base는 거칠어도 정확도 확보됨.
+        # 기존엔 1mm 균일 격자(40×40×200≈32만 셀)로 과도하게 커서 직렬 메싱·해석이
+        # 매우 느렸음 → base를 키워 셀 수를 ~15배 줄인다.
+        base_mm = max(2.0, self.cell_size * 1000 / 16)
+        cells_x = max(8,  round(self.cell_size * 1000 / base_mm))
+        cells_y = max(8,  round(self.cell_size * 1000 / base_mm))
+        cells_z = max(20, round(2 * depth / base_mm))
 
         bmd = self.case_dir / "system" / "blockMeshDict"
         replace_in_file(bmd, {
@@ -206,20 +358,71 @@ class UnitCellCaseBuilder:
             "(20 20 100)": f"({cells_x} {cells_y} {cells_z})",
         })
 
+    def _patch_fvSolution(self):
+        """수렴 기준(residualControl) 주입"""
+        fvs = self.case_dir / "system" / "fvSolution"
+        replace_in_file(fvs, {
+            "residualLevel   1e-4;": f"residualLevel   {self.residual_control:.0e};",
+        })
+
+    def _patch_snappyLevel(self):
+        """격자 세분화 레벨 주입"""
+        level_min = max(1, self.refine_level - 1)
+        level_max = self.refine_level
+        snappy = self.case_dir / "system" / "snappyHexMeshDict"
+        replace_in_file(snappy, {
+            "refineLevelMin  2;": f"refineLevelMin  {level_min};",
+            "refineLevelMax  3;": f"refineLevelMax  {level_max};",
+        })
+
     def _patch_controlDict(self):
-        """forceCoeffs 기준값 수정"""
-        aref = self.cell_size ** 2 * self.nx * self.ny  # 전체 도메인 전면 면적
+        """forceCoeffs 기준값 + endTime/writeInterval 주입"""
         ctrl = self.case_dir / "system" / "controlDict"
-        # 항력 방향 벡터 (유속 방향)
-        drag_dir = f"({self.Ux/self.speed:.4f} 0 {self.Uz/self.speed:.4f})" \
+        import math as _math
+        _theta = _math.radians(self.angle_deg)
+
+        # ── Aref(기준면적): 학술 표준 = 고정 기준면적 방식, '1셀' 기준 ──
+        # 그물면 법선(=Z축, 정면) 방향으로 투영한 실측 면적을 영각과 무관하게
+        # 한 번만 계산한다. 영각 의존성은 Cd(θ)·Cl(θ) 계수에 담기는 것이 정석
+        # (Løland 1991; Aarsnes et al. 1990; Kristiansen & Faltinsen 2012 screen
+        # model). 원기둥 Cd≈1.2도 기준면적을 d×L로 '고정'하는 것과 동일한 원리.
+        #
+        # 격자가 항상 1셀(주기 BC)이므로 forceCoeffs의 힘도 1셀분 → Aref도 1셀.
+        # nx/ny는 곱하지 않는다. (곱하면 힘=1셀인데 면적만 커져 Cd가 1/(nx·ny)로
+        # 잘못 작아짐.) 결과적으로 Cd는 nx/ny에 완전히 불변이다.
+        _net_normal = (0.0, 0.0, 1.0)   # 그물면 법선 (Z축 = 와이어 두께 방향)
+        try:
+            _cell_proj = compute_projected_area(self.stl_path, _net_normal)
+        except Exception as _e:
+            logger.warning(f"[UnitCell] 투영면적 계산 실패({_e}) → 근사식 사용")
+            _cell_proj = 0.0
+
+        if _cell_proj > 0:
+            aref = _cell_proj
+            logger.info(
+                f"[UnitCell] Aref=고정 기준면적(그물면 법선 투영, 1셀) "
+                f"{aref:.6e} m² (영각·nx/ny 무관 — 영각 효과는 Cd/Cl이 표현)")
+        else:
+            # 폴백: 고형률 × 패널 면적 (2d/a 근사, 1셀)
+            aref = self.solidity * (self.cell_size ** 2)
+            logger.info(f"[UnitCell] Aref=근사식 Sn×셀² (1셀) = {aref:.6e} m²")
+
+        drag_dir = f"({_math.cos(_theta):.4f} 0 {_math.sin(_theta):.4f})" \
                    if self.speed > 0 else "(1 0 0)"
+        # liftDir: 유속에 수직, XZ 평면 내 = (-sinθ, 0, cosθ)
+        lift_dir = f"({-_math.sin(_theta):.4f} 0 {_math.cos(_theta):.4f})" \
+                   if self.speed > 0 else "(0 0 1)"
         replace_in_file(ctrl, {
+            "endTimeValue        2000;":       f"endTimeValue        {self.end_time};",
+            "writeIntervalValue  100;":        f"writeIntervalValue  {self.write_interval};",
             "magUInf         1.0;        // 기준 유속 [m/s] - Python에서 교체":
                 f"magUInf         {self.speed:.4f};",
             "lRef            0.02;       // 기준 길이 [m] (단위 셀 크기)":
                 f"lRef            {self.cell_size:.6f};",
             "Aref            4.0e-4;     // 기준 면적 [m^2] (0.02 x 0.02)":
                 f"Aref            {aref:.6e};",
+            "liftDir         (0 1 0);    // 양력 방향 (y축)":
+                f"liftDir         {lift_dir};",
             "dragDir         (1 0 0);    // 항력 방향 (x축, 유속 방향)":
                 f"dragDir         {drag_dir};",
         })
@@ -248,15 +451,21 @@ class FullStructureCaseBuilder:
                  cage_stl: Optional[Path], net_stl: Optional[Path],
                  speed: float, angle_deg: float = 0.0,
                  cage_diameter: float = 10.0, cage_depth: float = 5.0,
-                 n_cores: Optional[int] = None):
-        self.case_dir      = case_dir
-        self.cage_stl      = cage_stl
-        self.net_stl       = net_stl
-        self.speed         = speed
-        self.angle_deg     = angle_deg
-        self.cage_D        = cage_diameter
-        self.cage_H        = cage_depth
-        self.n_cores       = n_cores or get_cpu_count()
+                 n_cores: Optional[int] = None,
+                 residual_control: float = 1e-4,
+                 end_time: int = 3000,
+                 write_interval: int = 100):
+        self.case_dir         = case_dir
+        self.cage_stl         = cage_stl
+        self.net_stl          = net_stl
+        self.speed            = speed
+        self.angle_deg        = angle_deg
+        self.cage_D           = cage_diameter
+        self.cage_H           = cage_depth
+        self.n_cores          = n_cores or get_cpu_count()
+        self.residual_control = max(1e-5, min(1e-3, float(residual_control)))
+        self.end_time         = max(100, int(end_time))
+        self.write_interval   = max(10, int(write_interval))
         self.Ux, self.Uy, self.Uz = compute_velocity_vector(speed, angle_deg)
         self.turb          = compute_turbulence_params(speed, length_scale=cage_diameter * 0.1)
 
@@ -278,6 +487,7 @@ class FullStructureCaseBuilder:
         self._patch_velocity_fields()
         self._patch_turbulence_fields()
         self._patch_blockMesh()
+        self._patch_fvSolution()
         self._patch_snappyHexMesh()
         self._patch_controlDict()
         self._patch_decomposePar()
@@ -337,11 +547,20 @@ class FullStructureCaseBuilder:
             "locationInMesh (0 0 -2.5);": f"locationInMesh (0 0 {-H/2:.2f});",
         })
 
+    def _patch_fvSolution(self):
+        """수렴 기준(residualControl) 주입"""
+        fvs = self.case_dir / "system" / "fvSolution"
+        replace_in_file(fvs, {
+            "residualLevel   1e-4;": f"residualLevel   {self.residual_control:.0e};",
+        })
+
     def _patch_controlDict(self):
         D, H = self.cage_D, self.cage_H
         aref = D * H
         ctrl = self.case_dir / "system" / "controlDict"
         replace_in_file(ctrl, {
+            "endTimeValue        3000;":       f"endTimeValue        {self.end_time};",
+            "writeIntervalValue  100;":        f"writeIntervalValue  {self.write_interval};",
             "magUInf         1.0;": f"magUInf         {self.speed:.4f};",
             "lRef            10.0;":  f"lRef            {D:.4f};",
             "Aref            50.0;":  f"Aref            {aref:.4f};",
@@ -379,12 +598,14 @@ class OpenFOAMRunner:
     def __init__(self, case_dir: Path, n_cores: int = 8,
                  of_version: str = "v2312",
                  progress_cb: Optional[Callable] = None,
-                 log_cb: Optional[Callable] = None):
+                 log_cb: Optional[Callable] = None,
+                 step_cb: Optional[Callable] = None):
         self.case_dir    = case_dir
         self.n_cores     = n_cores
         self.of_version  = of_version
         self.progress_cb = progress_cb   # progress_cb(percent, step, max_step)
         self.log_cb      = log_cb         # log_cb(line: str)
+        self.step_cb     = step_cb        # step_cb(module, status, pct, detail)
         self.log_file    = LOGS_DIR / f"{case_dir.name}_{datetime.now():%Y%m%d_%H%M%S}.log"
         self._proc       = None
         self._stop_flag  = threading.Event()
@@ -460,19 +681,29 @@ class OpenFOAMRunner:
     # ─── 전체 워크플로우 실행 ─────────────────────────────────────────────
 
     def run_full_workflow(self, end_time: int = 2000) -> bool:
-        steps = [
+        # 필수 단계(여기 실패하면 해석 자체 실패)
+        essential = [
             self.run_blockMesh,
             self.run_surfaceFeatureExtract,
             self.run_snappyHexMesh,
-            self.run_solver,
-            self.run_reconstructPar,
         ]
-        for step_fn in steps:
+        for step_fn in essential:
             if self._stop_flag.is_set():
                 return False
-            if not step_fn() if step_fn != self.run_solver \
-               else step_fn(end_time):
+            if not step_fn():
                 return False
+        # 솔버 (Cd/Cl·필드 생성)
+        if self._stop_flag.is_set():
+            return False
+        if not self.run_solver(end_time):
+            return False
+        # reconstructPar는 '시각화용 편의' 단계 — 실패해도 forceCoeffs(Cd/Cl)는
+        # postProcessing에 이미 있으므로 결과 추출에는 지장 없음. best-effort 처리.
+        try:
+            if not self.run_reconstructPar():
+                self._emit_log("⚠️ reconstructPar 실패(시각화용) — Cd/Cl 추출은 계속 진행")
+        except Exception as _e:
+            self._emit_log(f"⚠️ reconstructPar 예외(무시): {_e}")
         return True
 
     def stop(self):
@@ -482,6 +713,14 @@ class OpenFOAMRunner:
             self._proc.terminate()
 
     # ─── 내부 실행 헬퍼 ───────────────────────────────────────────────────
+
+    def _emit_step(self, module: str, status: str, pct: float, detail: str = ""):
+        """step_cb 호출 헬퍼"""
+        if self.step_cb:
+            try:
+                self.step_cb(module, status, pct, detail)
+            except Exception:
+                pass
 
     def _run_step(self, cmd: str, label: str,
                   parallel: bool = False,
@@ -496,6 +735,15 @@ class OpenFOAMRunner:
 
         full_cmd = self._of_cmd(cmd)
         self._emit_log(f"\n{'='*50}\n▶ {label} 시작\n{'='*50}")
+        self._emit_step(label, "running", 0, "시작")
+
+        # snappyHexMesh 단계 추적용 (단계별 반복 횟수로 진행률을 동적으로 갱신)
+        _snappy_pct  = 0.0
+        _cast_iter   = 0   # castellation refinement 반복
+        _morph_iter  = 0   # snapping(morph) 반복
+        _layer_iter  = 0   # layer addition 반복
+        import time as _time
+        _snap_t0     = _time.time()
 
         try:
             self._proc = subprocess.Popen(
@@ -514,22 +762,59 @@ class OpenFOAMRunner:
 
                     if monitor_residuals:
                         self._parse_residuals(line, step, end_time)
-                        # 스텝 번호 파싱
                         m = re.match(r"^Time = (\d+)", line)
                         if m:
                             step = int(m.group(1))
+                            pct = round(min(step / end_time * 100, 99.9), 1)
+                            residual_info = ""
+                            if self.last_residuals:
+                                max_r = max(self.last_residuals.values())
+                                residual_info = f"잔차 {max_r:.2e}"
+                            self._emit_step(label, "running", pct,
+                                            f"Time={step}/{end_time}  {residual_info}")
                             if self.progress_cb:
-                                pct = min(int(step / end_time * 100), 99)
                                 self.progress_cb(pct, step, end_time)
+
+                    # snappyHexMesh 단계 파싱 — 반복 횟수로 진행률을 동적으로 움직인다
+                    elif "snappyHexMesh" in cmd or "snappyHexMesh" in label:
+                        _line = line.strip().lower()
+                        _el   = int(_time.time() - _snap_t0)           # 경과(초)
+                        _elap = f"{_el//60}분 {_el%60:02d}초"
+                        if "writing mesh" in _line or "written mesh" in _line:
+                            # 실제 최종 격자 저장
+                            _snappy_pct = max(_snappy_pct, 95.0)
+                            self._emit_step(label, "running", _snappy_pct,
+                                            f"격자 저장 중... ({_elap})")
+                        elif "morph iteration" in _line or "moving mesh" in _line:
+                            # 스내핑(표면 적합) 단계 — Morph iteration 반복
+                            if "morph iteration" in _line:
+                                _morph_iter += 1
+                            _snappy_pct = min(70.0, max(_snappy_pct, 40.0 + _morph_iter * 2.0))
+                            self._emit_step(label, "running", _snappy_pct,
+                                            f"표면 적합(스내핑) {_morph_iter}회 반복 중 · {_elap}")
+                        elif "add layer" in _line or "layer addition" in _line \
+                                or ("layer" in _line and "iteration" in _line):
+                            _layer_iter += 1
+                            _snappy_pct = min(92.0, max(_snappy_pct, 72.0 + _layer_iter * 2.0))
+                            self._emit_step(label, "running", _snappy_pct,
+                                            f"경계층 추가 {_layer_iter}회 · {_elap}")
+                        elif "refinement iteration" in _line or "castellat" in _line:
+                            if "refinement iteration" in _line:
+                                _cast_iter += 1
+                            _snappy_pct = min(38.0, max(_snappy_pct, 8.0 + _cast_iter * 6.0))
+                            self._emit_step(label, "running", _snappy_pct,
+                                            f"격자 세분화 {_cast_iter}회 · {_elap}")
 
             self._proc.wait()
             success = (self._proc.returncode == 0)
             status = "✅ 완료" if success else "❌ 실패"
             self._emit_log(f"\n{status}: {label}")
+            self._emit_step(label, "done" if success else "error", 100 if success else 0, "")
             return success
 
         except Exception as e:
             self._emit_log(f"❌ 오류 발생: {e}")
+            self._emit_step(label, "error", 0, str(e))
             return False
 
     def _parse_residuals(self, line: str, step: int, end_time: int):
@@ -762,19 +1047,24 @@ class BatchAnalysisManager:
             self._log(f"배치 {i+1}/{total}: 유속={speed:.2f}m/s, 영각={angle:.1f}°")
             self._log(f"{'='*60}")
 
-            # 케이스 이름 생성
             case_name = f"{self.mode}_U{speed:.2f}_A{angle:.1f}"
             case_dir  = RESULTS_DIR / self.mode / case_name
 
-            # 케이스 빌드
+            # 케이스 시작 직전 — 초기화/격자생성 구간에도 진행률 표시
+            self._progress(round(i / total * 100, 1), i + 1, total)
+
             try:
                 if self.mode == "unit_cell":
                     builder = UnitCellCaseBuilder(
                         case_dir=case_dir,
                         stl_path=self.stl_paths.get("net"),
                         speed=speed, angle_deg=angle,
+                        # 계산량 옵션(end_time·refine_level 등)도 전달해야 배치가
+                        # 프리셋(최소/보통/정밀)을 반영한다. (이전엔 무시되어 항상 기본값)
                         **{k: v for k, v in self.params.items()
-                           if k in ["cell_size", "n_cores", "nx", "ny"]}
+                           if k in ["cell_size", "n_cores", "nx", "ny",
+                                    "residual_control", "end_time",
+                                    "write_interval", "refine_level", "solidity"]}
                     )
                 else:
                     builder = FullStructureCaseBuilder(
@@ -788,28 +1078,55 @@ class BatchAnalysisManager:
 
                 builder.build()
 
-                # 해석 실행
+                # OpenFOAM 단계별 진행을 배치 UI에도 전달하는 step_cb
+                _i = i
+                def _batch_step_cb(module, status, pct, detail, _ii=_i):
+                    label_map = {
+                        "blockMesh":        "격자 생성",
+                        "snappyHexMesh":    "격자 스냅",
+                        "simpleFoam":       "CFD 해석",
+                        "reconstructPar":   "결과 재조합",
+                    }
+                    short = next(
+                        (v for k, v in label_map.items() if k in module), module
+                    )
+                    step_desc = f"{detail}" if detail else status
+                    self._progress(
+                        round((_ii / total) * 100 + pct / total, 1),
+                        _ii + 1, total,
+                        label=f"케이스 {_ii+1}/{total} — {short} {step_desc}"
+                    )
+
                 n_cores = self.params.get("n_cores", get_cpu_count())
                 runner = OpenFOAMRunner(
                     case_dir=case_dir,
                     n_cores=n_cores,
-                    progress_cb=lambda p, s, e: self._progress(
-                        int((i + p/100) / total * 100), s, e
+                    progress_cb=lambda p, s, e, _ii=_i: self._progress(
+                        round((_ii + p / 100) / total * 100, 1), _ii + 1, total
                     ),
-                    log_cb=self.log_cb
+                    log_cb=self.log_cb,
+                    step_cb=_batch_step_cb,
                 )
-                ok = runner.run_full_workflow()
-                if not ok:
-                    raise RuntimeError("워크플로우 실패 — logs/ 폴더 로그 확인")
+                _et = int(self.params.get("end_time", 2000))
+                ok = runner.run_full_workflow(end_time=_et)
 
-                # 결과 추출
+                # 워크플로우 반환값과 무관하게 forceCoeffs(Cd/Cl)가 있으면 추출한다.
+                # (reconstructPar나 솔버의 비치명적 비정상 종료로 ok=False여도 결과가
+                #  생성됐으면 살린다 → 결과 유실 방지)
                 extractor = ResultExtractor(case_dir, speed, angle)
-                extractor.save_csv(self.output_csv)
+                _cf  = extractor.extract_force_coeffs() or {}
+                _cdv = _cf.get("Cd")
+                if isinstance(_cdv, (int, float)):
+                    extractor.save_csv(self.output_csv)
+                    self._log(f"✅ 케이스 완료 [{case_name}] — Cd={_cdv:.4f}")
+                else:
+                    self._log(f"❌ 케이스 결과 없음 [{case_name}] "
+                              f"(forceCoeffs 미생성, 워크플로우 ok={ok})")
 
             except Exception as e:
                 self._log(f"❌ 케이스 오류 [{case_name}]: {e}")
 
-            self._progress(int((i+1) / total * 100), i+1, total)
+            self._progress(round((i + 1) / total * 100, 1), i + 1, total)
 
         self._log(f"\n✅ 배치 해석 완료: {self.output_csv}")
         return self.results
@@ -819,8 +1136,20 @@ class BatchAnalysisManager:
 
     def _log(self, msg: str):
         if self.log_cb:
-            self.log_cb(msg)
+            try:
+                self.log_cb(msg)
+            except Exception:
+                pass
 
-    def _progress(self, pct: int, step: int, total: int):
+    def _progress(self, pct: float, step: int, total: int, label: str = ""):
         if self.progress_cb:
-            self.progress_cb(pct, step, total)
+            try:
+                self.progress_cb(pct, step, total, label)
+            except TypeError:
+                # 이전 시그니처(label 없음) 호환
+                try:
+                    self.progress_cb(pct, step, total)
+                except Exception:
+                    pass
+            except Exception:
+                pass

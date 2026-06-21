@@ -135,19 +135,39 @@ def init_session():
         "job_thread":         None,
         "job_runner":         None,
         "batch_manager":      None,
-        "progress":           0,
+        "progress":           0.0,
         "current_step":       "",
         "log_lines":          [],
         "last_result_dir":    None,
         "auto_viz":           None,
         "viz_images":         {},
         "results_csv":        None,
-        "refresh_interval":   10,
+        "refresh_interval":   3,
+        "job_start_time":     None,
+        "refresh_count":      0,
+        "case_progress":      {},
         "n_cores":            get_cpu_count(),
         "stl_net_path":       None,
         "stl_cage_path":      None,
         "unit_nx":            1,
         "unit_ny":            1,
+        "cell_size_mm":       20.0,
+        "solidity_input":     0.15,
+        "auto_cell_size_mm":  None,
+        "auto_solidity":      None,
+        "auto_frontal_area":  None,
+        "auto_wire_d_mm":     None,
+        # ── 계산량 프리셋 ──
+        "calc_preset_name":   "보통",
+        "end_time_preset":    2000,
+        "refine_level_preset": 3,
+        "residual_preset":    "1e-4",
+        "write_interval_preset": 100,
+        # ── 파이프라인 단계별 진행 상태 ──
+        "pipeline_steps":     [],
+        # ── 새로고침 복구 표시 플래그 ──
+        "_detached_view":     False,
+        "_input_restored":    False,
     }
     for k, v in defaults.items():
         if k not in ss:
@@ -164,14 +184,190 @@ def add_log(msg: str):
     ss.log_lines.append(f"[{datetime.now():%H:%M:%S}] {msg}")
     if len(ss.log_lines) > 500:
         ss.log_lines = ss.log_lines[-400:]
+    _persist_job_state()          # 새로고침 복구용 디스크 기록 (스로틀됨)
 
 def set_status(status: str, step: str = ""):
     ss.job_status   = status
     ss.current_step = step
+    _persist_job_state(force=True)   # 상태 전환은 즉시 기록
+
+
+# ─── 작업 상태 영속화 (새로고침/세션 단절 후 진행률·로그 복구) ──────────────
+JOB_STATE_FILE = RESULTS_DIR / ".job_state.json"
+_last_persist  = {"ts": 0.0}
+
+def _persist_job_state(force: bool = False):
+    """실행 중인 작업 상태를 디스크에 기록한다. 백그라운드 스레드가 호출하므로,
+    브라우저를 새로고침해 세션이 바뀌어도 새 세션이 이 파일을 읽어 복구할 수 있다.
+    과도한 쓰기를 막기 위해 force가 아니면 1.5초 간격으로 스로틀한다."""
+    now = time.time()
+    if not force and (now - _last_persist["ts"] < 1.5):
+        return
+    _last_persist["ts"] = now
+    try:
+        state = {
+            "job_status":      ss.get("job_status", "idle"),
+            "progress":        float(ss.get("progress", 0.0)),
+            "current_step":    ss.get("current_step", ""),
+            "last_result_dir": ss.get("last_result_dir"),
+            "job_start_time":  ss.get("job_start_time"),
+            "case_progress":   ss.get("case_progress", {}),
+            "pipeline_steps":  ss.get("pipeline_steps", []),
+            "log_tail":        (ss.get("log_lines", []) or [])[-200:],
+            "updated_at":      now,
+        }
+        tmp = JOB_STATE_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False))
+        tmp.replace(JOB_STATE_FILE)        # 원자적 교체 (부분 읽기 방지)
+    except Exception:
+        pass
+
+def _load_job_state() -> Optional[dict]:
+    try:
+        if JOB_STATE_FILE.exists():
+            return json.loads(JOB_STATE_FILE.read_text())
+    except Exception:
+        return None
+    return None
+
+def _restore_job_state_if_detached():
+    """이 세션이 실행 중인 작업을 직접 소유(job_thread 보유)하지 않는데
+    디스크 상태가 '실행 중'이면, 진행률·로그·파이프라인을 복구해 화면에 표시한다.
+    180초 이상 갱신이 없으면 백그라운드 프로세스가 죽은 것으로 보고 오류 표시."""
+    if ss.get("job_thread") is not None:
+        ss._detached_view = False
+        return  # 작업 소유 세션 → 라이브 ss 사용
+    data = _load_job_state()
+    if not data:
+        ss._detached_view = False
+        return
+    status       = data.get("job_status")
+    age          = time.time() - data.get("updated_at", 0)
+    was_detached = ss.get("_detached_view", False)
+
+    if status == "running" and age > 1800:
+        # 30분 이상 방치된 상태 파일 → 오래전에 죽은 작업으로 보고 무시
+        ss._detached_view = False
+        return
+
+    if status == "running":
+        # 실행 중인 작업 복구 (진행률·로그·파이프라인)
+        ss.progress        = float(data.get("progress", 0.0))
+        ss.current_step    = data.get("current_step", "")
+        ss.last_result_dir = data.get("last_result_dir")
+        ss.job_start_time  = data.get("job_start_time")
+        ss.case_progress   = data.get("case_progress", {})
+        ss.pipeline_steps  = data.get("pipeline_steps", [])
+        ss.log_lines       = data.get("log_tail", [])
+        ss._detached_view  = True
+        if age > 180:
+            # 180초 이상 갱신 없음 → 백그라운드 프로세스 종료/중단으로 간주
+            ss.job_status   = "error"
+            ss.current_step = "백그라운드 작업이 응답하지 않습니다 (서버 재시작·종료 추정)"
+        else:
+            ss.job_status   = "running"
+    elif status in ("done", "error") and was_detached:
+        # 새로고침으로 지켜보던 작업이 끝남 → 최종 상태를 한 번 반영
+        ss.progress       = float(data.get("progress", 0.0))
+        ss.current_step   = data.get("current_step", "")
+        ss.pipeline_steps = data.get("pipeline_steps", [])
+        ss.log_lines      = data.get("log_tail", [])
+        ss.job_status     = status
+        ss._detached_view = False
+    else:
+        ss._detached_view = False
+
+# ─── 입력(STL 업로드) 상태 영속화 (새로고침 후 업로드·미리보기 복구) ────────
+INPUT_STATE_FILE = RESULTS_DIR / ".input_state.json"
+
+def _persist_input_state():
+    """업로드한 STL 선택과 자동 감지 정보를 디스크에 기록한다. STL 파일 자체는
+    이미 stl_uploads/ 에 저장돼 있으므로, 여기서는 '어떤 파일을 쓰는지'와 감지
+    결과만 저장해 두면 새로고침 후 새 세션이 그대로 복구할 수 있다."""
+    if not (ss.get("stl_net_path") or ss.get("stl_cage_path")):
+        return
+    try:
+        state = {k: ss.get(k) for k in (
+            "analysis_mode", "stl_net_path", "stl_cage_path",
+            "auto_cell_size_mm", "auto_wire_d_mm", "auto_solidity",
+            "auto_frontal_area", "cell_size_mm", "solidity_input",
+            "unit_nx", "unit_ny",
+        )}
+        tmp = INPUT_STATE_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False))
+        tmp.replace(INPUT_STATE_FILE)
+    except Exception:
+        pass
+
+def _restore_input_state():
+    """새 세션(F5 등)에서 이전 STL 선택·감지 정보를 복구한다.
+    저장된 STL 파일이 디스크에 실제 존재할 때만 복구한다."""
+    if ss.get("stl_net_path") or ss.get("stl_cage_path"):
+        return  # 이미 이 세션에 STL이 있으면 그대로 둠
+    try:
+        if not INPUT_STATE_FILE.exists():
+            return
+        data = json.loads(INPUT_STATE_FILE.read_text())
+    except Exception:
+        return
+    _net  = data.get("stl_net_path")
+    _cage = data.get("stl_cage_path")
+    _has_net  = bool(_net)  and Path(_net).exists()
+    _has_cage = bool(_cage) and Path(_cage).exists()
+    if not (_has_net or _has_cage):
+        return  # 파일이 사라졌으면 복구하지 않음
+    if _has_net:
+        ss.stl_net_path = _net
+    if _has_cage:
+        ss.stl_cage_path = _cage
+    for k in ("auto_cell_size_mm", "auto_wire_d_mm", "auto_solidity",
+              "auto_frontal_area", "cell_size_mm", "solidity_input",
+              "unit_nx", "unit_ny"):
+        if data.get(k) is not None:
+            ss[k] = data[k]
+    ss._input_restored = True
+
+# 매 렌더링마다 디스크 상태 확인 → 새로고침 후 진행 중인 작업 자동 복구
+_restore_job_state_if_detached()
+# 새로고침 후 STL 업로드 선택·미리보기 복구
+_restore_input_state()
 
 def status_badge(status: str) -> str:
     labels = {"idle":"대기","running":"해석 중","done":"완료","error":"오류"}
     return f'<span class="badge-{status}">{labels.get(status, status)}</span>'
+
+# ─── 예상 소요 시간 추정 ────────────────────────────────────────────────────
+def estimate_case_minutes(end_time: int, refine_level: int, n_cores: int) -> float:
+    """단일 케이스 예상 계산 시간(분) = 직렬 메싱 오버헤드 + 병렬 솔버 시간.
+    정밀화 레벨이 격자 셀 수(→메싱·솔버 시간)를 좌우하고, 솔버는 반복수에 비례·
+    코어 수에 반비례한다고 가정한 경험식. 주기(cyclic) 단위셀이라 격자는 항상 1셀
+    → nx/ny는 계산시간에 영향 없음.
+    (격자 base 축소 반영해 재보정: 보통 2000·정밀화3·16코어 ≈ 32분)"""
+    f_iter   = max(1, end_time) / 2000.0
+    f_refine = {1: 0.3, 2: 0.6, 3: 1.0, 4: 2.2, 5: 5.0}.get(int(refine_level), 1.0)
+    f_cores  = 16.0 / max(1, int(n_cores))
+    solver_min = 25.0 * f_iter * f_refine * f_cores   # 병렬 솔버 시간
+    mesh_min   = 3.0 + 4.0 * f_refine                 # 직렬 snappy 메싱 오버헤드
+    return mesh_min + solver_min
+
+def fmt_duration(minutes: float) -> str:
+    """분 단위 시간을 '시간 분' 형식 문자열로."""
+    if minutes < 1:
+        return "1분 미만"
+    m = int(round(minutes))
+    if m < 60:
+        return f"{m}분"
+    h, mm = divmod(m, 60)
+    return f"{h}시간 {mm}분" if mm else f"{h}시간"
+
+def fmt_elapsed(seconds: float) -> str:
+    """초 단위 경과 시간을 '시 분 초' 형식으로 (예: 1시간 23분 45초)."""
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h > 0:
+        return f"{h}시간 {m}분 {sec:02d}초"
+    return f"{m}분 {sec:02d}초"
 
 def save_uploaded_stl(uploaded_file, prefix: str) -> Optional[Path]:
     """업로드된 STL 파일을 임시 디렉토리에 저장"""
@@ -181,6 +377,310 @@ def save_uploaded_stl(uploaded_file, prefix: str) -> Optional[Path]:
     with open(save_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
     return save_path
+
+def render_stl_preview(stl_path: str, angle_deg: float = 0.0) -> Optional[bytes]:
+    """STL 형상을 PyVista로 렌더링하여 PNG bytes 반환. 실패 시 matplotlib 폴백."""
+    import io
+    try:
+        import pyvista as pv
+        pv.global_theme.font.family = "courier"
+        mesh = pv.read(str(stl_path))
+        mesh_mm = mesh.scale(1000.0, inplace=False)  # m→mm 표시용
+        bounds = mesh_mm.bounds  # (xmin,xmax, ymin,ymax, zmin,zmax)
+
+        pl = pv.Plotter(off_screen=True, window_size=[700, 520])
+        pl.set_background("#0d1117")
+        pl.add_mesh(mesh_mm, color="#5dade2", opacity=0.85, show_edges=True,
+                    edge_color="#a9cce3", line_width=0.5)
+
+        # 좌표축
+        pl.add_axes(color="white", xlabel="X [mm]", ylabel="Y [mm]", zlabel="Z [mm]")
+
+        # 유속 방향 화살표 (빨간색)
+        _theta = math.radians(angle_deg)
+        cx = (bounds[0] + bounds[1]) / 2
+        cy = (bounds[2] + bounds[3]) / 2
+        cz = (bounds[4] + bounds[5]) / 2
+        span = max(bounds[1]-bounds[0], bounds[3]-bounds[2], bounds[5]-bounds[4])
+        arrow_len = span * 0.7
+        ox = cx - math.cos(_theta) * arrow_len
+        oz = cz - math.sin(_theta) * arrow_len
+        arrow = pv.Arrow(
+            start=(ox, cy, oz),
+            direction=(math.cos(_theta), 0, math.sin(_theta)),
+            scale=arrow_len, tip_length=0.25, tip_radius=0.08, shaft_radius=0.03
+        )
+        pl.add_mesh(arrow, color="#e74c3c")
+        pl.add_text(f"U (α={angle_deg:.0f}°)", position="upper_left",
+                    font_size=10, color="#e74c3c")
+
+        # 바운딩 박스 아웃라인
+        pl.add_mesh(mesh_mm.outline(), color="#f39c12", line_width=1.5)
+        # 그물면(법선 Z)을 약간 기울여 거의 정면으로 본다 — 얇은 평판이라
+        # isometric(모서리) 시점에서는 납작한 조각처럼 보이므로, 법선 쪽으로
+        # 기울여 망목(사각 개구부) 패턴이 또렷이 보이게 한다.
+        pl.view_vector((0.45, -0.75, 0.95), viewup=(0, 0, 1))
+        pl.camera.zoom(1.2)
+
+        buf = io.BytesIO()
+        img = pl.screenshot(return_img=True)
+        pl.close()
+        from PIL import Image
+        Image.fromarray(img).save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        pass
+
+    # ── matplotlib 폴백 ──────────────────────────────────────────────────
+    try:
+        import struct
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.mplot3d import Axes3D
+        from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+        with open(str(stl_path), "rb") as f:
+            header = f.read(80)
+            n_tri = struct.unpack("<I", f.read(4))[0]
+            verts = []
+            for _ in range(min(n_tri, 5000)):
+                f.read(12)
+                pts = [struct.unpack("<fff", f.read(12)) for _ in range(3)]
+                f.read(2)
+                verts.append(pts)
+        verts_mm = [[(x*1000, y*1000, z*1000) for x,y,z in tri] for tri in verts]
+
+        fig = plt.figure(figsize=(7, 5), facecolor="#0d1117")
+        ax = fig.add_subplot(111, projection="3d", facecolor="#0d1117")
+        poly = Poly3DCollection(verts_mm, alpha=0.5, facecolor="#5dade2",
+                                edgecolor="#a9cce3", linewidth=0.2)
+        ax.add_collection3d(poly)
+        xs = [p[0] for tri in verts_mm for p in tri]
+        ys = [p[1] for tri in verts_mm for p in tri]
+        zs = [p[2] for tri in verts_mm for p in tri]
+        ax.set_xlim(min(xs), max(xs)); ax.set_ylim(min(ys), max(ys)); ax.set_zlim(min(zs), max(zs))
+        # 실제 치수 비율 유지 (기본값은 정육면체로 왜곡되어 얇은 판이 두껍게 보임)
+        _dx, _dy, _dz = max(xs)-min(xs), max(ys)-min(ys), max(zs)-min(zs)
+        try:
+            ax.set_box_aspect((_dx, _dy, max(_dz, _dx*0.02)))
+        except Exception:
+            pass
+        # 그물면 법선 쪽으로 기울여 본다 (납작한 조각이 아닌 망목 패턴이 보이도록)
+        ax.view_init(elev=55, azim=-60)
+        ax.set_xlabel("X [mm]", color="white"); ax.set_ylabel("Y [mm]", color="white")
+        ax.set_zlabel("Z [mm]", color="white")
+        ax.tick_params(colors="white"); ax.title.set_color("white")
+
+        # 유속 화살표
+        _theta = math.radians(angle_deg)
+        mx, my, mz = (min(xs)+max(xs))/2, (min(ys)+max(ys))/2, (min(zs)+max(zs))/2
+        span = max(max(xs)-min(xs), max(ys)-min(ys), max(zs)-min(zs)) * 0.5
+        ax.quiver(mx-math.cos(_theta)*span, my, mz-math.sin(_theta)*span,
+                  math.cos(_theta)*span, 0, math.sin(_theta)*span,
+                  color="#e74c3c", linewidth=2, arrow_length_ratio=0.3)
+        ax.set_title(f"STL 미리보기  |  유속 방향 α={angle_deg:.0f}°", color="white", pad=10)
+        plt.tight_layout()
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format="PNG", facecolor="#0d1117", dpi=110)
+        plt.close()
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+def render_stl_interactive_plotly(
+    stl_path: str,
+    mode: str,
+    angle_deg: float,
+    nx: int = 1,
+    ny: int = 1,
+    cell_size_m: float = 0.02,   # 폴백용 — 실제 타일 간격은 STL bbox에서 자동 계산
+):
+    """Plotly go.Mesh3d 기반 인터랙티브 3D STL 뷰어. 마우스 드래그로 회전 가능."""
+    try:
+        import plotly.graph_objects as go
+        import numpy as np
+    except ImportError:
+        return None
+
+    # ── STL 읽기 (PyVista 우선, binary STL 폴백) ──────────────────────────
+    def _read_stl(path):
+        """(pts: N×3, faces: M×3 int) 반환.
+        STL 좌표는 이미 mm 단위 (blockMeshDict: scale 0.001 적용) — 변환 없음."""
+        try:
+            import pyvista as pv
+            m = pv.read(str(path))
+            pts = m.points.copy()              # 좌표 단위: mm (변환 불필요)
+            raw = m.faces
+            if len(raw) == 0:
+                raise ValueError("empty mesh")
+            faces = raw.reshape(-1, 4)[:, 1:]  # [3, v0,v1,v2, …] → (M,3)
+            return pts.astype(float), faces.astype(int)
+        except Exception:
+            pass
+        # Binary STL 폴백
+        import struct
+        pts_l, faces_l = [], []
+        with open(str(path), "rb") as f:
+            f.read(80)
+            n = struct.unpack("<I", f.read(4))[0]
+            for t in range(n):
+                f.read(12)
+                base = len(pts_l)
+                for _ in range(3):
+                    vx, vy, vz = struct.unpack("<fff", f.read(12))
+                    pts_l.append([vx, vy, vz])  # mm 단위 그대로 사용
+                f.read(2)
+                faces_l.append([base, base + 1, base + 2])
+        return np.array(pts_l, dtype=float), np.array(faces_l, dtype=int)
+
+    try:
+        base_pts, base_faces = _read_stl(stl_path)
+    except Exception:
+        return None
+
+    # ── 타일 간격: STL 바운딩박스에서 직접 계산 (단위 의존성 없음) ────────
+    bx_min = float(base_pts[:, 0].min()); bx_max = float(base_pts[:, 0].max())
+    by_min = float(base_pts[:, 1].min()); by_max = float(base_pts[:, 1].max())
+    bz_min = float(base_pts[:, 2].min()); bz_max = float(base_pts[:, 2].max())
+
+    step_x = (bx_max - bx_min) or (cell_size_m * 1000.0)
+    step_y = (by_max - by_min) or (cell_size_m * 1000.0)
+
+    # ── 단위셀 모드: Nx × Ny 타일링 ──────────────────────────────────────
+    do_tile = (mode == "unit_cell") and (nx > 1 or ny > 1)
+    offsets = [(ix, iy) for ix in range(nx) for iy in range(ny)] if do_tile else [(0, 0)]
+
+    n_base = len(base_pts)
+    all_pts, all_faces = [], []
+    for step_idx, (ix, iy) in enumerate(offsets):
+        shift = np.array([ix * step_x, iy * step_y, 0.0])
+        all_pts.append(base_pts + shift)
+        all_faces.append(base_faces + step_idx * n_base)
+
+    pts   = np.vstack(all_pts)
+    faces = np.vstack(all_faces)
+    x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
+    ii, ji, ki = faces[:, 0], faces[:, 1], faces[:, 2]
+
+    # ── 전체 범위 계산 ────────────────────────────────────────────────────
+    cx = (float(x.min()) + float(x.max())) / 2
+    cy = (float(y.min()) + float(y.max())) / 2
+    cz = (float(z.min()) + float(z.max())) / 2
+    span = max(float(x.max()) - float(x.min()),
+               float(y.max()) - float(y.min()),
+               float(z.max()) - float(z.min()))
+
+    # ── 유속 방향 화살표 ──────────────────────────────────────────────────
+    theta = math.radians(angle_deg)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    aLen  = span * 0.55
+    ax0, az0 = cx - cos_t * aLen,        cz - sin_t * aLen
+    ax1, az1 = cx + cos_t * aLen * 0.25, cz + sin_t * aLen * 0.25
+
+    # ── Figure 조립 ───────────────────────────────────────────────────────
+    fig = go.Figure()
+
+    # STL 메쉬
+    fig.add_trace(go.Mesh3d(
+        x=x, y=y, z=z,
+        i=ii, j=ji, k=ki,
+        color='#5dade2', opacity=0.78, flatshading=True,
+        lighting=dict(ambient=0.5, diffuse=0.7, specular=0.2, roughness=0.5),
+        lightposition=dict(x=1, y=2, z=3),
+        showlegend=False,
+        hoverinfo='skip',
+    ))
+
+    # 단위셀 경계 박스 (타일이 2개 이상일 때)
+    if do_tile:
+        for ix, iy in offsets:
+            dx, dy = ix * step_x, iy * step_y
+            # 상·하 사각형 + 수직 연결선 (None으로 선분 끊기)
+            ex = [bx_min+dx, bx_max+dx, bx_max+dx, bx_min+dx, bx_min+dx, None,
+                  bx_min+dx, bx_max+dx, bx_max+dx, bx_min+dx, bx_min+dx, None,
+                  bx_min+dx, bx_min+dx, None, bx_max+dx, bx_max+dx, None,
+                  bx_max+dx, bx_max+dx, None, bx_min+dx, bx_min+dx]
+            ey = [by_min+dy, by_min+dy, by_max+dy, by_max+dy, by_min+dy, None,
+                  by_min+dy, by_min+dy, by_max+dy, by_max+dy, by_min+dy, None,
+                  by_min+dy, by_min+dy, None, by_min+dy, by_min+dy, None,
+                  by_max+dy, by_max+dy, None, by_max+dy, by_max+dy]
+            ez = [bz_min]*5 + [None] + [bz_max]*5 + [None,
+                  bz_min, bz_max, None, bz_min, bz_max, None,
+                  bz_min, bz_max, None, bz_min, bz_max]
+            fig.add_trace(go.Scatter3d(
+                x=ex, y=ey, z=ez,
+                mode='lines',
+                line=dict(color='#f39c12', width=1),
+                showlegend=False, hoverinfo='skip',
+            ))
+
+    # 유속 화살표 shaft
+    fig.add_trace(go.Scatter3d(
+        x=[ax0, ax1], y=[cy, cy], z=[az0, az1],
+        mode='lines',
+        line=dict(color='#e74c3c', width=6),
+        showlegend=False, hoverinfo='skip',
+    ))
+    # 유속 화살표 cone
+    fig.add_trace(go.Cone(
+        x=[ax1], y=[cy], z=[az1],
+        u=[cos_t * aLen * 0.22], v=[0.0], w=[sin_t * aLen * 0.22],
+        colorscale=[[0, '#e74c3c'], [1, '#e74c3c']],
+        showscale=False,
+        sizemode='absolute', sizeref=span * 0.1,
+        showlegend=False, hoverinfo='skip',
+    ))
+
+    # ── 모드 정보 · 유속 라벨을 annotation으로 배치 (겹침 없음) ─────────
+    mode_label = "단위 셀 모드" if mode == "unit_cell" else "전체 구조 모드"
+    tile_label = f"  ({nx}×{ny} 타일)" if do_tile else ""
+
+    fig.update_layout(
+        showlegend=False,
+        annotations=[
+            # 좌상단 모드 배지
+            dict(
+                text=f"<b>{mode_label}</b>{tile_label}",
+                xref="paper", yref="paper",
+                x=0.01, y=0.99,
+                xanchor="left", yanchor="top",
+                showarrow=False,
+                font=dict(size=12, color="#1a4a8a"),
+                bgcolor="rgba(255,255,255,0.80)",
+                bordercolor="#1a4a8a", borderwidth=1, borderpad=5,
+            ),
+            # 좌하단 유속 라벨
+            dict(
+                text=f"→ 유속 방향  α = {angle_deg:.0f}°",
+                xref="paper", yref="paper",
+                x=0.01, y=0.03,
+                xanchor="left", yanchor="bottom",
+                showarrow=False,
+                font=dict(size=11, color="#e74c3c"),
+                bgcolor="rgba(255,255,255,0.80)",
+                borderpad=4,
+            ),
+        ],
+        scene=dict(
+            xaxis=dict(title="X [mm]", backgroundcolor="#eaf4fb",
+                       gridcolor="white", showbackground=True),
+            yaxis=dict(title="Y [mm]", backgroundcolor="#eaf4fb",
+                       gridcolor="white", showbackground=True),
+            zaxis=dict(title="Z [mm]", backgroundcolor="#dce9f5",
+                       gridcolor="white", showbackground=True),
+            aspectmode='data',
+            bgcolor='rgba(240,248,255,1)',
+            camera=dict(eye=dict(x=1.4, y=1.0, z=0.9)),
+        ),
+        margin=dict(l=0, r=0, t=10, b=0),
+        height=440,
+        paper_bgcolor='#f0f8ff',
+    )
+    return fig
+
 
 def check_openfoam() -> bool:
     """OpenFOAM 설치 여부 확인"""
@@ -244,12 +744,15 @@ with st.sidebar:
     # ─── 시스템 설정 ──────────────────────────────────────────────────────
     st.markdown("### 🖥️ 시스템 설정")
     max_cores = get_cpu_count()
-    n_cores = st.slider("MPI 코어 수", 1, max(max_cores, 32), max_cores,
-                        help=f"감지된 코어 수: {max_cores}")
+    n_cores = st.slider("MPI 코어 수", 1, max_cores, max_cores,
+                        help=f"물리 코어 수: {max_cores} (하이퍼스레딩 제외 — 초과 설정 시 성능 저하)")
     ss.n_cores = n_cores
 
-    refresh_sec = st.slider("시각화 갱신 주기 [초]", 5, 60, 10)
+    refresh_sec = st.slider("시각화 갱신 주기 [초]", 2, 30, 3,
+                            help="짧을수록 실시간에 가깝지만 CPU 사용량 증가")
     ss.refresh_interval = refresh_sec
+    st.divider()
+
     st.divider()
 
     # ─── OpenFOAM 상태 ────────────────────────────────────────────────────
@@ -277,20 +780,95 @@ with st.sidebar:
 
 # ─── 헤더 ────────────────────────────────────────────────────────────────
 st.markdown("# 🌊 양식 가두리 CFD 해석 시스템")
+
+# 경과 시간 계산
+_elapsed_str = ""
+if ss.job_status == "running" and ss.get("job_start_time"):
+    _elapsed_sec = int(time.time() - ss.job_start_time)
+    _elapsed_str = f"  &nbsp;&nbsp;⏱️ 경과: **{fmt_elapsed(_elapsed_sec)}**"
+
 st.markdown(
     f"**해석 모드:** {'🔬 단위 셀 (Unit Cell)' if mode=='unit_cell' else '🏗️ 전체 구조 (Full Structure)'}  "
     f"&nbsp;&nbsp;**상태:** {status_badge(ss.job_status)}  "
-    f"&nbsp;&nbsp;**진행률:** {ss.progress}%",
+    f"&nbsp;&nbsp;**진행률:** {ss.progress:.1f}%"
+    f"{_elapsed_str}",
     unsafe_allow_html=True
 )
 
-# ─── 진행률 바 ────────────────────────────────────────────────────────────
+# 새로고침/세션 단절 후 복구된 작업을 보고 있을 때 안내
+if ss.get("_detached_view"):
+    st.info(
+        "🔄 **새로고침으로 복구된 화면입니다.** 해석은 백그라운드에서 계속 진행 중이며, "
+        "진행률·로그는 디스크에서 자동으로 불러와 갱신됩니다. "
+        "단, 이 화면에서는 '중지' 버튼이 동작하지 않을 수 있습니다.",
+        icon="ℹ️",
+    )
+
+# ─── 진행률 바 + 마지막 로그 라인 실시간 표시 ────────────────────────────
 if ss.job_status == "running":
-    st.progress(ss.progress / 100, text=f"⚙️ {ss.current_step}")
+    _bar_text = f"⚙️ {ss.current_step}" if ss.current_step else "⚙️ 해석 진행 중..."
+    st.progress(ss.progress / 100, text=f"전체 진행률 {ss.progress:.1f}%  |  {_bar_text[2:].strip()}")
+    # 배치 케이스별 진행률
+    _cp = ss.get("case_progress", {})
+    if _cp and _cp.get("total", 1) > 1:
+        _cp_pct = float(_cp.get("pct", 0.0))
+        _cp_idx = _cp.get("case_idx", 1)
+        _cp_tot = _cp.get("total", 1)
+        st.progress(
+            _cp_pct / 100,
+            text=f"케이스 {_cp_idx}/{_cp_tot} 진행률: {_cp_pct:.1f}%",
+        )
+    # 마지막 유효 로그 라인 강조 표시
+    _last_logs = [l for l in (ss.log_lines or []) if l.strip()]
+    if _last_logs:
+        _last = _last_logs[-1]
+        _log_color = "#d93025" if "❌" in _last or "오류" in _last else "#1a73e8"
+        st.markdown(
+            f'<div style="font-size:12px;color:{_log_color};'
+            f'background:#f8f9fa;padding:4px 10px;border-left:3px solid {_log_color};'
+            f'border-radius:4px;margin:2px 0;font-family:monospace;">'
+            f'📋 {_last[:120]}</div>',
+            unsafe_allow_html=True
+        )
 elif ss.job_status == "done":
     st.progress(1.0, text="✅ 해석 완료!")
 elif ss.job_status == "error":
     st.error(f"❌ 오류 발생: {ss.current_step}")
+
+# ─── 파이프라인 단계 패널 ─────────────────────────────────────────────────
+_pipeline = ss.get("pipeline_steps", [])
+if _pipeline and ss.job_status in ("running", "done", "error"):
+    _STATUS_ICON = {
+        "pending": "⬜",
+        "running": "🔵",
+        "done":    "✅",
+        "error":   "❌",
+    }
+    _STATUS_COLOR = {
+        "pending": "#888",
+        "running": "#1a73e8",
+        "done":    "#0f9d58",
+        "error":   "#d93025",
+    }
+    _pcols = st.columns(len(_pipeline))
+    for _col, _step in zip(_pcols, _pipeline):
+        _icon  = _STATUS_ICON.get(_step["status"], "⬜")
+        _color = _STATUS_COLOR.get(_step["status"], "#888")
+        _pct   = float(_step["pct"])          # 소수점 진행률 유지
+        _detail = _step.get("detail", "")
+        with _col:
+            st.markdown(
+                f"<div style='text-align:center;padding:6px;border:1px solid {_color};"
+                f"border-radius:8px;background:{'#e8f4fd' if _step['status']=='running' else '#f8f9fa'}'>"
+                f"<div style='font-size:20px'>{_icon}</div>"
+                f"<div style='font-size:12px;font-weight:600;color:{_color}'>{_step['label']}</div>"
+                f"<div style='font-size:11px;color:#555'>{_detail or _step['status']}</div>"
+                f"<div style='background:#e0e0e0;border-radius:4px;height:6px;margin-top:4px'>"
+                f"<div style='background:{_color};width:{_pct:.1f}%;height:6px;border-radius:4px'></div></div>"
+                f"<div style='font-size:10px;color:{_color}'>{_pct:.1f}%</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
 st.divider()
 
@@ -301,7 +879,11 @@ def _start_single_analysis(
     mode, speed, angle,
     cell_size, cage_d, cage_h,
     end_time, n_cores, rho, ti,
-    nx=1, ny=1
+    nx=1, ny=1,
+    residual_control=1e-4,
+    write_interval=100,
+    refine_level=3,
+    solidity=None,
 ):
     """단일 해석 케이스 실행 (백그라운드 스레드)"""
     if ss.job_status == "running":
@@ -320,9 +902,24 @@ def _start_single_analysis(
         return
 
     set_status("running", "케이스 준비 중...")
-    ss.progress   = 0
-    ss.log_lines  = []
+    ss.progress       = 0.0
+    ss.log_lines      = []
+    ss.job_start_time = time.time()
+    ss.refresh_count  = 0
     add_log(f"해석 시작: 모드={mode}, U={speed}m/s, α={angle}°")
+
+    # ── 파이프라인 단계 초기화 ──────────────────────────────────────────────
+    _PIPE_LABELS = [
+        "blockMesh",
+        "surfaceFeatureExtract",
+        "snappyHexMesh",
+        "simpleFoam",
+        "reconstructPar",
+    ]
+    ss.pipeline_steps = [
+        {"label": lbl, "status": "pending", "pct": 0, "detail": ""}
+        for lbl in _PIPE_LABELS
+    ]
 
     # 케이스 디렉토리 생성
     case_name = f"{mode}_U{speed:.2f}_A{angle:.1f}_{datetime.now():%H%M%S}"
@@ -330,6 +927,20 @@ def _start_single_analysis(
     ss.last_result_dir = str(case_dir)
 
     def _run():
+        # ── step_cb: 단계별 진행 상태 업데이트 ─────────────────────────────
+        def _step_cb(label: str, status: str, pct: int, detail: str):
+            steps = ss.get("pipeline_steps", [])
+            for step in steps:
+                # _run_step label 예: "배경 격자 생성 (blockMesh)" — 키워드 부분 매칭
+                if step["label"] in label or label in step["label"]:
+                    step["status"] = status
+                    step["pct"]    = pct
+                    step["detail"] = detail
+                    break
+            ss.pipeline_steps = steps
+            if status == "running":
+                ss.current_step = f"{label}: {detail}" if detail else label
+
         try:
             # 케이스 빌드
             if mode == "unit_cell":
@@ -337,9 +948,14 @@ def _start_single_analysis(
                     case_dir=case_dir,
                     stl_path=stl_net,
                     speed=speed, angle_deg=angle,
-                    cell_size=cell_size or 0.02,
+                    cell_size=cell_size or None,
                     n_cores=n_cores,
-                    nx=nx, ny=ny
+                    nx=nx, ny=ny,
+                    residual_control=residual_control,
+                    end_time=end_time,
+                    write_interval=write_interval,
+                    refine_level=refine_level,
+                    solidity=solidity,
                 )
             else:
                 builder = FullStructureCaseBuilder(
@@ -349,7 +965,10 @@ def _start_single_analysis(
                     speed=speed, angle_deg=angle,
                     cage_diameter=cage_d or 10.0,
                     cage_depth=cage_h or 5.0,
-                    n_cores=n_cores
+                    n_cores=n_cores,
+                    residual_control=residual_control,
+                    end_time=end_time,
+                    write_interval=write_interval,
                 )
             builder.build()
             add_log("✅ 케이스 빌드 완료")
@@ -360,9 +979,10 @@ def _start_single_analysis(
                 n_cores=n_cores,
                 progress_cb=lambda p, s, e: (
                     setattr(ss, "progress", p),
-                    setattr(ss, "current_step", f"simpleFoam: {s}/{e}")
+                    setattr(ss, "current_step", f"반복 {s}/{e}회  ← 현재/최대")
                 ),
-                log_cb=add_log
+                log_cb=add_log,
+                step_cb=_step_cb,
             )
             ss.job_runner = runner
 
@@ -383,6 +1003,7 @@ def _start_single_analysis(
             extractor.save_csv(csv_out)
             ss.results_csv = str(csv_out)
 
+            ss.progress = 100.0
             set_status("done", "해석 완료!")
             add_log(f"✅ 해석 완료! 결과: {csv_out}")
 
@@ -414,9 +1035,22 @@ def _start_batch_analysis(mode, speeds, angles, csv_path, n_cores, rho, ti, nx=1
         stl_paths["cage"] = Path(ss.stl_cage_path)
 
     set_status("running", "배치 해석 초기화 중...")
-    ss.progress  = 0
-    ss.log_lines = []
+    ss.progress       = 0.0
+    ss.log_lines      = []
+    ss.job_start_time = time.time()
+    ss.refresh_count  = 0
     add_log(f"배치 해석 시작: {len(speeds)*len(angles)}개 케이스")
+
+    # 계산량 프리셋(최소/보통/정밀)을 배치에도 반영
+    _bp = {
+        "n_cores": n_cores, "nx": nx, "ny": ny,
+        "end_time":         int(ss.get("end_time_preset", 2000)),
+        "refine_level":     int(ss.get("refine_level_preset", 3)),
+        "residual_control": float(ss.get("residual_preset", "1e-4")),
+        "write_interval":   int(ss.get("write_interval_preset", 100)),
+    }
+    add_log(f"계산 조건: 반복 {_bp['end_time']} · 정밀화 {_bp['refine_level']} · "
+            f"수렴 {_bp['residual_control']:.0e} · {n_cores}코어")
 
     manager = BatchAnalysisManager(
         mode=mode,
@@ -424,10 +1058,16 @@ def _start_batch_analysis(mode, speeds, angles, csv_path, n_cores, rho, ti, nx=1
         speeds=speeds,
         angles=angles,
         output_csv=csv_path,
-        common_params={"n_cores": n_cores, "nx": nx, "ny": ny},
-        progress_cb=lambda p, s, e: (
+        common_params=_bp,
+        progress_cb=lambda p, s, e, label="": (
             setattr(ss, "progress", p),
-            setattr(ss, "current_step", f"케이스 {s}/{e}")
+            setattr(ss, "current_step",
+                    label if label else f"케이스 {s}/{e}개  ← 완료/전체"),
+            setattr(ss, "case_progress", {
+                "case_idx": s, "total": e,
+                "pct": round(min((p - (s - 1) / e * 100) * e, 100.0), 2),
+                "label": label,
+            })
         ),
         log_cb=add_log
     )
@@ -436,11 +1076,17 @@ def _start_batch_analysis(mode, speeds, angles, csv_path, n_cores, rho, ti, nx=1
     def _run():
         try:
             manager.run_batch()
-            set_status("done", "배치 해석 완료!")
-            add_log(f"✅ 배치 완료! CSV: {csv_path}")
+            try:
+                set_status("done", "배치 해석 완료!")
+                add_log(f"✅ 배치 완료! CSV: {csv_path}")
+            except Exception:
+                pass
         except Exception as e:
-            set_status("error", str(e))
-            add_log(f"❌ 배치 오류: {e}")
+            try:
+                set_status("error", str(e))
+                add_log(f"❌ 배치 오류: {e}")
+            except Exception:
+                pass
 
     thread = threading.Thread(target=_run, daemon=True)
     # 백그라운드 스레드에서도 Streamlit session_state(ss)에 접근할 수 있도록
@@ -493,13 +1139,61 @@ with tab_input:
                 ss.stl_net_path = save_uploaded_stl(net_file, "net")
                 st.success(f"✅ 업로드 완료: {net_file.name} ({net_file.size/1024:.1f} KB)")
 
+                # STL 자동 감지
+                from cfd_manager import detect_stl_cell_size
+                _info = detect_stl_cell_size(Path(ss.stl_net_path))
+                ss.auto_cell_size_mm  = _info["cell_size_mm"]
+                ss.auto_wire_d_mm     = _info["wire_diameter_mm"]
+                ss.auto_solidity      = _info["solidity"]
+                # 위젯 기본값 업데이트 (다음 렌더링에 반영)
+                ss.cell_size_mm       = _info["cell_size_mm"]
+                ss.solidity_input     = _info["solidity"]
+
+                _front_a = _info.get("frontal_area_m2", 0.0)
+                ss.auto_frontal_area = _front_a
+                ss._input_restored = False
+                _persist_input_state()        # 새로고침 복구용 디스크 기록
+
+                st.info(
+                    f"🔍 **STL 자동 감지** — "
+                    f"단위 셀 **{_info['cell_size_mm']:.1f} mm**, "
+                    f"와이어 직경 **{_info['wire_diameter_mm']:.1f} mm**, "
+                    f"고형률 추정 **Sn ≈ {_info['solidity']:.3f}**, "
+                    f"실측 기준 투영면적 **{_front_a*1e4:.3f} cm²** (그물면 법선)"
+                )
+
                 # STL 정보 표시
                 with st.expander("🔍 STL 파일 정보"):
                     st.code(f"""
-파일명   : {net_file.name}
-크기     : {net_file.size/1024:.1f} KB
-저장 경로: {ss.stl_net_path}
+파일명          : {net_file.name}
+크기            : {net_file.size/1024:.1f} KB
+저장 경로       : {ss.stl_net_path}
+셀 크기(감지)   : {_info['cell_size_mm']:.1f} mm
+와이어 직경     : {_info['wire_diameter_mm']:.1f} mm
+고형률(추정)    : Sn = {_info['solidity']:.3f}  (참고용 2d/a 근사)
+기준 투영면적   : {_front_a:.6e} m²  = {_front_a*1e4:.4f} cm²  (실측 그물면 법선 투영)
                     """)
+                    st.caption(
+                        "💡 Aref(기준면적)는 학술 표준대로 **고정값**입니다 — 그물면 법선 "
+                        "방향 실측 투영면적 × 주기반복수(nx×ny). 영각이 바뀌어도 Aref는 "
+                        "고정이며, 영각 효과는 Cd(θ)·Cl(θ) 계수가 표현합니다."
+                    )
+
+            elif ss.get("stl_net_path") and Path(ss.stl_net_path).exists():
+                # 새로고침 등으로 업로드 위젯은 비었지만 이전 STL이 복구된 경우
+                _rn = Path(ss.stl_net_path).name
+                st.success(
+                    f"✅ 이전 업로드 STL 복구됨: **{_rn}** "
+                    f"(미리보기·감지값 유지). 새 파일로 바꾸려면 위에서 다시 업로드하세요."
+                )
+                if ss.get("auto_cell_size_mm"):
+                    _fa = ss.get("auto_frontal_area") or 0.0
+                    st.info(
+                        f"🔍 **감지값(복구)** — 단위 셀 **{ss.auto_cell_size_mm:.1f} mm**, "
+                        f"와이어 직경 **{ss.get('auto_wire_d_mm',0):.1f} mm**, "
+                        f"고형률 **Sn ≈ {ss.get('auto_solidity',0):.3f}**, "
+                        f"기준 투영면적 **{_fa*1e4:.3f} cm²**"
+                    )
 
         else:  # full_structure
             st.info("💡 **가두리 림(Rim) STL**과 **그물 STL**을 각각 업로드하세요.")
@@ -516,9 +1210,79 @@ with tab_input:
             if cage_file:
                 ss.stl_cage_path = save_uploaded_stl(cage_file, "cage")
                 st.success(f"✅ 가두리 업로드: {cage_file.name}")
+                _persist_input_state()
             if net_file2:
                 ss.stl_net_path = save_uploaded_stl(net_file2, "net2")
                 st.success(f"✅ 그물 업로드: {net_file2.name}")
+                _persist_input_state()
+            # 새로고침 복구 안내 (full_structure)
+            if not cage_file and not net_file2 and (
+                    ss.get("stl_cage_path") or ss.get("stl_net_path")):
+                _parts = []
+                if ss.get("stl_cage_path") and Path(ss.stl_cage_path).exists():
+                    _parts.append(f"가두리 **{Path(ss.stl_cage_path).name}**")
+                if ss.get("stl_net_path") and Path(ss.stl_net_path).exists():
+                    _parts.append(f"그물 **{Path(ss.stl_net_path).name}**")
+                if _parts:
+                    st.success("✅ 이전 업로드 STL 복구됨: " + ", ".join(_parts))
+
+        st.divider()
+
+        # ─── 계산량 프리셋 ────────────────────────────────────────────────
+        st.markdown("### ⚡ 계산량 프리셋")
+        _PRESETS = {
+            "최소":     {"end_time": 500,   "refine_level": 2, "residual": "1e-3", "write_interval": 100,
+                         "desc": "빠른 테스트 (~30분)"},
+            "보통":     {"end_time": 2000,  "refine_level": 3, "residual": "1e-4", "write_interval": 100,
+                         "desc": "일반 해석 (~2시간)"},
+            "정밀":     {"end_time": 5000,  "refine_level": 4, "residual": "1e-4", "write_interval": 200,
+                         "desc": "고정밀 (~5시간)"},
+            "최고정밀": {"end_time": 10000, "refine_level": 4, "residual": "1e-5", "write_interval": 500,
+                         "desc": "검증용 (~10시간+)"},
+        }
+        _pcols = st.columns(4)
+        for _col, (_pname, _pvals) in zip(_pcols, _PRESETS.items()):
+            with _col:
+                _is_active = (ss.get("calc_preset_name") == _pname)
+                _btn_type = "primary" if _is_active else "secondary"
+                if st.button(
+                    f"{'✅ ' if _is_active else ''}{_pname}",
+                    help=_pvals["desc"],
+                    use_container_width=True,
+                    type=_btn_type,
+                    key=f"preset_btn_{_pname}",
+                ):
+                    ss.calc_preset_name     = _pname
+                    ss.end_time_preset      = _pvals["end_time"]
+                    ss.refine_level_preset  = _pvals["refine_level"]
+                    ss.residual_preset      = _pvals["residual"]
+                    ss.write_interval_preset = _pvals["write_interval"]
+                    st.rerun()
+
+        _cur = _PRESETS.get(ss.get("calc_preset_name", "보통"), _PRESETS["보통"])
+        st.caption(
+            f"현재: **{ss.get('calc_preset_name','보통')}** — "
+            f"반복 {ss.get('end_time_preset', 2000)} / 격자 레벨 {ss.get('refine_level_preset', 3)} / "
+            f"수렴 {ss.get('residual_preset','1e-4')} / 저장간격 {ss.get('write_interval_preset', 100)}"
+        )
+
+        # 수렴 기준 · 저장 간격 (개별 조정 가능)
+        _sc1, _sc2 = st.columns(2)
+        with _sc1:
+            residual_control = st.select_slider(
+                "수렴 기준 (Residual)",
+                options=["1e-3", "1e-4", "1e-5"],
+                key="residual_preset",
+                help="프리셋으로 자동 설정됩니다. 수동 조정 가능.",
+            )
+            residual_control = float(residual_control)
+        with _sc2:
+            write_interval = st.number_input(
+                "결과 저장 간격 (스텝)",
+                min_value=10, max_value=1000, step=50,
+                key="write_interval_preset",
+                help="N 스텝마다 결과 필드를 디스크에 저장합니다.",
+            )
 
         st.divider()
 
@@ -533,53 +1297,81 @@ with tab_input:
                     min_value=0.1, max_value=5.0, step=0.1,
                     key="speed_single"
                 )
+                _auto_cs = ss.get("auto_cell_size_mm")
+                _cs_help = ("STL 자동 감지값이 적용됨. 수동 수정 가능."
+                            if _auto_cs else "STL 업로드 시 자동 감지됩니다.")
                 cell_size = st.number_input(
-                    "단위 셀 크기 a [mm]", value=20.0,
-                    min_value=5.0, max_value=100.0, step=1.0,
-                    key="cell_size_mm"
+                    "단위 셀 크기 a [mm]",
+                    value=float(ss.get("cell_size_mm", 20.0)),
+                    min_value=1.0, max_value=200.0, step=1.0,
+                    key="cell_size_mm",
+                    help=_cs_help,
                 ) / 1000.0
+                if _auto_cs:
+                    st.caption(f"자동 감지: {_auto_cs:.1f} mm | 와이어: {ss.get('auto_wire_d_mm',0):.1f} mm")
+                solidity = st.number_input(
+                    "고형률 Sn (그물실 투영 면적 비율)",
+                    value=float(ss.get("solidity_input", 0.15)),
+                    min_value=0.01, max_value=0.95, step=0.01,
+                    key="solidity_input",
+                    help="Sn = 그물실 투영 면적 / 패널 전체 면적. STL 업로드 시 자동 추정 (≈ 2d/a). "
+                         "Aref = Sn × 패널면적으로 설정되어 Cd가 원기둥 Cd(~1.2)와 직접 비교 가능합니다.",
+                )
+                refine_level = st.number_input(
+                    "격자 정밀화 레벨",
+                    min_value=1, max_value=4, step=1,
+                    key="refine_level_preset",
+                    help="snappyHexMesh 표면 최대 정밀화 레벨 (min = 레벨-1). "
+                         "레벨 3: ~50만 셀(권장), 레벨 4: ~200만 셀(정밀)",
+                )
 
             with col_b:
-                angle_val = st.number_input(
-                    "영각 AoA [°]", value=0.0,
-                    min_value=-90.0, max_value=90.0, step=5.0,
-                    key="angle_single"
+                angle_val = st.slider(
+                    "영각 AoA [°]",
+                    min_value=-90, max_value=90, value=0, step=5,
+                    key="angle_single",
+                    help="유속 방향 각도 (XZ 평면). 0°=수평, 90°=수직(법선 방향)",
                 )
                 end_time = st.number_input(
-                    "최대 반복 횟수", value=2000,
-                    min_value=500, max_value=10000, step=500
+                    "최대 반복 횟수",
+                    min_value=100, max_value=10000, step=100,
+                    key="end_time_preset",
+                    help="controlDict endTime. 수렴 기준 도달 시 조기 종료됩니다.",
                 )
 
             # 속도 벡터 미리보기
             from cfd_manager import compute_velocity_vector
             Ux, Uy, Uz = compute_velocity_vector(speed_val, angle_val)
             st.info(
-                f"📐 **속도 벡터** = ({Ux:.4f}, {Uy:.4f}, {Uz:.4f}) m/s  "
+                f"📐 **속도 벡터** = ({Ux:.3f}, 0, {Uz:.3f}) m/s  "
+                f"| dragDir=({Ux/speed_val:.3f} 0 {Uz/speed_val:.3f})  "
                 f"| Reynolds = {speed_val * cell_size / 1.19e-6:.1f}"
             )
 
-            # 주기 경계조건 반복 수 설정
-            st.markdown("#### 🔁 주기 경계조건 반복 수 (Periodic BC)")
+            # 주기 경계조건 반복 수 (보고용 — 메시/Cd/계산시간에 영향 없음)
+            st.markdown("#### 🔁 주기 반복 수 (Nx×Ny) — 보고용")
             col_nx, col_ny = st.columns(2)
             with col_nx:
                 nx_val = st.number_input(
                     "X 방향 반복 수 (Nx)",
-                    min_value=1, max_value=10, step=1,
+                    min_value=1, max_value=100, step=1,
                     key="unit_nx",
-                    help="STL에 X축(주기) 방향으로 포함된 단위 셀 개수"
+                    help="대표하려는 무한 배열의 X 방향 셀 개수. 격자는 항상 1셀만 "
+                         "계산하므로 Cd·계산시간에는 영향 없음. '총 힘[N]' 환산에만 사용."
                 )
             with col_ny:
                 ny_val = st.number_input(
                     "Y 방향 반복 수 (Ny)",
-                    min_value=1, max_value=10, step=1,
+                    min_value=1, max_value=100, step=1,
                     key="unit_ny",
-                    help="STL에 Y축(주기) 방향으로 포함된 단위 셀 개수"
+                    help="대표하려는 무한 배열의 Y 방향 셀 개수. (Cd·계산시간 불변)"
                 )
-            domain_x_mm = cell_size * nx_val * 1000
-            domain_y_mm = cell_size * ny_val * 1000
+            domain_x_mm = cell_size * 1000
+            domain_y_mm = cell_size * 1000
             st.info(
-                f"📦 **해석 도메인**: {domain_x_mm:.1f} mm (X) × {domain_y_mm:.1f} mm (Y)  "
-                f"| STL에 **{nx_val}×{ny_val} = {nx_val*ny_val}개** 단위 셀 포함 필요"
+                f"📦 **해석 격자**: 항상 **1셀** = {domain_x_mm:.1f} × {domain_y_mm:.1f} mm "
+                f"(주기 BC). Nx×Ny={nx_val}×{ny_val}는 **계산시간·Cd에 영향 없음** — "
+                f"총 힘[N]을 {nx_val*ny_val}배로 환산할 때만 쓰입니다."
             )
 
         else:  # full_structure
@@ -594,22 +1386,70 @@ with tab_input:
                     min_value=1.0, max_value=50.0, step=0.5
                 )
             with col_b:
-                angle_val = st.number_input(
-                    "유입 영각 [°]", value=0.0,
-                    min_value=-45.0, max_value=45.0, step=5.0
+                angle_val = st.slider(
+                    "유입 영각 [°]",
+                    min_value=-45, max_value=45, value=0, step=5,
+                    help="가두리 유입 각도 (XZ 평면)",
                 )
                 cage_h = st.number_input(
                     "가두리 수심 H [m]", value=5.0,
                     min_value=1.0, max_value=30.0, step=0.5
                 )
             end_time = st.number_input(
-                "최대 반복 횟수", value=3000,
-                min_value=500, max_value=15000, step=500
+                "최대 반복 횟수",
+                min_value=100, max_value=15000, step=100,
+                key="end_time_preset",
+                help="controlDict endTime. 수렴 기준 도달 시 조기 종료됩니다.",
             )
             Re = speed_val * cage_d / 1.19e-6
             st.info(f"📐 **가두리 Reynolds 수** = {Re:.2e}  |  도메인: {3*cage_d:.0f}D × {3*cage_d:.0f}D × {cage_h:.0f}m")
 
     with col_right:
+        # ─── STL 미리보기 (인터랙티브 3D) ────────────────────────────────
+        _stl_show = ss.get("stl_net_path") or ss.get("stl_cage_path")
+        if _stl_show and Path(_stl_show).exists():
+            st.markdown("### 🖼️ STL 미리보기")
+            _angle_v  = float(ss.get("angle_single", angle_val))
+            _nx_v     = int(ss.get("unit_nx", 1))
+            _ny_v     = int(ss.get("unit_ny", 1))
+            _cs_m     = float(ss.get("cell_size_mm", 20.0)) / 1000.0
+
+            # ── 인터랙티브 Plotly 뷰어 (마우스 드래그 회전 가능) ──────────
+            _fig3d = render_stl_interactive_plotly(
+                _stl_show, mode, _angle_v, _nx_v, _ny_v, _cs_m
+            )
+            if _fig3d is not None:
+                st.plotly_chart(_fig3d, use_container_width=True,
+                                key="stl_3d_preview")
+                st.caption(
+                    "💡 마우스 드래그: 회전  |  스크롤: 줌  |  오른쪽 드래그: 이동"
+                )
+            else:
+                # ── 정적 이미지 폴백 ──────────────────────────────────────
+                _stl_img = render_stl_preview(_stl_show, angle_deg=_angle_v)
+                _mode_badge = "🔬 단위 셀 모드" if mode == "unit_cell" else "🏗️ 전체 구조 모드"
+                if _stl_img:
+                    st.image(_stl_img, use_container_width=True,
+                             caption=f"{_mode_badge}  |  유속 방향 α={_angle_v:.0f}°")
+                else:
+                    st.info("STL 렌더링 실패 — Plotly/PyVista/matplotlib 확인 필요")
+
+            if mode == "unit_cell" and ss.get("auto_cell_size_mm"):
+                _ci1, _ci2, _ci3, _ci4 = st.columns(4)
+                _ci1.metric("셀 크기", f"{ss.auto_cell_size_mm:.1f} mm")
+                _ci2.metric("와이어 직경", f"{ss.get('auto_wire_d_mm',0):.1f} mm")
+                _ci3.metric("고형률 Sn", f"{ss.get('auto_solidity',0):.3f}")
+                # 고정 기준면적(Aref) 라이브 계산 — 그물면 법선 투영, 1셀(영각·nx/ny 무관)
+                try:
+                    from cfd_manager import compute_projected_area as _cpa
+                    _aref_live = _cpa(Path(ss.stl_net_path), (0.0, 0.0, 1.0))
+                    _ci4.metric("Aref (1셀 고정)", f"{_aref_live*1e4:.3f} cm²",
+                                help="그물면 법선 투영(실측, 1셀). 영각·nx/ny에 불변 — "
+                                     "영각 효과는 Cd/Cl이 표현")
+                except Exception:
+                    pass
+            st.divider()
+
         # ─── 해석 정보 요약 ───────────────────────────────────────────────
         st.markdown("### 📋 해석 설정 요약")
 
@@ -619,13 +1459,28 @@ with tab_input:
             "영각":         f"{angle_val:.1f}°",
             "MPI 코어":     f"{n_cores}개",
             "최대 반복":    str(end_time),
+            "수렴 기준":    f"{residual_control:.0e}",
+            "저장 간격":    f"{int(write_interval)} 스텝",
             "해수 밀도":    f"{rho:.1f} kg/m³",
             "동점성계수":   f"{nu:.2f} × 10⁻⁶ m²/s",
             "난류 강도":    f"{ti}%",
         }
         if mode == "unit_cell":
             summary_data["단위 셀 크기"] = f"{cell_size*1000:.1f} mm"
-            summary_data["반복 수 (Nx×Ny)"] = f"{ss.unit_nx} × {ss.unit_ny} = {ss.unit_nx*ss.unit_ny}개"
+            summary_data["고형률 Sn"] = f"{float(solidity):.3f}  (참고용 2d/a 추정)"
+            summary_data["반복 수 (Nx×Ny)"] = (
+                f"{ss.unit_nx} × {ss.unit_ny} (보고용 — 격자·Cd·시간 불변)")
+            # 기준면적 Aref: 고정 기준면적(그물면 법선 투영, 1셀, 영각·nx/ny 무관)
+            if ss.get("stl_net_path"):
+                try:
+                    from cfd_manager import compute_projected_area as _cpa2
+                    _aref2 = _cpa2(Path(ss.stl_net_path), (0.0, 0.0, 1.0))
+                    summary_data["기준면적 Aref"] = (
+                        f"{_aref2:.4e} m²  (고정·실측 그물면 법선 투영, 1셀 — 영각·nx/ny 무관)"
+                    )
+                except Exception:
+                    pass
+            summary_data["정밀화 레벨"] = f"{int(refine_level)} (min {max(1,int(refine_level)-1)} / max {int(refine_level)})"
         else:
             summary_data["가두리 직경"] = f"{cage_d:.1f} m"
             summary_data["가두리 수심"] = f"{cage_h:.1f} m"
@@ -634,6 +1489,23 @@ with tab_input:
             col_k, col_v = st.columns([1, 1])
             col_k.markdown(f"**{key}**")
             col_v.markdown(val)
+
+        st.divider()
+
+        # ─── 예상 소요 시간 (조건에 따라 동적 갱신) ────────────────────────
+        _rl_e = refine_level if mode == "unit_cell" else 3
+        _est = estimate_case_minutes(end_time, _rl_e, n_cores)
+        st.markdown("### ⏱️ 예상 소요 시간")
+        _ec1, _ec2 = st.columns([1, 1.4])
+        _ec1.metric("대략 예상", fmt_duration(_est))
+        _ec2.caption(
+            f"범위 **{fmt_duration(_est*0.6)} ~ {fmt_duration(_est*1.5)}** "
+            f"(반복 {int(end_time)} · 정밀화 {int(_rl_e)} · {n_cores}코어). "
+            f"단위셀은 주기 BC라 nx/ny와 무관하게 일정. "
+            f"수렴 기준에 먼저 도달하면 더 빨리 끝납니다."
+        )
+        # 입력값(반복·정밀화·코어·nx/ny) 변경 시점 상태 저장
+        _persist_input_state()
 
         st.divider()
 
@@ -668,7 +1540,11 @@ with tab_input:
                     cage_d if mode == "full_structure" else None,
                     cage_h if mode == "full_structure" else None,
                     end_time, n_cores, rho, ti,
-                    nx=ss.unit_nx, ny=ss.unit_ny
+                    nx=ss.unit_nx, ny=ss.unit_ny,
+                    residual_control=residual_control,
+                    write_interval=int(write_interval),
+                    refine_level=int(refine_level) if mode == "unit_cell" else 3,
+                    solidity=float(solidity) if mode == "unit_cell" else None,
                 )
 
         with btn_col2:
@@ -697,39 +1573,55 @@ with tab_batch:
     with col_b1:
         st.markdown("#### 유속 설정")
         u_min   = st.number_input("최소 유속 [m/s]", value=0.5, min_value=0.1, max_value=5.0, step=0.1)
-        u_max   = st.number_input("최대 유속 [m/s]", value=2.0, min_value=0.1, max_value=5.0, step=0.1)
-        u_steps = st.number_input("유속 단계 수",    value=4,   min_value=1,   max_value=20,  step=1)
+        u_max   = st.number_input("최대 유속 [m/s]", value=1.0, min_value=0.1, max_value=5.0, step=0.1)
+        u_steps = st.number_input("유속 단계 수",    value=2,   min_value=1,   max_value=20,  step=1)
         speeds  = list(np.linspace(u_min, u_max, int(u_steps)))
 
     with col_b2:
         st.markdown("#### 영각 설정")
         a_min   = st.number_input("최소 영각 [°]", value=0.0,  min_value=-90.0, max_value=90.0, step=5.0)
-        a_max   = st.number_input("최대 영각 [°]", value=45.0, min_value=-90.0, max_value=90.0, step=5.0)
-        a_steps = st.number_input("영각 단계 수",  value=5,    min_value=1,     max_value=20,   step=1)
+        a_max   = st.number_input("최대 영각 [°]", value=90.0, min_value=-90.0, max_value=90.0, step=5.0)
+        a_steps = st.number_input("영각 단계 수",  value=10,   min_value=1,     max_value=20,   step=1)
         angles  = list(np.linspace(a_min, a_max, int(a_steps)))
 
     # ─── 파라미터 매트릭스 미리보기 ──────────────────────────────────────
     st.markdown("#### 📊 해석 매트릭스 미리보기")
     total_cases = len(speeds) * len(angles)
-    st.metric("총 해석 케이스", f"{total_cases}개",
-              help="유속 × 영각 조합의 총 수")
 
-    # 테이블 형식으로 표시
-    import pandas as pd
-    matrix_data = {}
-    for s in speeds:
-        matrix_data[f"U={s:.2f}"] = [f"U={s:.2f}, α={a:.1f}°" for a in angles]
-    matrix_df = pd.DataFrame(
-        matrix_data,
-        index=[f"α={a:.1f}°" for a in angles]
+    # 예상 총 소요 시간 (케이스 수 × 조건 기반, 순차 실행 가정)
+    _b_end    = int(ss.get("end_time_preset", 2000))
+    _b_refine = int(ss.get("refine_level_preset", 3))
+    _per_case = estimate_case_minutes(_b_end, _b_refine, n_cores)
+    _total_min = _per_case * total_cases
+
+    _tc1, _tc2 = st.columns(2)
+    _tc1.metric("총 해석 케이스", f"{total_cases}개",
+                help="유속 × 영각 조합의 총 수")
+    _tc2.metric("예상 총 소요 시간", fmt_duration(_total_min),
+                help=f"케이스당 약 {fmt_duration(_per_case)} × {total_cases}개 (순차 실행). "
+                     f"반복 {_b_end}·정밀화 {_b_refine}·{n_cores}코어 기준")
+    st.caption(
+        f"⏱️ 예상 범위 **{fmt_duration(_total_min*0.6)} ~ {fmt_duration(_total_min*1.5)}** "
+        f"— 케이스마다 수렴 시점이 달라 실제 시간은 변동합니다. "
+        f"계산 조건은 **입력 설정** 탭의 프리셋에서 바꾸면 이 값이 즉시 갱신됩니다."
     )
-    st.dataframe(matrix_df, use_container_width=True)
 
-    # 단위 셀 모드일 때 현재 반복 수 표시
+    # ── 설정 요약 및 매트릭스 미리보기 ──────────────────────────────────
+    import pandas as pd
+    _sm1, _sm2 = st.columns(2)
+    _sm1.info(f"**유속 목록**: {', '.join(f'{s:.2f}' for s in speeds)} m/s")
+    _sm2.info(f"**영각 목록**: {', '.join(f'{a:.0f}°' for a in angles)}")
+
+    matrix_data = {f"U={s:.2f} m/s": ["✓" for _ in angles] for s in speeds}
+    matrix_df = pd.DataFrame(matrix_data, index=[f"α={a:.0f}°" for a in angles])
+    st.dataframe(matrix_df, use_container_width=True, height=min(38 + len(angles)*35, 420))
+
+    # 단위 셀 모드일 때 현재 반복 수 표시 (보고용 — 계산시간 불변)
     if mode == "unit_cell":
         st.info(
-            f"🔁 **현재 반복 수 설정**: Nx={ss.unit_nx} × Ny={ss.unit_ny} = {ss.unit_nx*ss.unit_ny}개  "
-            f"— 변경하려면 **입력 설정** 탭에서 수정하세요."
+            f"🔁 **반복 수(보고용)**: Nx={ss.unit_nx} × Ny={ss.unit_ny}  "
+            f"— 주기 BC라 격자는 항상 1셀, **계산시간·Cd에 영향 없음**. "
+            f"총 힘[N] 환산에만 사용됩니다."
         )
 
     st.divider()
@@ -746,7 +1638,7 @@ with tab_batch:
     with col_bb1:
         batch_disabled = (ss.job_status == "running")
         if st.button(
-            f"🚀 배치 해석 시작 ({total_cases}개 케이스)",
+            f"🚀 배치 해석 시작 ({total_cases}개 · 예상 {fmt_duration(_total_min)})",
             disabled=batch_disabled,
             use_container_width=True,
             type="primary"
@@ -784,6 +1676,181 @@ with tab_batch:
     else:
         st.info("아직 저장된 결과 CSV가 없습니다. 배치 해석을 실행하세요.")
 
+    # ─── 배치 해석 결과 통합 그래프 ──────────────────────────────────────
+    st.divider()
+    st.markdown("#### 📈 배치 해석 결과 통합 그래프")
+
+    all_batch_csvs = sorted(
+        list((RESULTS_DIR / "unit_cell").glob("*.csv")) +
+        list((RESULTS_DIR / "full_structure").glob("*.csv")),
+        key=lambda f: f.stat().st_mtime, reverse=True
+    )
+
+    if not all_batch_csvs:
+        st.info("표시할 결과 CSV가 없습니다. 배치 해석을 먼저 실행하세요.")
+    else:
+        import pandas as pd
+
+        # 각 CSV의 유효 Cd/Cl 행수를 세어 '유효 데이터 많은 순'으로 정렬 →
+        # 기본 선택이 빈(전부 NaN) CSV가 되어 그래프가 안 보이는 문제 방지
+        def _valid_count(_p):
+            try:
+                _d = pd.read_csv(_p)
+                if "Cd" in _d.columns and "Cl" in _d.columns:
+                    return int(_d.dropna(subset=["Cd", "Cl"]).shape[0])
+            except Exception:
+                pass
+            return 0
+
+        _csv_meta = [(c, _valid_count(c)) for c in all_batch_csvs]
+        # 유효행 많은 순 → 같으면 최신순
+        _csv_meta.sort(key=lambda t: (t[1], t[0].stat().st_mtime), reverse=True)
+
+        bg_csv_options = {
+            f"{c.name}  (유효 {n}행)": c for c, n in _csv_meta
+        }
+        bg_sel_label = st.selectbox(
+            "결과 CSV 파일 선택  — 유효 데이터 많은 순 정렬",
+            options=list(bg_csv_options.keys()),
+            key="batch_graph_csv_sel"
+        )
+        bg_csv_path = bg_csv_options[bg_sel_label]
+
+        try:
+            import plotly.graph_objects as go
+            from plotly.subplots import make_subplots as _make_subplots
+
+            _df_bg = pd.read_csv(bg_csv_path)
+            if "Cd" not in _df_bg.columns or "Cl" not in _df_bg.columns:
+                _df_bg_valid = _df_bg.iloc[0:0]
+            else:
+                _df_bg_valid = _df_bg.dropna(subset=["Cd", "Cl"])
+
+            if _df_bg_valid.empty:
+                _n_total = len(_df_bg)
+                st.warning(
+                    f"선택한 CSV에 유효한 Cd/Cl 데이터가 없습니다 "
+                    f"(전체 {_n_total}행 모두 NaN). 해당 케이스들이 완료 전 중단됐거나 "
+                    f"forceCoeffs 추출이 실패한 경우입니다. **유효 행이 있는 다른 CSV**를 "
+                    f"선택하거나 해석을 다시 완료하세요."
+                )
+            else:
+                _speeds_avail = sorted(_df_bg_valid["speed_m_s"].unique())
+                _angles_avail = sorted(_df_bg_valid["angle_deg"].unique())
+
+                _fg1, _fg2 = st.columns(2)
+                with _fg1:
+                    _sel_spds = st.multiselect(
+                        "표시할 유속 [m/s]",
+                        options=[f"{s:.3g}" for s in _speeds_avail],
+                        default=[f"{s:.3g}" for s in _speeds_avail],
+                        key="batch_graph_spd_filter"
+                    )
+                with _fg2:
+                    _sel_angs = st.multiselect(
+                        "표시할 영각 [°]",
+                        options=[f"{a:.3g}" for a in _angles_avail],
+                        default=[f"{a:.3g}" for a in _angles_avail],
+                        key="batch_graph_ang_filter"
+                    )
+
+                _sel_spd_vals = [float(s) for s in _sel_spds]
+                _sel_ang_vals = [float(a) for a in _sel_angs]
+                _df_plot = _df_bg_valid[
+                    _df_bg_valid["speed_m_s"].isin(_sel_spd_vals) &
+                    _df_bg_valid["angle_deg"].isin(_sel_ang_vals)
+                ].copy()
+
+                if _df_plot.empty:
+                    st.warning("선택한 유속/영각 조합에 해당하는 데이터가 없습니다.")
+                else:
+                    _COLORS = [
+                        "#e74c3c", "#3498db", "#2ecc71", "#f39c12",
+                        "#9b59b6", "#1abc9c", "#e67e22", "#34495e"
+                    ]
+
+                    _fig_bg = _make_subplots(
+                        rows=1, cols=2,
+                        subplot_titles=("Cd vs 영각", "Cl vs 영각"),
+                        horizontal_spacing=0.12
+                    )
+
+                    _unique_speeds = sorted(_df_plot["speed_m_s"].unique())
+                    for _j, _spd in enumerate(_unique_speeds):
+                        _sub = _df_plot[_df_plot["speed_m_s"] == _spd].sort_values("angle_deg")
+                        _clr = _COLORS[_j % len(_COLORS)]
+                        _lbl = f"U = {_spd:.3g} m/s"
+
+                        _fig_bg.add_trace(go.Scatter(
+                            x=_sub["angle_deg"], y=_sub["Cd"],
+                            mode="lines+markers",
+                            name=_lbl,
+                            line=dict(color=_clr, width=2.5),
+                            marker=dict(size=8, symbol="circle"),
+                            hovertemplate=(
+                                f"<b>{_lbl}</b><br>"
+                                "영각: %{x:.1f}°<br>"
+                                "Cd: %{y:.5f}<extra></extra>"
+                            ),
+                            legendgroup=_lbl,
+                        ), row=1, col=1)
+
+                        _fig_bg.add_trace(go.Scatter(
+                            x=_sub["angle_deg"], y=_sub["Cl"],
+                            mode="lines+markers",
+                            name=_lbl,
+                            showlegend=False,
+                            line=dict(color=_clr, width=2.5, dash="dot"),
+                            marker=dict(size=8, symbol="square"),
+                            hovertemplate=(
+                                f"<b>{_lbl}</b><br>"
+                                "영각: %{x:.1f}°<br>"
+                                "Cl: %{y:.5f}<extra></extra>"
+                            ),
+                            legendgroup=_lbl,
+                        ), row=1, col=2)
+
+                    _fig_bg.update_xaxes(title_text="영각 α [°]", gridcolor="#e0e0e0", row=1, col=1)
+                    _fig_bg.update_xaxes(title_text="영각 α [°]", gridcolor="#e0e0e0", row=1, col=2)
+                    _fig_bg.update_yaxes(title_text="Cd", gridcolor="#e0e0e0", row=1, col=1)
+                    _fig_bg.update_yaxes(title_text="Cl", gridcolor="#e0e0e0", row=1, col=2)
+                    _fig_bg.update_layout(
+                        height=460,
+                        legend=dict(
+                            title="유속",
+                            orientation="v",
+                            x=1.02, y=1,
+                            xanchor="left",
+                            font=dict(size=12)
+                        ),
+                        paper_bgcolor="white",
+                        plot_bgcolor="#f9f9f9",
+                        margin=dict(l=60, r=150, t=60, b=60),
+                        hovermode="x unified",
+                    )
+                    st.plotly_chart(_fig_bg, use_container_width=True, key="batch_result_combined_chart")
+
+                    # 요약 피벗 테이블
+                    with st.expander("📋 Cd / Cl 요약 테이블 보기"):
+                        _ptab1, _ptab2 = st.tabs(["Cd 테이블", "Cl 테이블"])
+                        with _ptab1:
+                            _piv_cd = _df_plot.pivot_table(
+                                values="Cd", index="angle_deg", columns="speed_m_s"
+                            )
+                            _piv_cd.index.name = "영각 [°]"
+                            _piv_cd.columns = [f"U={s:.3g}" for s in _piv_cd.columns]
+                            st.dataframe(_piv_cd.style.format("{:.5f}"), use_container_width=True)
+                        with _ptab2:
+                            _piv_cl = _df_plot.pivot_table(
+                                values="Cl", index="angle_deg", columns="speed_m_s"
+                            )
+                            _piv_cl.index.name = "영각 [°]"
+                            _piv_cl.columns = [f"U={s:.3g}" for s in _piv_cl.columns]
+                            st.dataframe(_piv_cl.style.format("{:.5f}"), use_container_width=True)
+
+        except Exception as _e:
+            st.error(f"결과 그래프 표시 오류: {_e}")
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  탭 3: 실시간 모니터
@@ -793,11 +1860,21 @@ with tab_monitor:
     st.markdown("### 📊 실시간 해석 모니터링")
 
     # ─── 상단 메트릭 ──────────────────────────────────────────────────────
-    mc1, mc2, mc3, mc4 = st.columns(4)
+    mc1, mc2, mc3, mc4, mc5 = st.columns(5)
     mc1.metric("해석 상태",   {"idle":"대기","running":"진행 중","done":"완료","error":"오류"}[ss.job_status])
-    mc2.metric("진행률",      f"{ss.progress}%")
-    mc3.metric("현재 단계",   ss.current_step or "-")
-    mc4.metric("MPI 코어",    f"{n_cores}개 / GPU RTX3090 ×2")
+    mc2.metric("진행률",      f"{ss.progress:.1f}%")
+    mc3.metric("현재 단계",   ss.current_step or "-",
+               help="단일 해석: '반복 N/M회 ← 현재/최대' — simpleFoam Time step\n배치 해석: '케이스 N/M개 ← 완료/전체' — 배치 케이스 진행률")
+    # 경과 시간 — 갱신마다 숫자 변화 → 시스템 동작 여부 확인 가능
+    if ss.job_status == "running" and ss.get("job_start_time"):
+        _esec = int(time.time() - ss.job_start_time)
+        mc4.metric("경과 시간", fmt_elapsed(_esec))
+        ss.refresh_count = ss.get("refresh_count", 0) + 1
+        mc5.metric("갱신 횟수", f"{ss.refresh_count}회",
+                   help="화면 갱신 횟수 — 숫자가 올라가면 시스템이 정상 동작 중")
+    else:
+        mc4.metric("경과 시간", "-")
+        mc5.metric("MPI 코어",  f"{n_cores}개 / GPU RTX3090 ×2")
 
     st.divider()
 
@@ -805,60 +1882,161 @@ with tab_monitor:
     viz_col, log_col = st.columns([1.4, 0.6])
 
     with viz_col:
-        st.markdown("#### 🖼️ 3D 유동장 시각화")
+        st.markdown("#### 🖼️ 3D 유동장 (인터랙티브)")
 
-        # 필드 선택
-        field_options = {"U": "속도장 |U|", "p": "압력장", "k": "난류 운동에너지",
-                         "omega": "비소산율", "residuals": "수렴 이력"}
-        selected_field = st.selectbox(
-            "시각화 필드",
-            options=list(field_options.keys()),
-            format_func=lambda x: field_options[x]
-        )
-
-        viz_subcol1, viz_subcol2 = st.columns(2)
-        with viz_subcol1:
-            slice_dir = st.selectbox("슬라이스 방향", ["y", "x", "z"])
-        with viz_subcol2:
-            show_stream = st.checkbox("유선 표시", value=False)
-
-        # 이미지 표시
-        if ss.last_result_dir and Path(ss.last_result_dir).exists():
-            viz = CFDVisualizer(Path(ss.last_result_dir))
-
-            if selected_field == "residuals":
-                img_path = viz.plot_residuals()
-            else:
-                img_path = viz.render_field(
-                    selected_field, slice_dir,
-                    show_streamlines=show_stream
+        # ── 결과 케이스 스캔 ──────────────────────────────────────────────
+        _mon_cases = []
+        for _msubdir in ["unit_cell", "full_structure"]:
+            _mroot = RESULTS_DIR / _msubdir
+            if not _mroot.exists():
+                continue
+            for _cd in sorted(_mroot.iterdir(),
+                               key=lambda x: x.stat().st_mtime, reverse=True):
+                if not _cd.is_dir() or not (_cd / "constant").exists():
+                    continue
+                # 재조합된 시간스텝 (0 제외 숫자 디렉토리)
+                _tdirs = sorted(
+                    [t for t in _cd.iterdir()
+                     if t.is_dir() and t.name.replace(".","",1).isdigit()
+                     and t.name not in ("0",)],
+                    key=lambda x: float(x.name)
                 )
+                _has_post  = (_cd / "postProcessing").exists()
+                _has_proc  = any(p.name.startswith("processor")
+                                 for p in _cd.iterdir() if p.is_dir())
+                _is_run    = (str(_cd) == ss.get("last_result_dir")
+                              and ss.job_status == "running")
+                _status = (
+                    "running"   if _is_run else
+                    "done"      if (_tdirs and _has_post) else
+                    "partial"   if (_tdirs or _has_post) else
+                    "mesh_only" if _has_proc else
+                    "empty"
+                )
+                _mon_cases.append({
+                    "key":        f"{_msubdir}/{_cd.name}",
+                    "path":       _cd,
+                    "mode":       _msubdir,
+                    "name":       _cd.name,
+                    "status":     _status,
+                    "has_fields": bool(_tdirs),
+                    "has_post":   _has_post,
+                })
 
-            if img_path and Path(img_path).exists():
-                st.image(img_path, use_container_width=True,
-                         caption=f"{field_options[selected_field]} — {Path(ss.last_result_dir).name}")
-            else:
-                st.info("🔄 해석 결과를 기다리는 중입니다...")
-                # 플레이스홀더 이미지
-                st.markdown("""
-                <div style="background:#f0f8ff; border:2px dashed #1a73e8;
-                            border-radius:10px; padding:60px; text-align:center;">
-                    <h3 style="color:#1a73e8;">🌊 해석 대기 중</h3>
-                    <p style="color:#666;">STL 파일을 업로드하고 해석을 시작하면<br>
-                    실시간으로 결과가 표시됩니다.</p>
-                </div>
-                """, unsafe_allow_html=True)
-        else:
+        if not _mon_cases:
             st.markdown("""
-            <div style="background:#f0f8ff; border:2px dashed #1a73e8;
-                        border-radius:10px; padding:60px; text-align:center;">
+            <div style="background:#f0f8ff;border:2px dashed #1a73e8;
+                        border-radius:10px;padding:40px;text-align:center;">
                 <h3 style="color:#1a73e8;">🌊 해석 시작 전</h3>
-                <p style="color:#666;">'입력 설정' 탭에서 STL 파일 업로드 후<br>
-                해석을 시작하세요.</p>
-            </div>
-            """, unsafe_allow_html=True)
+                <p style="color:#666;">'입력 설정' 탭에서 해석을 시작하세요.</p>
+            </div>""", unsafe_allow_html=True)
+        else:
+            # ── 케이스 선택 ───────────────────────────────────────────────
+            _STATUS_ICON_M = {
+                "running":   "🔄",
+                "done":      "✅",
+                "partial":   "🟡",
+                "mesh_only": "🔵",
+                "empty":     "⬜",
+            }
+            _case_labels = {
+                c["key"]: f"{_STATUS_ICON_M[c['status']]}  {c['name']}"
+                          f"{'  ← 진행 중' if c['status']=='running' else ''}"
+                for c in _mon_cases
+            }
+            # 기본 선택: 현재 실행 중이면 그 케이스, 아니면 최근 완료 케이스
+            _default_key = next(
+                (c["key"] for c in _mon_cases if c["status"] == "running"),
+                next((c["key"] for c in _mon_cases if c["status"] == "done"),
+                     _mon_cases[0]["key"])
+            )
+            _sel_idx = list(_case_labels.keys()).index(_default_key)
 
-        # 자동 갱신 컨트롤
+            _mon_sel_key = st.selectbox(
+                "케이스 선택",
+                options=list(_case_labels.keys()),
+                format_func=lambda k: _case_labels[k],
+                index=_sel_idx,
+                key="mon_case_sel",
+            )
+            _mon_case = next(c for c in _mon_cases if c["key"] == _mon_sel_key)
+            _mon_dir  = _mon_case["path"]
+
+            # ── 선택 케이스 상태 배너 ──────────────────────────────────────
+            if _mon_case["status"] == "running":
+                _run_pct = ss.progress
+                _run_step = ss.current_step or "진행 중..."
+                st.warning(
+                    f"⏳ **해석 진행 중** — {_run_pct:.1f}%  |  {_run_step}",
+                    icon=None
+                )
+                st.progress(_run_pct / 100, text=f"케이스 진행률: {_run_pct:.1f}%")
+            elif _mon_case["status"] == "done":
+                st.success("✅ 해석 완료 — 3D 유동장을 확인하세요.")
+            elif _mon_case["status"] == "partial":
+                st.info("🟡 부분 완료 — 일부 결과만 표시될 수 있습니다.")
+            elif _mon_case["status"] == "mesh_only":
+                st.info("🔵 격자 생성 완료 — 아직 해석 결과가 없습니다.")
+            else:
+                st.info("⬜ 케이스 초기화 중...")
+
+            # ── 시각화 컨트롤 ──────────────────────────────────────────────
+            _vc1, _vc2, _vc3 = st.columns([1.2, 1.2, 1])
+            with _vc1:
+                _field_opts = {"U": "속도 |U|", "p": "압력 p",
+                               "k": "난류 운동에너지 k", "omega": "비소산율 ω",
+                               "residuals": "수렴 이력"}
+                selected_field = st.selectbox(
+                    "시각화 필드",
+                    options=list(_field_opts.keys()),
+                    format_func=lambda x: _field_opts[x],
+                    key="mon_field",
+                )
+            with _vc2:
+                slice_dir = st.selectbox("슬라이스 방향", ["y", "x", "z"],
+                                         key="mon_slice_dir")
+            with _vc3:
+                show_stream = st.checkbox("유선", value=False, key="mon_stream")
+
+            if selected_field != "residuals":
+                slice_frac = st.slider(
+                    f"슬라이스 위치 ({slice_dir.upper()} 축, 0%=최소 → 100%=최대)",
+                    min_value=0, max_value=100, value=50, step=5,
+                    key="mon_slice_frac",
+                    help="슬라이더 클릭 후 마우스 휠 또는 ← → 키로 슬라이스 이동",
+                ) / 100.0
+            else:
+                slice_frac = 0.5
+
+            # ── 시각화 렌더링 ──────────────────────────────────────────────
+            if _mon_case["status"] in ("running", "mesh_only", "empty") \
+                    and not _mon_case["has_fields"] and selected_field != "residuals":
+                st.markdown("""
+                <div style="background:#fff8e1;border:2px dashed #f9a825;
+                            border-radius:10px;padding:30px;text-align:center;">
+                    <h4 style="color:#f9a825;">⏳ 유동장 결과 대기 중</h4>
+                    <p style="color:#666;">simpleFoam 완료 후 reconstructPar가 끝나면<br>
+                    3D 유동장이 표시됩니다.</p>
+                </div>""", unsafe_allow_html=True)
+            else:
+                _viz_m = CFDVisualizer(_mon_dir)
+                if selected_field == "residuals":
+                    _fig_m = _viz_m.plot_residuals_plotly()
+                    if _fig_m:
+                        st.plotly_chart(_fig_m, use_container_width=True,
+                                        key="mon_resid_chart")
+                    else:
+                        st.info("수렴 이력 데이터를 기다리는 중...")
+                else:
+                    _fig_m = _viz_m.render_field_plotly(
+                        selected_field, slice_dir, slice_frac, show_stream)
+                    if _fig_m:
+                        st.plotly_chart(_fig_m, use_container_width=True,
+                                        key="mon_field_chart")
+                        st.caption("💡 마우스 드래그: 회전  |  스크롤: 줌  |  슬라이더: 슬라이스 이동")
+                    else:
+                        st.info("🔄 유동장 데이터를 불러오는 중...")
+
         if ss.job_status == "running":
             if st.button(f"🔄 수동 갱신 ({refresh_sec}초 자동 갱신 중)"):
                 st.rerun()
@@ -884,10 +2062,9 @@ with tab_monitor:
                         unsafe_allow_html=True
                     )
 
-    # 자동 새로고침
-    if ss.job_status == "running":
-        time.sleep(refresh_sec)
-        st.rerun()
+    # ⚠️ 자동 새로고침은 여기서 하지 않는다. (이 자리에서 st.rerun()을 호출하면
+    # 뒤따르는 결과분석·도움말 탭이 렌더링되지 못해 빈 화면이 된다.)
+    # → 모든 탭 렌더링이 끝난 스크립트 맨 끝에서 수행한다.
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -923,70 +2100,163 @@ with tab_results:
         ])
 
         with r_tab1:
-            viz2 = CFDVisualizer(selected_case_dir)
-            r_col1, r_col2 = st.columns([1, 1])
-            with r_col1:
-                st.markdown("**속도장 |U|**")
-                img = viz2.render_field("U", "y")
-                if img:
-                    st.image(img, use_container_width=True)
-            with r_col2:
-                st.markdown("**압력장 p**")
-                img2 = viz2.render_field("p", "y")
-                if img2:
-                    st.image(img2, use_container_width=True)
+            # ── 인터랙티브 3D 유동장 ──────────────────────────────────────
+            _r1c1, _r1c2, _r1c3 = st.columns([1.2, 1.2, 1])
+            with _r1c1:
+                _r1_field = st.selectbox(
+                    "시각화 필드",
+                    ["U", "p", "k", "omega"],
+                    format_func=lambda x: {"U":"속도 |U|","p":"압력 p",
+                                           "k":"난류 k","omega":"비소산율 ω"}[x],
+                    key="r1_field",
+                )
+            with _r1c2:
+                _r1_sdir = st.selectbox("슬라이스 방향", ["y","x","z"], key="r1_sdir")
+            with _r1c3:
+                _r1_stream = st.checkbox("유선 표시", value=False, key="r1_stream")
+
+            _r1_sfrac = st.slider(
+                f"슬라이스 위치 ({_r1_sdir.upper()} 축, %)",
+                min_value=0, max_value=100, value=50, step=2,
+                key="r1_sfrac",
+                help="슬라이더 클릭 후 마우스 휠로 슬라이스 면을 이동합니다.",
+            ) / 100.0
+
+            _viz_r1 = CFDVisualizer(selected_case_dir)
+            _fig_r1  = _viz_r1.render_field_plotly(
+                _r1_field, _r1_sdir, _r1_sfrac, _r1_stream)
+            if _fig_r1:
+                st.plotly_chart(_fig_r1, use_container_width=True, key="r1_chart")
+                st.caption("💡 드래그: 회전  |  스크롤: 줌  |  슬라이더: 슬라이스 이동")
+            else:
+                st.info("OpenFOAM 결과 데이터 없음 — 해석 완료 후 표시됩니다.")
 
         with r_tab2:
-            viz3 = CFDVisualizer(selected_case_dir)
-            resid_img = viz3.plot_residuals()
-            if resid_img:
-                st.image(resid_img, use_container_width=True)
+            # ── 수렴 이력 (Plotly — 한국어 폰트 불필요) ──────────────────
+            _viz_r2   = CFDVisualizer(selected_case_dir)
+            _fig_resid = _viz_r2.plot_residuals_plotly()
+            if _fig_resid:
+                st.plotly_chart(_fig_resid, use_container_width=True, key="r2_resid")
+                st.caption("hover로 각 반복에서의 잔차 값 확인 가능")
             else:
-                st.info("수렴 이력 데이터가 없습니다. 해석 로그 파일을 확인하세요.")
+                # 로그 파일 목록 표시 (디버그용)
+                _log_dir = selected_case_dir
+                _logs = list(_log_dir.glob("*.log")) + list(_log_dir.glob("log.*"))
+                if _logs:
+                    st.warning(f"수렴 이력 파싱 실패 — 로그 파일 존재: {[l.name for l in _logs[:3]]}")
+                else:
+                    st.info("수렴 이력 없음 — 해석 진행 중이거나 로그 파일이 없습니다.")
 
         with r_tab3:
-            viz4 = CFDVisualizer(selected_case_dir)
-            atten_img = viz4.plot_velocity_attenuation()
-            if atten_img:
-                st.image(atten_img, use_container_width=True)
+            # ── 유속 감쇠 (Plotly) ────────────────────────────────────────
+            _viz_r3   = CFDVisualizer(selected_case_dir)
+            _fig_atten = _viz_r3.plot_velocity_attenuation_plotly()
+            if _fig_atten:
+                st.plotly_chart(_fig_atten, use_container_width=True, key="r3_atten")
             else:
-                st.info("유속 샘플링 데이터가 없습니다. (전체 구조 모드에서 이용 가능)")
+                st.info("유속 샘플링 데이터 없음 — 전체 구조 모드(full_structure)에서 이용 가능합니다.")
 
         with r_tab4:
-            # CSV 데이터 표시
-            all_csvs = list((RESULTS_DIR / "unit_cell").glob("*.csv")) + \
-                       list((RESULTS_DIR / "full_structure").glob("*.csv"))
+            # ── CSV 데이터 표시 ───────────────────────────────────────────
+            import pandas as pd
+            all_csvs = (
+                list((RESULTS_DIR / "unit_cell").glob("*.csv")) +
+                list((RESULTS_DIR / "full_structure").glob("*.csv"))
+            )
 
-            if all_csvs:
+            if not all_csvs:
+                st.info("저장된 결과 CSV가 없습니다. 해석을 완료하면 자동 생성됩니다.")
+            else:
+                _csv_names = [c.name for c in all_csvs]
                 csv_sel = st.selectbox(
                     "CSV 파일 선택",
-                    options=[c.name for c in all_csvs],
-                    key="result_csv_sel"
+                    options=_csv_names,
+                    key="result_csv_sel",
                 )
                 csv_target = next(c for c in all_csvs if c.name == csv_sel)
 
                 try:
                     df = pd.read_csv(csv_target)
-                    st.dataframe(df, use_container_width=True)
 
-                    # Cd/Cl 플롯
-                    viz5 = CFDVisualizer(selected_case_dir)
-                    coeff_img = viz5.plot_force_coefficients(csv_target)
-                    if coeff_img:
-                        st.image(coeff_img, use_container_width=True)
+                    # ── 데이터 테이블 ──────────────────────────────────────
+                    st.markdown(f"**{csv_target.name}** — {len(df)} 행, {len(df.columns)} 열")
+                    st.dataframe(
+                        df.style.format({
+                            col: "{:.5f}" for col in df.select_dtypes("float").columns
+                        }),
+                        use_container_width=True,
+                        height=250,
+                    )
 
-                    # 다운로드
-                    with open(csv_target, "rb") as f:
+                    # ── 영각 / 유속 필터 ──────────────────────────────────
+                    _has_filter_cols = "angle_deg" in df.columns and "speed_m_s" in df.columns
+                    if _has_filter_cols:
+                        _speeds_all  = sorted(df["speed_m_s"].dropna().unique())
+                        _angles_all  = sorted(df["angle_deg"].dropna().unique())
+
+                        _fc1, _fc2 = st.columns(2)
+                        with _fc1:
+                            _sel_speeds = st.multiselect(
+                                "표시할 유속 [m/s]",
+                                options=[f"{s:.2f}" for s in _speeds_all],
+                                default=[f"{s:.2f}" for s in _speeds_all],
+                                key="r4_speed_filter",
+                            )
+                        with _fc2:
+                            _sel_angles = st.multiselect(
+                                "표시할 영각 [°]",
+                                options=[f"{a:.1f}" for a in _angles_all],
+                                default=[f"{a:.1f}" for a in _angles_all],
+                                key="r4_angle_filter",
+                            )
+
+                        # 필터 적용된 임시 CSV 생성
+                        _sel_s_vals = [float(s) for s in _sel_speeds]
+                        _sel_a_vals = [float(a) for a in _sel_angles]
+                        _df_filt = df[
+                            df["speed_m_s"].isin(_sel_s_vals) &
+                            df["angle_deg"].isin(_sel_a_vals)
+                        ]
+
+                        if _df_filt.empty:
+                            st.info("선택된 유속/영각 조합의 데이터가 없습니다.")
+                        else:
+                            import tempfile as _tmp
+                            _tmp_csv = Path(_tmp.mktemp(suffix=".csv"))
+                            _df_filt.to_csv(_tmp_csv, index=False)
+                            _viz_r4 = CFDVisualizer(selected_case_dir)
+                            _fig_coeff = _viz_r4.plot_force_coefficients_plotly(_tmp_csv)
+                            _tmp_csv.unlink(missing_ok=True)
+                            if _fig_coeff and len(_fig_coeff.data) > 0:
+                                st.plotly_chart(_fig_coeff, use_container_width=True,
+                                                key="r4_coeff")
+                            else:
+                                _valid_cd = _df_filt["Cd"].notna().sum() if "Cd" in _df_filt.columns else 0
+                                st.info(f"유효한 Cd/Cl 데이터: {_valid_cd}행 — "
+                                        "해석이 완료된 케이스가 없거나 데이터가 NaN입니다.")
+                    else:
+                        _viz_r4 = CFDVisualizer(selected_case_dir)
+                        _fig_coeff = _viz_r4.plot_force_coefficients_plotly(csv_target)
+                        if _fig_coeff and len(_fig_coeff.data) > 0:
+                            st.plotly_chart(_fig_coeff, use_container_width=True,
+                                            key="r4_coeff")
+                        else:
+                            st.warning(f"CSV 컬럼: {list(df.columns)}  — "
+                                       "angle_deg, Cd, Cl 컬럼이 없습니다.")
+
+                    # ── 다운로드 버튼 ─────────────────────────────────────
+                    with open(csv_target, "rb") as _f:
                         st.download_button(
                             "⬇️ CSV 다운로드 (질량-스프링 모델 호환 포맷)",
-                            data=f.read(),
+                            data=_f.read(),
                             file_name=csv_target.name,
-                            mime="text/csv"
+                            mime="text/csv",
+                            key="r4_download",
                         )
+
                 except Exception as e:
                     st.error(f"CSV 읽기 오류: {e}")
-            else:
-                st.info("저장된 결과 CSV가 없습니다.")
+                    st.code(str(csv_target))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1058,3 +2328,12 @@ MPI 병렬화 → CPU 코어 수에 맞게 자동 설정
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  백엔드 함수 (버튼 핸들러)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ─── 자동 새로고침 (모든 탭 렌더링 이후, 스크립트 맨 끝) ─────────────────────
+# 해석 실행 중일 때만 갱신 주기마다 재실행한다. 반드시 모든 탭이 렌더링된 뒤에
+# 호출해야 결과분석·도움말 탭이 정상 표시된다. (이전엔 모니터 탭 안에서 호출해
+# 뒤 탭들이 빈 화면이 됐음)
+if ss.job_status == "running":
+    time.sleep(ss.get("refresh_interval", 3))
+    st.rerun()

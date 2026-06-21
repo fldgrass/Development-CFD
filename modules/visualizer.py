@@ -118,17 +118,25 @@ class OpenFOAMResultReader:
         return results if results else None
 
     def read_residuals(self) -> Optional[Dict[str, List[float]]]:
-        """로그 파일에서 잔차 히스토리 파싱"""
+        """로그 파일에서 잔차 히스토리 파싱.
+        케이스 폴더 내부 + 프로젝트 루트 logs/ 폴더를 함께 탐색."""
         from pathlib import Path
         import re
 
-        log_files = list(self.case_dir.glob("*.log")) + \
-                    list(self.case_dir.glob("log.*"))
+        # 케이스 이름 패턴으로 전역 logs/ 폴더도 탐색
+        _global_logs = Path(__file__).resolve().parent.parent / "logs"
+        log_files = (
+            list(self.case_dir.glob("*.log")) +
+            list(self.case_dir.glob("log.*")) +
+            list(_global_logs.glob(f"{self.case_dir.name}*.log"))
+            if _global_logs.exists() else
+            list(self.case_dir.glob("*.log")) + list(self.case_dir.glob("log.*"))
+        )
         if not log_files:
             return None
 
-        # 가장 최신 로그 파일
-        log_file = max(log_files, key=lambda f: f.stat().st_mtime)
+        # simpleFoam 로그만 우선 (가장 크고 최신인 것)
+        log_file = max(log_files, key=lambda f: f.stat().st_size)
         residuals: Dict[str, List[float]] = {}
 
         pattern = re.compile(
@@ -545,6 +553,349 @@ class CFDVisualizer:
         """캐시 무효화 (새 결과가 생성된 경우 호출)"""
         self._mesh_cache = None
         self._cache_time = 0
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Plotly 인터랙티브 시각화 (마우스 드래그 회전, 슬라이스 위치 이동)
+    # ═══════════════════════════════════════════════════════════════════════
+
+    # 필드별 Plotly 컬러스케일 매핑
+    _PLOTLY_CMAP = {
+        "U":     "Jet",
+        "p":     "RdBu_r",
+        "k":     "Hot",
+        "omega": "Plasma",
+        "nut":   "Viridis",
+    }
+    _FIELD_UNIT = {
+        "U": "m/s", "p": "Pa·m²/s²", "k": "m²/s²",
+        "omega": "1/s", "nut": "m²/s",
+    }
+
+    def render_field_plotly(self,
+                             field: str = "U",
+                             slice_normal: str = "y",
+                             slice_fraction: float = 0.5,
+                             show_streamlines: bool = False) -> Optional[Any]:
+        """
+        PyVista로 슬라이스 추출 → Plotly go.Mesh3d 인터랙티브 3D 뷰어 반환.
+        slice_fraction: 0.0(경계 최소) ~ 1.0(경계 최대) 위치 비율.
+        """
+        try:
+            import plotly.graph_objects as go
+        except ImportError:
+            return None
+
+        if not PYVISTA_OK:
+            return None
+
+        try:
+            mesh = self._get_mesh()
+            if mesh is None:
+                return None
+
+            internal = mesh["internalMesh"] if "internalMesh" in mesh.keys() else mesh
+
+            # 슬라이스 위치 계산
+            bounds = internal.bounds  # (xmin,xmax, ymin,ymax, zmin,zmax)
+            axis_map = {"x": (0, 1), "y": (2, 3), "z": (4, 5)}
+            b_lo, b_hi = axis_map.get(slice_normal, (2, 3))
+            lo, hi = bounds[b_lo], bounds[b_hi]
+            pos = lo + (hi - lo) * slice_fraction
+
+            normal_map = {"x": (1,0,0), "y": (0,1,0), "z": (0,0,1)}
+            normal_vec = normal_map.get(slice_normal, (0,1,0))
+            cx = (bounds[0]+bounds[1])/2
+            cy = (bounds[2]+bounds[3])/2
+            cz = (bounds[4]+bounds[5])/2
+            origin = {"x": (pos,cy,cz), "y": (cx,pos,cz), "z": (cx,cy,pos)}.get(
+                slice_normal, (cx, pos, cz))
+
+            sliced = internal.slice(normal=normal_vec, origin=origin)
+            if sliced.n_points == 0:
+                return None
+
+            # 삼각화 후 메시 데이터 추출
+            tri = sliced.triangulate()
+            pts = tri.points
+            raw_faces = tri.faces
+            if len(raw_faces) == 0:
+                return None
+            faces = raw_faces.reshape(-1, 4)[:, 1:]
+
+            # 스칼라 값 추출 (point data 우선)
+            def _get_scalar(ds, fname):
+                if fname not in ds.array_names:
+                    return np.zeros(ds.n_points)
+                arr = ds[fname]
+                return np.linalg.norm(arr, axis=1) if arr.ndim == 2 else np.asarray(arr, float)
+
+            scalar = _get_scalar(tri, field)
+
+            cmap   = self._PLOTLY_CMAP.get(field, "Jet")
+            unit   = self._FIELD_UNIT.get(field, "")
+            cfg    = self.FIELD_CONFIG.get(field, self.FIELD_CONFIG["U"])
+
+            fig = go.Figure()
+            fig.add_trace(go.Mesh3d(
+                x=pts[:,0], y=pts[:,1], z=pts[:,2],
+                i=faces[:,0], j=faces[:,1], k=faces[:,2],
+                intensity=scalar,
+                colorscale=cmap,
+                colorbar=dict(
+                    title=dict(text=f"{field} [{unit}]", side="right",
+                               font=dict(size=12)),
+                    thickness=14, len=0.75,
+                    tickfont=dict(size=10),
+                ),
+                showscale=True,
+                flatshading=False,
+                lighting=dict(ambient=0.8, diffuse=0.5, specular=0.1),
+                showlegend=False,
+                hovertemplate=f"{field}: %{{intensity:.4f}} {unit}<extra></extra>",
+            ))
+
+            # 경계면 (반투명 회색)
+            for key in mesh.keys():
+                if key == "internalMesh":
+                    continue
+                try:
+                    patch = mesh[key]
+                    if patch.n_points == 0:
+                        continue
+                    ptri = patch.triangulate()
+                    pf   = ptri.faces.reshape(-1, 4)[:, 1:]
+                    pp   = ptri.points
+                    fig.add_trace(go.Mesh3d(
+                        x=pp[:,0], y=pp[:,1], z=pp[:,2],
+                        i=pf[:,0], j=pf[:,1], k=pf[:,2],
+                        color='lightgray', opacity=0.15,
+                        showscale=False, showlegend=False,
+                        hoverinfo='skip',
+                    ))
+                except Exception:
+                    pass
+
+            # 유선 (Scatter3d 라인)
+            if show_streamlines and PYVISTA_OK and "U" in internal.array_names:
+                try:
+                    seeds = pv.Sphere(radius=(hi-lo)*0.05, center=list(origin))
+                    stream = internal.streamlines_from_source(
+                        seeds, vectors="U", max_steps=500, max_step_length=0.05)
+                    if stream.n_points > 0:
+                        sp = stream.points
+                        fig.add_trace(go.Scatter3d(
+                            x=sp[:,0], y=sp[:,1], z=sp[:,2],
+                            mode='lines',
+                            line=dict(color='black', width=1),
+                            showlegend=False, hoverinfo='skip',
+                        ))
+                except Exception:
+                    pass
+
+            # Annotation으로 슬라이스 위치 표시
+            pct = int(slice_fraction * 100)
+            fig.update_layout(
+                annotations=[dict(
+                    text=f"Slice {slice_normal.upper()} = {pos:.4f} m  ({pct}%)",
+                    xref="paper", yref="paper",
+                    x=0.01, y=0.99,
+                    xanchor="left", yanchor="top",
+                    showarrow=False,
+                    font=dict(size=11, color="#1a4a8a"),
+                    bgcolor="rgba(255,255,255,0.82)", borderpad=4,
+                    bordercolor="#1a4a8a", borderwidth=1,
+                )],
+                scene=dict(
+                    xaxis=dict(title="X [m]", backgroundcolor="#eaf4fb",
+                               gridcolor="white", showbackground=True),
+                    yaxis=dict(title="Y [m]", backgroundcolor="#eaf4fb",
+                               gridcolor="white", showbackground=True),
+                    zaxis=dict(title="Z [m]", backgroundcolor="#dce9f5",
+                               gridcolor="white", showbackground=True),
+                    aspectmode='data',
+                    bgcolor='rgba(240,248,255,1)',
+                    # 카메라를 약 2배 멀리 → 초기 화면에서 형상이 ~50% 작게 보임.
+                    # (기존 eye(1.5,1.0,1.0) → (3.0,2.0,2.0)) 멀어서 스크롤로
+                    # 줌아웃할 여유 공간도 약 2배로 늘어난다.
+                    camera=dict(eye=dict(x=3.0, y=2.0, z=2.0)),
+                ),
+                showlegend=False,
+                margin=dict(l=0, r=0, t=10, b=0),
+                height=360,
+                paper_bgcolor='#f0f8ff',
+            )
+            return fig
+
+        except Exception as e:
+            logger.error(f"render_field_plotly 오류: {e}")
+            return None
+
+    def plot_residuals_plotly(self) -> Optional[Any]:
+        """잔차 수렴 이력 Plotly 인터랙티브 그래프"""
+        try:
+            import plotly.graph_objects as go
+        except ImportError:
+            return None
+
+        residuals = self.reader.read_residuals()
+        if not residuals:
+            return None
+
+        colors = ['#e74c3c','#3498db','#2ecc71','#f39c12','#9b59b6','#1abc9c']
+        fig = go.Figure()
+
+        max_iter = 0
+        for i, (fname, vals) in enumerate(residuals.items()):
+            if not vals:
+                continue
+            max_iter = max(max_iter, len(vals))
+            fig.add_trace(go.Scatter(
+                x=list(range(1, len(vals)+1)),
+                y=vals,
+                mode='lines',
+                name=fname,
+                line=dict(color=colors[i % len(colors)], width=1.8),
+                hovertemplate=f"{fname}: %{{y:.2e}}  iter %{{x}}<extra></extra>",
+            ))
+
+        if max_iter > 0:
+            fig.add_trace(go.Scatter(
+                x=[1, max_iter], y=[1e-4, 1e-4],
+                mode='lines', name='Target (1e-4)',
+                line=dict(color='red', width=1, dash='dash'),
+            ))
+
+        fig.update_layout(
+            xaxis=dict(title="Iteration", gridcolor='lightgray', showgrid=True),
+            yaxis=dict(title="Residual", type='log', gridcolor='lightgray',
+                       showgrid=True, exponentformat='e'),
+            title=dict(text="Convergence History", font=dict(size=14), x=0.5),
+            legend=dict(font=dict(size=11), bgcolor='rgba(255,255,255,0.85)',
+                        bordercolor='lightgray', borderwidth=1),
+            hovermode='x unified',
+            margin=dict(l=60, r=20, t=50, b=60),
+            height=420,
+            paper_bgcolor='white',
+            plot_bgcolor='#fafafa',
+        )
+        return fig
+
+    def plot_velocity_attenuation_plotly(self, u_inlet: float = 1.0) -> Optional[Any]:
+        """유속 감쇠 프로파일 Plotly 인터랙티브 그래프 (subplot 2열)"""
+        try:
+            import plotly.graph_objects as go
+            from plotly.subplots import make_subplots
+        except ImportError:
+            return None
+
+        sampled = self.reader.read_sampled_data()
+        if not sampled:
+            return None
+
+        fig = make_subplots(
+            rows=1, cols=2,
+            subplot_titles=("Velocity |U| [m/s]", "Velocity Attenuation [%]"),
+            horizontal_spacing=0.12,
+        )
+        colors = ['#e74c3c','#3498db','#2ecc71','#f39c12','#9b59b6']
+
+        for i, (name, data) in enumerate(sampled.items()):
+            if data is None or data.ndim < 2 or data.shape[0] < 2:
+                continue
+            try:
+                if data.shape[1] >= 4:
+                    pos   = data[:, 0]
+                    u_mag = np.sqrt(data[:,1]**2 + data[:,2]**2 + data[:,3]**2)
+                    clr   = colors[i % len(colors)]
+                    fig.add_trace(go.Scatter(
+                        x=pos, y=u_mag, mode='lines+markers',
+                        name=name, line=dict(color=clr, width=1.5),
+                        marker=dict(size=4),
+                        hovertemplate="pos=%{x:.3f} m<br>|U|=%{y:.4f} m/s<extra></extra>",
+                    ), row=1, col=1)
+                    fig.add_trace(go.Scatter(
+                        x=pos, y=u_mag/u_inlet*100,
+                        mode='lines+markers',
+                        name=name, showlegend=False,
+                        line=dict(color=clr, width=1.5, dash='dot'),
+                        marker=dict(size=4),
+                        hovertemplate="pos=%{x:.3f} m<br>att=%{y:.1f}%<extra></extra>",
+                    ), row=1, col=2)
+            except Exception:
+                pass
+
+        fig.update_xaxes(title_text="Position [m]", gridcolor='lightgray', showgrid=True)
+        fig.update_yaxes(gridcolor='lightgray', showgrid=True)
+        fig.update_layout(
+            title=dict(text="Velocity Profile (Wake)", font=dict(size=14), x=0.5),
+            height=420,
+            legend=dict(font=dict(size=11)),
+            paper_bgcolor='white', plot_bgcolor='#fafafa',
+            margin=dict(l=60, r=20, t=60, b=60),
+        )
+        return fig
+
+    def plot_force_coefficients_plotly(self, csv_path: Path) -> Optional[Any]:
+        """Cd/Cl 계수 Plotly 인터랙티브 그래프"""
+        try:
+            import plotly.graph_objects as go
+            from plotly.subplots import make_subplots
+            import csv as csvmod
+        except ImportError:
+            return None
+
+        if not csv_path.exists():
+            return None
+
+        try:
+            rows = []
+            with open(csv_path) as f:
+                for row in csvmod.DictReader(f):
+                    rows.append(row)
+            if not rows:
+                return None
+
+            speeds = sorted(set(float(r["speed_m_s"]) for r in rows))
+            colors = ['#e74c3c','#3498db','#2ecc71','#f39c12','#9b59b6']
+
+            fig = make_subplots(rows=1, cols=2,
+                                subplot_titles=("Cd vs Angle of Attack",
+                                                "Cl vs Angle of Attack"),
+                                horizontal_spacing=0.12)
+
+            for j, speed in enumerate(speeds):
+                srows = [r for r in rows if abs(float(r["speed_m_s"]) - speed) < 0.01]
+                clr   = colors[j % len(colors)]
+                for col_idx, coeff in enumerate(["Cd", "Cl"], start=1):
+                    ang_v = [float(r["angle_deg"]) for r in srows
+                             if r.get(coeff, "") not in ("nan", "")]
+                    val_v = [float(r[coeff]) for r in srows
+                             if r.get(coeff, "") not in ("nan", "")]
+                    if not val_v:
+                        continue
+                    fig.add_trace(go.Scatter(
+                        x=ang_v, y=val_v, mode='lines+markers',
+                        name=f"U={speed:.2f} m/s",
+                        showlegend=(col_idx == 1),
+                        line=dict(color=clr, width=1.8),
+                        marker=dict(size=6),
+                    ), row=1, col=col_idx)
+
+            fig.update_xaxes(title_text="Angle of Attack [deg]",
+                             gridcolor='lightgray', showgrid=True)
+            fig.update_yaxes(gridcolor='lightgray', showgrid=True)
+            fig.update_layout(
+                title=dict(text="Force Coefficients (Cd / Cl)", x=0.5,
+                           font=dict(size=14)),
+                height=420, paper_bgcolor='white', plot_bgcolor='#fafafa',
+                legend=dict(font=dict(size=11)),
+                margin=dict(l=60, r=20, t=60, b=60),
+            )
+            return fig
+
+        except Exception as e:
+            logger.error(f"plot_force_coefficients_plotly 오류: {e}")
+            return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════

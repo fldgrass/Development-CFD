@@ -12,16 +12,20 @@ FoamFile
 }
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
+// ─── UI 제어 변수 (Python에서 이 두 줄만 치환) ───────────────────────────
+endTimeValue        2000;
+writeIntervalValue  100;
+
 application     simpleFoam;
 
 startFrom       startTime;
 startTime       0;
 stopAt          endTime;
-endTime         2000;          // 반복 횟수 (정상 상태 수렴 기준)
+endTime         $endTimeValue;     // 반복 횟수 (정상 상태 수렴 기준)
 
-deltaT          1;             // 반복 스텝 (steady-state이므로 1)
+deltaT          1;                 // 반복 스텝 (steady-state이므로 1)
 writeControl    timeStep;
-writeInterval   100;           // 100스텝마다 결과 저장
+writeInterval   $writeIntervalValue;  // N스텝마다 결과 저장
 purgeWrite      3;             // 최근 3개 결과만 유지 (디스크 절약)
 
 writeFormat     binary;        // binary가 ASCII보다 ~3배 빠름

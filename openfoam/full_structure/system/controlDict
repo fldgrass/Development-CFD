@@ -12,16 +12,20 @@ FoamFile
 }
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
+// ─── UI 제어 변수 (Python에서 이 두 줄만 치환) ───────────────────────────
+endTimeValue        3000;
+writeIntervalValue  100;
+
 application     simpleFoam;
 
 startFrom       startTime;
 startTime       0;
 stopAt          endTime;
-endTime         3000;
+endTime         $endTimeValue;
 
 deltaT          1;
 writeControl    timeStep;
-writeInterval   100;
+writeInterval   $writeIntervalValue;
 purgeWrite      5;
 
 writeFormat     binary;

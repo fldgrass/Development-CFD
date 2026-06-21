@@ -12,6 +12,10 @@ FoamFile
 }
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
+// ─── UI 제어 변수 (Python에서 이 두 줄만 치환) ───────────────────────────
+refineLevelMin  2;
+refineLevelMax  3;
+
 castellatedMesh true;
 snap            true;
 addLayers       false;  // 그물망 와이어가 도메인 경계에 근접 시 getFaceOrder FATAL ERROR 발생 — 비활성화
@@ -48,8 +52,8 @@ castellatedMeshControls
     {
         netSurface
         {
-            // 그물발 표면: 레벨 2~3 (3mm 와이어에 0.25mm 셀, ~50만 셀 수준)
-            level (2 3);
+            // 그물발 표면 정밀화 레벨 (UI에서 조절)
+            level ($refineLevelMin $refineLevelMax);
             patchInfo
             {
                 type    wall;
@@ -62,8 +66,10 @@ castellatedMeshControls
     {
         netSurface
         {
-            mode    inside;
-            levels  ((2e-3 3));  // 와이어 직경 이내 레벨 3
+            // distance 방식: 비밀폐(open) 그물 STL에서도 동작
+            // (2e-3 3) = 표면 2mm 이내를 레벨 3으로 정밀화
+            mode    distance;
+            levels  ((2e-3 3));
         }
     }
 

@@ -13,6 +13,9 @@ FoamFile
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 // RTX 3090 x2 GPU 가속 설정 (AmgX 플러그인 설치 시 자동 활성화)
 
+// ─── UI 제어 변수 (Python에서 이 한 줄만 치환) ───────────────────────────
+residualLevel   1e-4;
+
 solvers
 {
     p
@@ -45,9 +48,9 @@ SIMPLE
 
     residualControl
     {
-        p               1e-4;
-        U               1e-4;
-        "(k|omega)"     1e-4;
+        p               $residualLevel;
+        U               $residualLevel;
+        "(k|omega)"     $residualLevel;
     }
 }
 
