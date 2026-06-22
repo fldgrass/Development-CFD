@@ -575,10 +575,18 @@ class CFDVisualizer:
                              field: str = "U",
                              slice_normal: str = "y",
                              slice_fraction: float = 0.5,
-                             show_streamlines: bool = False) -> Optional[Any]:
+                             show_streamlines: bool = False,
+                             tile_nx: int = 1,
+                             tile_ny: int = 1,
+                             init_camera: bool = True) -> Optional[Any]:
         """
         PyVista로 슬라이스 추출 → Plotly go.Mesh3d 인터랙티브 3D 뷰어 반환.
         slice_fraction: 0.0(경계 최소) ~ 1.0(경계 최대) 위치 비율.
+        tile_nx, tile_ny: 주기 단위셀을 화면에서 nx×ny로 복제(타일링)해 보여준다.
+            해석은 항상 1셀이며 시각화만 복제한다(항목 2).
+        init_camera: True면 scene에 초기 카메라(eye)를 넣는다. **첫 렌더에만 True**,
+            이후 위젯 변경 렌더에서는 False로 호출해 figure에서 camera 키를 빼야
+            plotly.js의 uirevision이 사용자의 마우스 카메라를 보존한다(아래 (D) 주석).
         """
         try:
             import plotly.graph_objects as go
@@ -634,27 +642,19 @@ class CFDVisualizer:
             cmap   = self._PLOTLY_CMAP.get(field, "Jet")
             unit   = self._FIELD_UNIT.get(field, "")
             cfg    = self.FIELD_CONFIG.get(field, self.FIELD_CONFIG["U"])
+            _cmin  = float(scalar.min()) if scalar.size else 0.0
+            _cmax  = float(scalar.max()) if scalar.size else 1.0
 
-            fig = go.Figure()
-            fig.add_trace(go.Mesh3d(
-                x=pts[:,0], y=pts[:,1], z=pts[:,2],
-                i=faces[:,0], j=faces[:,1], k=faces[:,2],
-                intensity=scalar,
-                colorscale=cmap,
-                colorbar=dict(
-                    title=dict(text=f"{field} [{unit}]", side="right",
-                               font=dict(size=12)),
-                    thickness=14, len=0.75,
-                    tickfont=dict(size=10),
-                ),
-                showscale=True,
-                flatshading=False,
-                lighting=dict(ambient=0.8, diffuse=0.5, specular=0.1),
-                showlegend=False,
-                hovertemplate=f"{field}: %{{intensity:.4f}} {unit}<extra></extra>",
-            ))
+            # ── 타일링 오프셋 (주기 단위셀 nx×ny 복제 — 시각화 전용) ────────
+            dx = bounds[1] - bounds[0]
+            dy = bounds[3] - bounds[2]
+            tile_nx = max(1, int(tile_nx))
+            tile_ny = max(1, int(tile_ny))
+            _offsets = [(i * dx, j * dy)
+                        for i in range(tile_nx) for j in range(tile_ny)]
 
-            # 경계면 (반투명 회색)
+            # 경계면 패치 미리 추출(타일마다 복제)
+            _patches = []
             for key in mesh.keys():
                 if key == "internalMesh":
                     continue
@@ -663,17 +663,38 @@ class CFDVisualizer:
                     if patch.n_points == 0:
                         continue
                     ptri = patch.triangulate()
-                    pf   = ptri.faces.reshape(-1, 4)[:, 1:]
-                    pp   = ptri.points
-                    fig.add_trace(go.Mesh3d(
-                        x=pp[:,0], y=pp[:,1], z=pp[:,2],
-                        i=pf[:,0], j=pf[:,1], k=pf[:,2],
-                        color='lightgray', opacity=0.15,
-                        showscale=False, showlegend=False,
-                        hoverinfo='skip',
-                    ))
+                    _patches.append((ptri.points,
+                                     ptri.faces.reshape(-1, 4)[:, 1:]))
                 except Exception:
                     pass
+
+            fig = go.Figure()
+            _first = True
+            for (ox, oy) in _offsets:
+                _mk = dict(
+                    x=pts[:,0]+ox, y=pts[:,1]+oy, z=pts[:,2],
+                    i=faces[:,0], j=faces[:,1], k=faces[:,2],
+                    intensity=scalar, colorscale=cmap,
+                    cmin=_cmin, cmax=_cmax,
+                    flatshading=False,
+                    lighting=dict(ambient=0.8, diffuse=0.5, specular=0.1),
+                    showlegend=False, showscale=_first,
+                    hovertemplate=f"{field}: %{{intensity:.4f}} {unit}<extra></extra>",
+                )
+                if _first:
+                    _mk["colorbar"] = dict(
+                        title=dict(text=f"{field} [{unit}]", side="right",
+                                   font=dict(size=12)),
+                        thickness=14, len=0.75, tickfont=dict(size=10))
+                fig.add_trace(go.Mesh3d(**_mk))
+                for (pp, pf) in _patches:
+                    fig.add_trace(go.Mesh3d(
+                        x=pp[:,0]+ox, y=pp[:,1]+oy, z=pp[:,2],
+                        i=pf[:,0], j=pf[:,1], k=pf[:,2],
+                        color='lightgray', opacity=0.15,
+                        showscale=False, showlegend=False, hoverinfo='skip',
+                    ))
+                _first = False
 
             # 유선 (Scatter3d 라인)
             if show_streamlines and PYVISTA_OK and "U" in internal.array_names:
@@ -694,9 +715,45 @@ class CFDVisualizer:
 
             # Annotation으로 슬라이스 위치 표시
             pct = int(slice_fraction * 100)
+
+            # 타일링을 반영한 중심·범위. 가장 긴 변의 2배 정육면체 범위를 직접
+            # 지정해 형상이 화면 ~50%만 차지하게 하고(스크롤 줌 여유), aspectmode
+            # ='cube'로 비율 왜곡을 막는다.
+            tiled_cx = cx + (tile_nx - 1) * dx / 2.0
+            tiled_cy = cy + (tile_ny - 1) * dy / 2.0
+            _ext  = max(tile_nx * dx, tile_ny * dy,
+                        bounds[5] - bounds[4], 1e-6)
+            _half = _ext
+
+            # (D) 카메라 유지: uirevision을 상수로 두는 것만으로는 부족하다.
+            # scene.camera를 매 렌더 명시하면 Streamlit이 새 figure를 Plotly.react로
+            # 넘길 때 그 eye 값이 사용자의 마우스 회전을 덮어써 리셋된다. 따라서
+            # 첫 렌더(init_camera=True)에만 camera를 넣고, 이후 위젯 변경 렌더에서는
+            # camera 키를 아예 빼서 uirevision이 사용자 카메라를 보존하게 한다.
+            scene = dict(
+                xaxis=dict(title="X [m]", range=[tiled_cx-_half, tiled_cx+_half],
+                           visible=True, showticklabels=True,
+                           backgroundcolor="#eaf4fb",
+                           gridcolor="white", showbackground=True),
+                yaxis=dict(title="Y [m]", range=[tiled_cy-_half, tiled_cy+_half],
+                           visible=True, showticklabels=True,
+                           backgroundcolor="#eaf4fb",
+                           gridcolor="white", showbackground=True),
+                zaxis=dict(title="Z [m]", range=[cz-_half, cz+_half],
+                           visible=True, showticklabels=True,
+                           backgroundcolor="#dce9f5",
+                           gridcolor="white", showbackground=True),
+                aspectmode='cube',
+                bgcolor='rgba(240,248,255,1)',
+                uirevision='flowfield',
+            )
+            if init_camera:
+                scene['camera'] = dict(eye=dict(x=1.6, y=1.6, z=1.6))
             fig.update_layout(
                 annotations=[dict(
-                    text=f"Slice {slice_normal.upper()} = {pos:.4f} m  ({pct}%)",
+                    text=f"Slice {slice_normal.upper()} = {pos:.4f} m  ({pct}%)"
+                         + (f"   |  타일 {tile_nx}×{tile_ny}"
+                            if tile_nx * tile_ny > 1 else ""),
                     xref="paper", yref="paper",
                     x=0.01, y=0.99,
                     xanchor="left", yanchor="top",
@@ -705,29 +762,288 @@ class CFDVisualizer:
                     bgcolor="rgba(255,255,255,0.82)", borderpad=4,
                     bordercolor="#1a4a8a", borderwidth=1,
                 )],
-                scene=dict(
-                    xaxis=dict(title="X [m]", backgroundcolor="#eaf4fb",
-                               gridcolor="white", showbackground=True),
-                    yaxis=dict(title="Y [m]", backgroundcolor="#eaf4fb",
-                               gridcolor="white", showbackground=True),
-                    zaxis=dict(title="Z [m]", backgroundcolor="#dce9f5",
-                               gridcolor="white", showbackground=True),
-                    aspectmode='data',
-                    bgcolor='rgba(240,248,255,1)',
-                    # 카메라를 약 2배 멀리 → 초기 화면에서 형상이 ~50% 작게 보임.
-                    # (기존 eye(1.5,1.0,1.0) → (3.0,2.0,2.0)) 멀어서 스크롤로
-                    # 줌아웃할 여유 공간도 약 2배로 늘어난다.
-                    camera=dict(eye=dict(x=3.0, y=2.0, z=2.0)),
-                ),
+                scene=scene,
+                uirevision='flowfield',
                 showlegend=False,
                 margin=dict(l=0, r=0, t=10, b=0),
-                height=360,
+                height=420,
                 paper_bgcolor='#f0f8ff',
             )
             return fig
 
         except Exception as e:
             logger.error(f"render_field_plotly 오류: {e}")
+            return None
+
+    # ─── 입체(비슬라이스) 등치면 + 애니메이션 (항목 13) ───────────────────
+
+    def _internal_points_scalar(self, field: str):
+        """내부 메시의 점 좌표와 스칼라(벡터는 크기)를 반환. (등치면용)"""
+        mesh = self._get_mesh()
+        if mesh is None:
+            return None
+        internal = mesh["internalMesh"] if "internalMesh" in mesh.keys() else mesh
+        ds = internal
+        if field not in ds.array_names:
+            return None
+        try:
+            if field in ds.point_data:
+                pts, arr = ds.points, ds.point_data[field]
+            else:
+                ds2 = ds.cell_data_to_point_data()
+                pts, arr = ds2.points, ds2[field]
+        except Exception:
+            pts, arr = ds.points, ds[field]
+        vals = (np.linalg.norm(arr, axis=1) if getattr(arr, "ndim", 1) == 2
+                else np.asarray(arr, float))
+        return internal, np.asarray(pts), np.asarray(vals, float)
+
+    def _boundary_traces(self, go, offsets):
+        """경계면(반투명) trace 목록 — 타일 오프셋 포함."""
+        mesh = self._get_mesh()
+        out = []
+        if mesh is None:
+            return out
+        for key in mesh.keys():
+            if key == "internalMesh":
+                continue
+            try:
+                patch = mesh[key]
+                if patch.n_points == 0:
+                    continue
+                ptri = patch.triangulate()
+                pf = ptri.faces.reshape(-1, 4)[:, 1:]
+                pp = ptri.points
+                for (ox, oy) in offsets:
+                    out.append(go.Mesh3d(
+                        x=pp[:, 0]+ox, y=pp[:, 1]+oy, z=pp[:, 2],
+                        i=pf[:, 0], j=pf[:, 1], k=pf[:, 2],
+                        color='lightgray', opacity=0.12,
+                        showscale=False, showlegend=False, hoverinfo='skip'))
+            except Exception:
+                pass
+        return out
+
+    def _iso_scene(self, go, bounds, tile_nx, tile_ny, dx, dy, init_camera=True):
+        """등치면 뷰의 scene(축·카메라·uirevision) 레이아웃.
+
+        init_camera=False면 camera 키를 빼서 uirevision이 사용자 마우스 카메라를
+        보존하게 한다(첫 렌더에만 True). render_field_plotly의 (D) 주석 참고.
+        """
+        cx = (bounds[0]+bounds[1])/2 + (tile_nx-1)*dx/2.0
+        cy = (bounds[2]+bounds[3])/2 + (tile_ny-1)*dy/2.0
+        cz = (bounds[4]+bounds[5])/2
+        _half = max(tile_nx*dx, tile_ny*dy, bounds[5]-bounds[4], 1e-6)
+        scene = dict(
+            xaxis=dict(title="X [m]", range=[cx-_half, cx+_half], visible=True,
+                       showticklabels=True, backgroundcolor="#eaf4fb",
+                       gridcolor="white", showbackground=True),
+            yaxis=dict(title="Y [m]", range=[cy-_half, cy+_half], visible=True,
+                       showticklabels=True, backgroundcolor="#eaf4fb",
+                       gridcolor="white", showbackground=True),
+            zaxis=dict(title="Z [m]", range=[cz-_half, cz+_half], visible=True,
+                       showticklabels=True, backgroundcolor="#dce9f5",
+                       gridcolor="white", showbackground=True),
+            aspectmode='cube', bgcolor='rgba(240,248,255,1)',
+            # 슬라이스/입체/등치면 모두 동일 uirevision을 써서, 표시 방식을 바꿔도
+            # plotly.js가 사용자의 카메라(확대/회전) 상태를 보존하게 한다.
+            uirevision='flowfield',
+        )
+        if init_camera:
+            scene['camera'] = dict(eye=dict(x=1.6, y=1.6, z=1.6))
+        return scene
+
+    def render_field_3d(self, field: str = "U", level: Optional[float] = None,
+                        level_frac: Optional[float] = None,
+                        anim: Optional[str] = None,
+                        tile_nx: int = 1, tile_ny: int = 1,
+                        n_frames: int = 24,
+                        init_camera: bool = True) -> Optional[Any]:
+        """슬라이스가 아닌 **입체 등치면(Isosurface)** 3D 뷰.
+
+        anim=None  : 정적. level 지정 시 그 |U| 등치면 1개, 없으면 다중 등치면.
+        anim='rotate': 카메라가 궤도를 도는 재생 버튼(입체 회전 동영상).
+        anim='sweep' : 등치값을 낮은→높은 |U|로 자동 스윕하는 재생 버튼.
+        tile_nx/ny : 주기 단위셀 시각화 복제(해석은 1셀).
+        """
+        try:
+            import plotly.graph_objects as go
+            import math
+        except ImportError:
+            return None
+        if not PYVISTA_OK:
+            return None
+        try:
+            import pyvista as pv
+            mesh = self._get_mesh()
+            if mesh is None:
+                return None
+            internal = mesh["internalMesh"] if "internalMesh" in mesh.keys() else mesh
+            if field not in internal.array_names:
+                return None
+            b = internal.bounds
+            ex = [max(b[1]-b[0], 1e-9), max(b[3]-b[2], 1e-9), max(b[5]-b[4], 1e-9)]
+            # 내부 메시 점 전체를 그대로 넘기면 figure가 수백 MB가 되어 웹소켓
+            # 한도를 초과한다. 도메인 비율에 맞춘 '거친 균일 격자'(~4.5만 점)로
+            # 리샘플해 데이터량을 수 MB로 제한한다.
+            _budget = 45000
+            _scale = (_budget / (ex[0]*ex[1]*ex[2])) ** (1.0/3.0)
+            _dims = [max(6, min(110, int(round(e*_scale)))) for e in ex]
+            grid = pv.ImageData()
+            grid.dimensions = _dims
+            grid.origin = (b[0], b[2], b[4])
+            grid.spacing = (ex[0]/max(1, _dims[0]-1),
+                            ex[1]/max(1, _dims[1]-1),
+                            ex[2]/max(1, _dims[2]-1))
+            sampled = grid.sample(internal)
+            if field not in sampled.array_names:
+                return None
+            arr = sampled[field]
+            vals = (np.linalg.norm(arr, axis=1) if getattr(arr, "ndim", 1) == 2
+                    else np.asarray(arr, float))
+            if "vtkValidPointMask" in sampled.array_names:
+                _m = np.asarray(sampled["vtkValidPointMask"])
+                vals = np.where(_m > 0, vals, np.nan)
+            pts = np.asarray(sampled.points)
+            _valid = vals[~np.isnan(vals)]
+            if _valid.size == 0:
+                return None
+            vmin, vmax = float(_valid.min()), float(_valid.max())
+            if not (vmax > vmin):
+                vmax = vmin + 1e-6
+
+            dx, dy = ex[0], ex[1]
+            tile_nx = max(1, int(tile_nx)); tile_ny = max(1, int(tile_ny))
+            offsets = [(i*dx, j*dy) for i in range(tile_nx) for j in range(tile_ny)]
+            if level is None and level_frac is not None:
+                level = vmin + float(level_frac) * (vmax - vmin)
+            cmap = self._PLOTLY_CMAP.get(field, "Jet")
+            unit = self._FIELD_UNIT.get(field, "")
+
+            # 등치면 렌더링: go.Isosurface는 plotly가 격자를 특정 순서(z-fastest)로
+            # 재구성한다고 가정하는데, pyvista ImageData의 점 순서는 x-fastest라
+            # 표면 폴리곤이 만들어지지 않는다(컬러바만 보이고 메시 안 보임). 따라서
+            # pyvista .contour()로 등치면을 직접 삼각화해, 슬라이스 모드와 동일한
+            # 명시 면 인덱스(i,j,k) go.Mesh3d로 그린다(확실히 렌더링됨).
+            sampled["__mag__"] = vals
+
+            def _contour_geom(lv):
+                """리샘플 그리드에서 |field|=lv 등치면을 (점, 삼각형면, 색강도)로 추출."""
+                try:
+                    cont = sampled.contour(isosurfaces=[float(lv)], scalars="__mag__")
+                except Exception:
+                    return None
+                if cont is None or cont.n_points == 0:
+                    return None
+                ct = cont.triangulate()
+                raw = ct.faces
+                if len(raw) == 0:
+                    return None
+                cp = np.asarray(ct.points)
+                cf = raw.reshape(-1, 4)[:, 1:]
+                cintens = (np.asarray(ct["__mag__"], float)
+                           if "__mag__" in ct.array_names
+                           else np.full(cp.shape[0], float(lv)))
+                return cp, cf, cintens
+
+            def _mesh(geom, ox, oy, first):
+                """등치면 지오메트리를 타일 오프셋 적용해 go.Mesh3d로 변환.
+                geom=None(빈 등치면)이면 빈 메시로 트레이스 자리만 유지(프레임 일관성)."""
+                if geom is None:
+                    return go.Mesh3d(x=[], y=[], z=[], i=[], j=[], k=[],
+                                     showscale=False, showlegend=False,
+                                     hoverinfo="skip")
+                cp, cf, cintens = geom
+                kw = dict(
+                    x=cp[:, 0]+ox, y=cp[:, 1]+oy, z=cp[:, 2],
+                    i=cf[:, 0], j=cf[:, 1], k=cf[:, 2],
+                    intensity=cintens, colorscale=cmap, cmin=vmin, cmax=vmax,
+                    opacity=0.55, flatshading=False, showscale=first,
+                    showlegend=False,
+                    hovertemplate=f"{field}: %{{intensity:.4f}} {unit}<extra></extra>")
+                if first:
+                    kw["colorbar"] = dict(title=dict(text=f"{field} [{unit}]",
+                                          side="right"), thickness=14, len=0.75)
+                return go.Mesh3d(**kw)
+
+            fig = go.Figure()
+            n_tiles = len(offsets)
+            if anim == "sweep":
+                # 등치값을 낮은→높은 |field|로 자동 스윕. 프레임마다 메시 지오메트리
+                # 전체를 교체(각 등치면 수천 점이라 경량). 등치값별 지오메트리는 1회만
+                # 계산해 타일끼리 재사용한다.
+                _lvls = np.linspace(vmin+(vmax-vmin)*0.12, vmax-(vmax-vmin)*0.04,
+                                    max(2, min(int(n_frames), 16)))
+                _geoms = {float(lv): _contour_geom(lv) for lv in _lvls}
+                lv0 = float(_lvls[0])
+                first = True
+                for (ox, oy) in offsets:
+                    fig.add_trace(_mesh(_geoms[lv0], ox, oy, first)); first = False
+                fig.frames = [
+                    go.Frame(data=[_mesh(_geoms[float(lv)], ox, oy, (idx == 0))
+                                   for idx, (ox, oy) in enumerate(offsets)],
+                             traces=list(range(n_tiles)), name=f"{lv:.3g}")
+                    for lv in _lvls]
+            else:
+                # 정적/회전: level 지정 시 그 등치면 1개, 없으면 3개 등치면 + 경계면
+                if level is not None:
+                    _lvls = [float(level)]
+                else:
+                    _lvls = [vmin + (vmax-vmin)*f for f in (0.25, 0.5, 0.75)]
+                first = True
+                for lv in _lvls:
+                    g = _contour_geom(lv)
+                    for (ox, oy) in offsets:
+                        fig.add_trace(_mesh(g, ox, oy, first)); first = False
+                for t in self._boundary_traces(go, offsets):
+                    fig.add_trace(t)
+                if anim == "rotate":
+                    _nf = max(2, int(n_frames))
+                    fig.frames = [
+                        go.Frame(layout=go.Layout(scene=dict(camera=dict(
+                            eye=dict(x=1.7*math.cos(2*math.pi*fi/_nf),
+                                     y=1.7*math.sin(2*math.pi*fi/_nf), z=1.0)))),
+                            name=str(fi))
+                        for fi in range(_nf)]
+
+            _menus = []
+            if anim in ("rotate", "sweep"):
+                _dur = 90 if anim == "rotate" else 140
+                # 재생/정지 버튼은 좌하단에 둔다. 좌상단(0.01,0.99)에 모드 안내
+                # annotation 배지가 있어 그 자리에 두면 겹친다(E).
+                _menus = [dict(
+                    type="buttons", showactive=False, direction="right",
+                    x=0.02, y=0.02, xanchor="left", yanchor="bottom",
+                    bgcolor="rgba(255,255,255,0.88)", bordercolor="#1a4a8a",
+                    borderwidth=1, pad=dict(t=3, b=3, l=5, r=5),
+                    buttons=[
+                        dict(label="▶ 재생", method="animate",
+                             args=[None, dict(frame=dict(duration=_dur, redraw=True),
+                                              fromcurrent=True,
+                                              transition=dict(duration=0))]),
+                        dict(label="⏸ 정지", method="animate",
+                             args=[[None], dict(frame=dict(duration=0, redraw=False),
+                                                mode="immediate")]),
+                    ])]
+
+            _ann = "입체 등치면" + ({"rotate": " · 카메라 회전 재생",
+                                   "sweep": " · 등치값 자동 스윕"}.get(anim, ""))
+            fig.update_layout(
+                annotations=[dict(text=_ann, xref="paper", yref="paper",
+                    x=0.01, y=0.99, xanchor="left", yanchor="top", showarrow=False,
+                    font=dict(size=11, color="#1a4a8a"),
+                    bgcolor="rgba(255,255,255,0.82)", borderpad=4,
+                    bordercolor="#1a4a8a", borderwidth=1)],
+                scene=self._iso_scene(go, b, tile_nx, tile_ny, dx, dy,
+                                      init_camera=init_camera),
+                uirevision='flowfield',
+                updatemenus=_menus,
+                showlegend=False, margin=dict(l=0, r=0, t=10, b=0),
+                height=460, paper_bgcolor='#f0f8ff',
+            )
+            return fig
+        except Exception as e:
+            logger.error(f"render_field_3d 오류: {e}")
             return None
 
     def plot_residuals_plotly(self) -> Optional[Any]:
@@ -742,6 +1058,10 @@ class CFDVisualizer:
             return None
 
         colors = ['#e74c3c','#3498db','#2ecc71','#f39c12','#9b59b6','#1abc9c']
+        # 솔버 필드명을 읽기 쉬운 범례 라벨로(없으면 원본 그대로)
+        _label = {"Ux": "Ux (속도 x)", "Uy": "Uy (속도 y)", "Uz": "Uz (속도 z)",
+                  "p": "p (압력)", "k": "k (난류에너지)", "omega": "ω (비소산율)",
+                  "epsilon": "ε (소산율)", "nut": "νt"}
         fig = go.Figure()
 
         max_iter = 0
@@ -749,28 +1069,34 @@ class CFDVisualizer:
             if not vals:
                 continue
             max_iter = max(max_iter, len(vals))
+            _nm = _label.get(fname, fname) or fname
             fig.add_trace(go.Scatter(
                 x=list(range(1, len(vals)+1)),
                 y=vals,
                 mode='lines',
-                name=fname,
+                name=_nm,
                 line=dict(color=colors[i % len(colors)], width=1.8),
-                hovertemplate=f"{fname}: %{{y:.2e}}  iter %{{x}}<extra></extra>",
+                hovertemplate=f"{_nm}: %{{y:.2e}}  iter %{{x}}<extra></extra>",
             ))
 
         if max_iter > 0:
             fig.add_trace(go.Scatter(
                 x=[1, max_iter], y=[1e-4, 1e-4],
-                mode='lines', name='Target (1e-4)',
+                mode='lines', name='수렴 목표 (1e-4)',
                 line=dict(color='red', width=1, dash='dash'),
             ))
 
+        # 범례 글자가 보이지 않던 문제(항목 10) → 전역/범례 폰트 색을 명시한다.
         fig.update_layout(
+            font=dict(color="#222"),
             xaxis=dict(title="Iteration", gridcolor='lightgray', showgrid=True),
             yaxis=dict(title="Residual", type='log', gridcolor='lightgray',
                        showgrid=True, exponentformat='e'),
-            title=dict(text="Convergence History", font=dict(size=14), x=0.5),
-            legend=dict(font=dict(size=11), bgcolor='rgba(255,255,255,0.85)',
+            title=dict(text="Convergence History", font=dict(size=14, color="#222"), x=0.5),
+            showlegend=True,
+            legend=dict(font=dict(size=12, color="#222"),
+                        title=dict(text="필드", font=dict(size=12, color="#222")),
+                        bgcolor='rgba(255,255,255,0.9)',
                         bordercolor='lightgray', borderwidth=1),
             hovermode='x unified',
             margin=dict(l=60, r=20, t=50, b=60),

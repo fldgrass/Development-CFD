@@ -61,6 +61,24 @@ functions
         Aref            50.0;      // 가두리 단면적 [m^2] - Python에서 교체
     }
 
+    // ─── 합력(N) 출력 — Fx/Fy/Fz 추출용 ──────────────────────────────
+    // forceCoeffs는 무차원 계수만 쓰므로, 실제 힘[N]을 얻으려면 forces
+    // 함수 객체가 별도로 필요하다. ESI v2312는 postProcessing/forces/<t>/
+    // force.dat (total/pressure/viscous 성분) + moment.dat 를 쓴다.
+    forces
+    {
+        type            forces;
+        libs            ("libforces.so");
+        writeControl    timeStep;
+        writeInterval   10;
+        log             false;
+
+        patches         (cageSurface netSurface);
+        rho             rhoInf;
+        rhoInf          1025;
+        CofR            (0 0 0);
+    }
+
     // ─── 유속 감쇠 측정 (가두리 전/후 샘플링 라인) ────────────────────
     velocitySampling
     {

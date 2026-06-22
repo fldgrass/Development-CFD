@@ -943,32 +943,56 @@ class ResultExtractor:
         return results if results else None
 
     def extract_forces(self) -> Optional[Dict]:
-        """forces 함수로부터 합력 추출"""
+        """forces 함수 객체의 출력에서 합력(N)을 추출한다.
+
+        ESI v2312는 `postProcessing/forces/<time>/force.dat` 에 합력을 쓴다.
+        컬럼은 `Time  total_x total_y total_z  pressure_xyz  viscous_xyz`
+        형식이며, 버전에 따라 벡터가 괄호 `(...)` 로 묶여 나올 수도 있어
+        괄호를 제거한 뒤 파싱한다(legacy `forces.dat`도 같은 방식으로 처리).
+        마지막 10스텝 평균을 합력으로 본다(계수 추출과 동일 정책).
+        """
         pp_dir = self.case_dir / "postProcessing"
         force_dirs = list(pp_dir.glob("forces*"))
         for fd in force_dirs:
             time_dirs = sorted(
                 [d for d in fd.iterdir() if d.is_dir()],
-                key=lambda x: float(x.name) if x.name.replace('.','').isdigit() else 0
+                key=lambda x: float(x.name) if x.name.replace('.', '').isdigit() else 0
             )
             if not time_dirs:
                 continue
-            f_file = time_dirs[-1] / "forces.dat"
+            # ESI v2312: force.dat / legacy: forces.dat
+            f_file = time_dirs[-1] / "force.dat"
+            if not f_file.exists():
+                f_file = time_dirs[-1] / "forces.dat"
             if not f_file.exists():
                 continue
+
             lines = [l for l in f_file.read_text().splitlines()
                      if not l.startswith("#") and l.strip()]
-            if lines:
-                parts = lines[-1].split()
-                if len(parts) >= 7:
+            if not lines:
+                continue
+
+            last_lines = lines[-min(10, len(lines)):]
+            fx_vals, fy_vals, fz_vals = [], [], []
+            for line in last_lines:
+                # 괄호로 묶인 벡터 표기 `( ... )` 를 제거해 평탄한 컬럼으로 만든다.
+                parts = line.replace("(", " ").replace(")", " ").split()
+                # parts[0]=Time, parts[1:4]=총합력(total) x/y/z
+                if len(parts) >= 4:
                     try:
-                        return {
-                            "Fx_N": float(parts[1]),
-                            "Fy_N": float(parts[2]),
-                            "Fz_N": float(parts[3]),
-                        }
+                        fx_vals.append(float(parts[1]))
+                        fy_vals.append(float(parts[2]))
+                        fz_vals.append(float(parts[3]))
                     except (ValueError, IndexError):
                         pass
+
+            if fx_vals:
+                n = len(fx_vals)
+                return {
+                    "Fx_N": sum(fx_vals) / n,
+                    "Fy_N": sum(fy_vals) / n,
+                    "Fz_N": sum(fz_vals) / n,
+                }
         return None
 
     def save_csv(self, output_path: Path) -> Path:
@@ -1047,8 +1071,16 @@ class BatchAnalysisManager:
             self._log(f"배치 {i+1}/{total}: 유속={speed:.2f}m/s, 영각={angle:.1f}°")
             self._log(f"{'='*60}")
 
-            case_name = f"{self.mode}_U{speed:.2f}_A{angle:.1f}"
-            case_dir  = RESULTS_DIR / self.mode / case_name
+            # 케이스 디렉토리 명명: 실행 중에는 '해석중_', 완료 후 '해석완료_'로
+            # rename 한다(항목 12). 결과분석 매트릭스가 이 접두어로 상태를 구분한다.
+            base_name    = f"{self.mode}_U{speed:.2f}_A{angle:.1f}"
+            running_name = f"해석중_{base_name}"
+            done_name    = f"해석완료_{base_name}"
+            case_dir  = RESULTS_DIR / self.mode / running_name
+            done_dir  = RESULTS_DIR / self.mode / done_name
+            # 같은 조합의 이전 '해석중_' 잔여물 정리(완료본은 성공 시점에만 교체)
+            if case_dir.exists():
+                shutil.rmtree(case_dir, ignore_errors=True)
 
             # 케이스 시작 직전 — 초기화/격자생성 구간에도 진행률 표시
             self._progress(round(i / total * 100, 1), i + 1, total)
@@ -1113,18 +1145,26 @@ class BatchAnalysisManager:
                 # 워크플로우 반환값과 무관하게 forceCoeffs(Cd/Cl)가 있으면 추출한다.
                 # (reconstructPar나 솔버의 비치명적 비정상 종료로 ok=False여도 결과가
                 #  생성됐으면 살린다 → 결과 유실 방지)
-                extractor = ResultExtractor(case_dir, speed, angle)
-                _cf  = extractor.extract_force_coeffs() or {}
+                _cf  = ResultExtractor(case_dir, speed, angle).extract_force_coeffs() or {}
                 _cdv = _cf.get("Cd")
                 if isinstance(_cdv, (int, float)):
-                    extractor.save_csv(self.output_csv)
-                    self._log(f"✅ 케이스 완료 [{case_name}] — Cd={_cdv:.4f}")
+                    # 성공 → '해석완료_'로 rename 후 그 경로로 CSV 저장(case_name 반영)
+                    final_dir = case_dir
+                    try:
+                        if done_dir.exists():
+                            shutil.rmtree(done_dir, ignore_errors=True)
+                        case_dir.rename(done_dir)
+                        final_dir = done_dir
+                    except Exception as _re:
+                        self._log(f"⚠️ 완료 rename 실패({_re}) — '해석중_' 유지")
+                    ResultExtractor(final_dir, speed, angle).save_csv(self.output_csv)
+                    self._log(f"✅ 케이스 완료 [{final_dir.name}] — Cd={_cdv:.4f}")
                 else:
-                    self._log(f"❌ 케이스 결과 없음 [{case_name}] "
+                    self._log(f"❌ 케이스 결과 없음 [{running_name}] "
                               f"(forceCoeffs 미생성, 워크플로우 ok={ok})")
 
             except Exception as e:
-                self._log(f"❌ 케이스 오류 [{case_name}]: {e}")
+                self._log(f"❌ 케이스 오류 [{running_name}]: {e}")
 
             self._progress(round((i + 1) / total * 100, 1), i + 1, total)
 
