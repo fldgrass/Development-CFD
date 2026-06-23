@@ -816,11 +816,12 @@ class CFDVisualizer:
                 pass
         return out
 
-    def _iso_scene(self, go, bounds, tile_nx, tile_ny, dx, dy, init_camera=True):
+    def _iso_scene(self, go, bounds, tile_nx, tile_ny, dx, dy,
+                   init_camera=True, anim=None):
         """등치면 뷰의 scene(축·카메라) 레이아웃.
 
-        카메라 유지(uirevision)는 포기. uirevision을 빼고 camera를 항상 명시해
-        화면을 늘 1.6배 확대(eye 거리 1.0)로 표시한다. (init_camera 무시)
+        anim='sweep': uirevision을 넣어 재생 중 사용자 카메라(회전·확대)를 보존한다.
+        그 외: uirevision 없이 camera를 항상 명시해 초기 1.6배 확대를 보장한다.
         """
         cx = (bounds[0]+bounds[1])/2 + (tile_nx-1)*dx/2.0
         cy = (bounds[2]+bounds[3])/2 + (tile_ny-1)*dy/2.0
@@ -839,6 +840,10 @@ class CFDVisualizer:
             aspectmode='cube', bgcolor='rgba(240,248,255,1)',
             camera=dict(eye=dict(x=1.0, y=1.0, z=1.0)),
         )
+        if anim == 'sweep':
+            # sweep는 프레임이 data만 교체하므로 uirevision으로 카메라 상태를 보존한다.
+            # 첫 렌더에서 camera(eye=1.0)가 적용된 뒤 재생해도 리셋되지 않는다.
+            scene['uirevision'] = 'iso_sweep_camera'
         return scene
 
     def render_field_3d(self, field: str = "U", level: Optional[float] = None,
@@ -1023,7 +1028,7 @@ class CFDVisualizer:
                     bgcolor="rgba(255,255,255,0.82)", borderpad=4,
                     bordercolor="#1a4a8a", borderwidth=1)],
                 scene=self._iso_scene(go, b, tile_nx, tile_ny, dx, dy,
-                                      init_camera=init_camera),
+                                      init_camera=init_camera, anim=anim),
                 updatemenus=_menus,
                 showlegend=False, margin=dict(l=0, r=0, t=10, b=0),
                 height=520, paper_bgcolor='#f0f8ff',

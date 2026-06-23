@@ -1675,10 +1675,12 @@ with tab_results:
             _done_pref = _d.name.startswith("해석완료_")
             if _run_pref and ss.job_status == "running":
                 _stt = "running"
-            elif _done_pref or (_tdirs and _has_post):
+            elif _done_pref:
                 _stt = "done"
             elif _run_pref:
                 _stt = "stopped"
+            elif _tdirs and _has_post:
+                _stt = "partial"
             elif _tdirs or _has_post:
                 _stt = "partial"
             else:
@@ -1694,7 +1696,7 @@ with tab_results:
     _by_cond = {}
     _mprio = {"running": 3, "done": 2}
     for _c in _cases:
-        if _c["status"] == "done" or (_c["status"] == "partial" and _c["has_fields"]):
+        if _c["status"] == "done":
             _mst = "done"
         elif _c["status"] == "running":
             _mst = "running"
