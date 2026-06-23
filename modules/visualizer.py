@@ -584,9 +584,7 @@ class CFDVisualizer:
         slice_fraction: 0.0(경계 최소) ~ 1.0(경계 최대) 위치 비율.
         tile_nx, tile_ny: 주기 단위셀을 화면에서 nx×ny로 복제(타일링)해 보여준다.
             해석은 항상 1셀이며 시각화만 복제한다(항목 2).
-        init_camera: True면 scene에 초기 카메라(eye)를 넣는다. **첫 렌더에만 True**,
-            이후 위젯 변경 렌더에서는 False로 호출해 figure에서 camera 키를 빼야
-            plotly.js의 uirevision이 사용자의 마우스 카메라를 보존한다(아래 (D) 주석).
+        init_camera: 현재 무시됨 — camera를 매 렌더 항상 명시해 1.6배 확대 고정.
         """
         try:
             import plotly.graph_objects as go
@@ -716,20 +714,17 @@ class CFDVisualizer:
             # Annotation으로 슬라이스 위치 표시
             pct = int(slice_fraction * 100)
 
-            # 타일링을 반영한 중심·범위. 가장 긴 변의 2배 정육면체 범위를 직접
-            # 지정해 형상이 화면 ~50%만 차지하게 하고(스크롤 줌 여유), aspectmode
-            # ='cube'로 비율 왜곡을 막는다.
+            # 씬 범위를 타일링된 XY 크기 기준으로 설정한다.
+            # Z 도메인 길이를 포함하면 씬이 너무 넓어져 단위셀 그물망이 작게 보이므로
+            # XY 크기만 사용해 그물망이 씬의 ~50%를 채우도록 한다.
             tiled_cx = cx + (tile_nx - 1) * dx / 2.0
             tiled_cy = cy + (tile_ny - 1) * dy / 2.0
-            _ext  = max(tile_nx * dx, tile_ny * dy,
-                        bounds[5] - bounds[4], 1e-6)
-            _half = _ext
+            _half = max(tile_nx * dx, tile_ny * dy, 1e-6)
 
-            # (D) 카메라 유지: uirevision을 상수로 두는 것만으로는 부족하다.
-            # scene.camera를 매 렌더 명시하면 Streamlit이 새 figure를 Plotly.react로
-            # 넘길 때 그 eye 값이 사용자의 마우스 회전을 덮어써 리셋된다. 따라서
-            # 첫 렌더(init_camera=True)에만 camera를 넣고, 이후 위젯 변경 렌더에서는
-            # camera 키를 아예 빼서 uirevision이 사용자 카메라를 보존하게 한다.
+            # 카메라 유지(uirevision)는 포기. uirevision을 두면 plotly.js가 명시한
+            # camera(eye)를 무시하고 이전 줌을 보존해 초기 확대가 화면에 반영되지
+            # 않는다. 따라서 uirevision을 빼고 camera를 매 렌더 항상 명시해 화면이
+            # 늘 1.6배 확대 상태(eye 거리 1.0)로 표시되게 한다. (init_camera 무시)
             scene = dict(
                 xaxis=dict(title="X [m]", range=[tiled_cx-_half, tiled_cx+_half],
                            visible=True, showticklabels=True,
@@ -745,10 +740,8 @@ class CFDVisualizer:
                            gridcolor="white", showbackground=True),
                 aspectmode='cube',
                 bgcolor='rgba(240,248,255,1)',
-                uirevision='flowfield',
+                camera=dict(eye=dict(x=1.0, y=1.0, z=1.0)),
             )
-            if init_camera:
-                scene['camera'] = dict(eye=dict(x=1.6, y=1.6, z=1.6))
             fig.update_layout(
                 annotations=[dict(
                     text=f"Slice {slice_normal.upper()} = {pos:.4f} m  ({pct}%)"
@@ -763,10 +756,9 @@ class CFDVisualizer:
                     bordercolor="#1a4a8a", borderwidth=1,
                 )],
                 scene=scene,
-                uirevision='flowfield',
                 showlegend=False,
                 margin=dict(l=0, r=0, t=10, b=0),
-                height=420,
+                height=520,
                 paper_bgcolor='#f0f8ff',
             )
             return fig
@@ -825,15 +817,15 @@ class CFDVisualizer:
         return out
 
     def _iso_scene(self, go, bounds, tile_nx, tile_ny, dx, dy, init_camera=True):
-        """등치면 뷰의 scene(축·카메라·uirevision) 레이아웃.
+        """등치면 뷰의 scene(축·카메라) 레이아웃.
 
-        init_camera=False면 camera 키를 빼서 uirevision이 사용자 마우스 카메라를
-        보존하게 한다(첫 렌더에만 True). render_field_plotly의 (D) 주석 참고.
+        카메라 유지(uirevision)는 포기. uirevision을 빼고 camera를 항상 명시해
+        화면을 늘 1.6배 확대(eye 거리 1.0)로 표시한다. (init_camera 무시)
         """
         cx = (bounds[0]+bounds[1])/2 + (tile_nx-1)*dx/2.0
         cy = (bounds[2]+bounds[3])/2 + (tile_ny-1)*dy/2.0
         cz = (bounds[4]+bounds[5])/2
-        _half = max(tile_nx*dx, tile_ny*dy, bounds[5]-bounds[4], 1e-6)
+        _half = max(tile_nx*dx, tile_ny*dy, 1e-6)
         scene = dict(
             xaxis=dict(title="X [m]", range=[cx-_half, cx+_half], visible=True,
                        showticklabels=True, backgroundcolor="#eaf4fb",
@@ -845,12 +837,8 @@ class CFDVisualizer:
                        showticklabels=True, backgroundcolor="#dce9f5",
                        gridcolor="white", showbackground=True),
             aspectmode='cube', bgcolor='rgba(240,248,255,1)',
-            # 슬라이스/입체/등치면 모두 동일 uirevision을 써서, 표시 방식을 바꿔도
-            # plotly.js가 사용자의 카메라(확대/회전) 상태를 보존하게 한다.
-            uirevision='flowfield',
+            camera=dict(eye=dict(x=1.0, y=1.0, z=1.0)),
         )
-        if init_camera:
-            scene['camera'] = dict(eye=dict(x=1.6, y=1.6, z=1.6))
         return scene
 
     def render_field_3d(self, field: str = "U", level: Optional[float] = None,
@@ -1036,10 +1024,9 @@ class CFDVisualizer:
                     bordercolor="#1a4a8a", borderwidth=1)],
                 scene=self._iso_scene(go, b, tile_nx, tile_ny, dx, dy,
                                       init_camera=init_camera),
-                uirevision='flowfield',
                 updatemenus=_menus,
                 showlegend=False, margin=dict(l=0, r=0, t=10, b=0),
-                height=460, paper_bgcolor='#f0f8ff',
+                height=520, paper_bgcolor='#f0f8ff',
             )
             return fig
         except Exception as e:

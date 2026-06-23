@@ -1704,7 +1704,7 @@ with tab_results:
         if _k not in _by_cond or _mprio[_mst] > _mprio[_by_cond[_k]["mstatus"]]:
             _by_cond[_k] = dict(case=_c, mstatus=_mst)
 
-    # ── 매트릭스 그리드 = 입력 설정의 유속·영각 단계(세션 키 연동) ───────────
+    # ── 매트릭스 그리드 = 입력 설정의 유속·영각 단계만 (세션 키 연동) ──────────
     _um = float(ss.get("u_min", 1.0)); _ux = float(ss.get("u_max", 1.0))
     _us = int(ss.get("u_steps", 1))
     _amn = float(ss.get("a_min", 0.0)); _amx = float(ss.get("a_max", 0.0))
@@ -1718,10 +1718,9 @@ with tab_results:
         st.info("입력 설정에서 유속·영각 조건을 먼저 지정하세요.")
     else:
         # ─── 해석 매트릭스 ────────────────────────────────────────────────
-        st.markdown("#### 🧮 해석 매트릭스 — 입력 설정의 유속·영각 조건과 연동")
-        st.caption("☑ 완료   ⏳ 진행 중   ☐ 미해석   ·   셀을 클릭하면 그 조건의 "
-                   "유동장이 표시됩니다(미해석 셀은 '해석 시작 전' 안내). "
-                   "행·열은 **입력 설정의 유속·영각 단계 수**로 구성됩니다.")
+        st.markdown("#### 🧮 해석 매트릭스")
+        st.caption("☑ 완료   ⏳ 진행 중   ☐ 미해석   ·   셀 클릭 → 유동장 표시. "
+                   "행·열은 **입력 설정의 유속·영각 단계**와 일치합니다.")
 
         _hdr = st.columns([0.9] + [1] * len(_speeds_grid))
         _hdr[0].markdown("**α \\ U**")
@@ -1740,11 +1739,38 @@ with tab_results:
                         ss.res_sel_cond = f"{_s:.2f}_{_a:.1f}"
                         st.rerun()
 
+        # ── 입력 설정 밖의 디스크 완료 케이스 별도 표시 ──────────────────────
+        _grid_keys = {(s, a) for a in _angles_grid for s in _speeds_grid}
+        _disk_extra = {k: v for k, v in _by_cond.items() if k not in _grid_keys}
+        if _disk_extra:
+            with st.expander(f"📂 이전 완료 케이스 ({len(_disk_extra)}개) — 클릭해서 유동장 보기",
+                             expanded=False):
+                _de_speeds = sorted({k[0] for k in _disk_extra})
+                _de_angles = sorted({k[1] for k in _disk_extra})
+                _de_hdr = st.columns([0.9] + [1] * len(_de_speeds))
+                _de_hdr[0].markdown("**α \\ U**")
+                for _dj, _ds in enumerate(_de_speeds):
+                    _de_hdr[_dj + 1].markdown(f"**U={_ds:.2f}**")
+                for _da in _de_angles:
+                    _de_row = st.columns([0.9] + [1] * len(_de_speeds))
+                    _de_row[0].markdown(f"**α={_da:.1f}°**")
+                    for _dj, _ds in enumerate(_de_speeds):
+                        _de_ent = _disk_extra.get((_ds, _da))
+                        _de_mst = _de_ent["mstatus"] if _de_ent else "none"
+                        with _de_row[_dj + 1]:
+                            if st.button(_BOX[_de_mst],
+                                         key=f"de_{_ds:.2f}_{_da:.1f}",
+                                         help=f"U={_ds:.2f}, α={_da:.1f}° — {_MTXT[_de_mst]}",
+                                         use_container_width=True):
+                                ss.res_sel_cond = f"{_ds:.2f}_{_da:.1f}"
+                                st.rerun()
+
         st.divider()
 
         # ── 선택 조건 해석 (기본: 첫 완료/진행 셀, 없으면 그리드 첫 셀) ──────
         # 저장된 선택이 현재 그리드 밖이면(입력 조건 변경 등) 재기본화한다.
-        _grid_keys = {(s, a) for a in _angles_grid for s in _speeds_grid}
+        # _grid_keys는 매트릭스 + 디스크 별도 섹션 합집합으로 유효 범위 확장.
+        _grid_keys = {(s, a) for a in _angles_grid for s in _speeds_grid} | set(_disk_extra.keys())
         _cur = ss.get("res_sel_cond")
         _cur_ok = False
         if _cur:
