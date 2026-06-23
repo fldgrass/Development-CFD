@@ -1850,73 +1850,76 @@ with tab_results:
                     with _c2:
                         _r1_stream = st.checkbox("유선 표시", value=False,
                                                  key="r1_stream")
-                    _r1_sfrac = st.slider(
-                        f"슬라이스 위치 ({_r1_sdir.upper()} 축, %)",
-                        min_value=0, max_value=100, value=50, step=2,
-                        key="r1_sfrac") / 100.0
+                    # 슬라이스 위치는 Plotly 내장 슬라이더로 제어(n_frames=11).
+                    # Streamlit 슬라이더를 쓰면 리런 → Plotly.react() → 카메라 리셋.
                     _fig_r1 = _viz_r1.render_field_plotly(
-                        _r1_field, _r1_sdir, _r1_sfrac, _r1_stream,
-                        tile_nx=_tnx, tile_ny=_tny, init_camera=_init_cam)
-                    _cap = "💡 드래그: 회전 | 스크롤: 줌 | 슬라이더: 슬라이스 이동 (앵글 유지됨)"
+                        _r1_field, _r1_sdir, 0.5, _r1_stream,
+                        tile_nx=_tnx, tile_ny=_tny, init_camera=_init_cam,
+                        n_frames=11)
+                    _cap = "💡 드래그: 회전 | 스크롤: 줌 | 차트 하단 슬라이더: 슬라이스 위치"
                 elif _vmode == "입체":
-                    # 정적 입체 등치면(자동 회전 없음). 마우스로 직접 회전·확대하며,
-                    # 재생 버튼이 없어 확대 상태가 어떤 조작에서도 초기화되지 않는다.
                     _fig_r1 = _viz_r1.render_field_3d(
                         _r1_field, tile_nx=_tnx, tile_ny=_tny,
                         init_camera=_init_cam)
-                    _cap = "💡 드래그: 회전 | 스크롤: 줌 (등치면 3개 — 확대 유지됨)"
+                    _cap = "💡 드래그: 회전 | 스크롤: 줌 (등치면 3개)"
                 else:  # 등치면(스윕)
-                    _manual = st.checkbox("수동 등치값 고정", value=False,
-                                          key="r1_iso_manual",
-                                          help="체크 해제 시 ▶ 재생으로 등치값 자동 스윕")
-                    if _manual:
-                        _lf = st.slider("등치값 (필드 범위의 %)", 0, 100, 50,
-                                        step=5, key="r1_iso_level") / 100.0
-                        _fig_r1 = _viz_r1.render_field_3d(
-                            _r1_field, level_frac=_lf, tile_nx=_tnx, tile_ny=_tny,
-                            init_camera=_init_cam)
-                        _cap = "수동 고정 등치면 — 슬라이더로 등치값 변경"
-                    else:
-                        _fig_r1 = _viz_r1.render_field_3d(
-                            _r1_field, anim="sweep", tile_nx=_tnx, tile_ny=_tny,
-                            init_camera=_init_cam)
-                        _cap = "▶ 재생 버튼으로 등치값이 낮은→높은 값으로 자동 스윕됩니다"
+                    # 수동 슬라이더 체크박스 제거 — Plotly 내장 슬라이더가 수동·자동 모두 담당.
+                    # ▶ 재생: 자동 스윕  |  차트 하단 슬라이더: 수동 위치 선택
+                    _fig_r1 = _viz_r1.render_field_3d(
+                        _r1_field, anim="sweep", tile_nx=_tnx, tile_ny=_tny,
+                        init_camera=_init_cam)
+                    _cap = "▶ 재생: 자동 스윕 | 차트 하단 슬라이더: 수동 위치 — 회전·확대 유지됨"
 
                 if _fig_r1:
                     st.plotly_chart(_fig_r1, use_container_width=True, key="r1_chart")
                     ss["_cam_init_field"] = True
-                    if _vmode == "등치면(스윕)" and not _manual:
-                        import streamlit.components.v1 as _cv1
-                        _cv1.html("""<script>
+                    # 모든 3D 모드에 JS 주입 — 카메라(회전·확대) 유지.
+                    # cam을 클로저 변수 대신 localStorage에 저장한다.
+                    # Streamlit이 슬라이더 변경 시 Plotly.relayout()을 추가 호출해
+                    # plotly_relayout이 발동되어 클로저 cam이 덮어쓰여지는 문제를 차단.
+                    # Plotly.react()는 plotly_relayout을 발동하지 않으므로 localStorage
+                    # 값은 사용자 인터랙션으로만 업데이트된다.
+                    import streamlit.components.v1 as _cv1
+                    _cv1.html("""<script>
 (function(){
+  // 슬라이스·등치면 모두 Plotly 애니메이션 프레임을 사용하므로
+  // plotly_animatingframe을 모든 모드에 공통으로 처리한다.
+  var animCam=null;
+
   function attach(gd){
-    var cam=null;
+    if(gd.__camSetup)return;
+    gd.__camSetup=true;
+
+    // 사용자 인터랙션(회전·줌)으로만 발동 — animCam에 저장
     gd.on('plotly_relayout',function(){
+      if(gd.__camBusy)return;
       var s=gd._fullLayout&&gd._fullLayout.scene;
-      if(s&&s.camera)cam=JSON.parse(JSON.stringify(
+      if(s&&s.camera)animCam=JSON.parse(JSON.stringify(
         {eye:s.camera.eye,center:s.camera.center,up:s.camera.up}));
     });
+
+    // 슬라이더/재생 프레임 직전: 마이크로태스크로 카메라 복원
     gd.on('plotly_animatingframe',function(){
-      if(!cam)return;
-      var c=cam;
+      if(!animCam)return;
+      var c=animCam;
       Promise.resolve().then(function(){
         window.parent.Plotly.relayout(gd,{'scene.camera':c});
       });
     });
   }
+
   function find(){
     var plots=window.parent.document.querySelectorAll('.js-plotly-plot');
     for(var i=0;i<plots.length;i++){
       var p=plots[i];
-      if(p._fullLayout&&p._fullLayout.scene&&!p.__sweepCamOk){
-        p.__sweepCamOk=true;attach(p);return;
-      }
+      if(p._fullLayout&&p._fullLayout.scene){attach(p);return;}
     }
-    setTimeout(find,300);
+    setTimeout(find,200);
   }
-  setTimeout(find,600);
+  find();
 })();
 </script>""", height=0)
+
                     st.caption(_cap)
                 else:
                     st.info("유동장 데이터를 불러오는 중이거나 렌더러를 사용할 수 없습니다.")

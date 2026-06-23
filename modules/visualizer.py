@@ -578,13 +578,12 @@ class CFDVisualizer:
                              show_streamlines: bool = False,
                              tile_nx: int = 1,
                              tile_ny: int = 1,
-                             init_camera: bool = True) -> Optional[Any]:
+                             init_camera: bool = True,
+                             n_frames: int = 1) -> Optional[Any]:
         """
         PyVista로 슬라이스 추출 → Plotly go.Mesh3d 인터랙티브 3D 뷰어 반환.
-        slice_fraction: 0.0(경계 최소) ~ 1.0(경계 최대) 위치 비율.
-        tile_nx, tile_ny: 주기 단위셀을 화면에서 nx×ny로 복제(타일링)해 보여준다.
-            해석은 항상 1셀이며 시각화만 복제한다(항목 2).
-        init_camera: 현재 무시됨 — camera를 매 렌더 항상 명시해 1.6배 확대 고정.
+        n_frames > 1: Streamlit 슬라이더 대신 Plotly 내장 슬라이더로 위치 제어.
+        Plotly 내장 슬라이더는 Streamlit 리런을 유발하지 않으므로 카메라가 유지된다.
         """
         try:
             import plotly.graph_objects as go
@@ -666,25 +665,58 @@ class CFDVisualizer:
                 except Exception:
                     pass
 
+            # ── 슬라이스 트레이스 생성 클로저 ─────────────────────────────────
+            def _make_slice_traces(frac):
+                """frac 위치의 슬라이스 Mesh3d 리스트(타일별 1개)와 위치 문자열 반환."""
+                _pos = lo + (hi - lo) * frac
+                _orig = {"x": (_pos,cy,cz), "y": (cx,_pos,cz),
+                         "z": (cx,cy,_pos)}.get(slice_normal, (cx,_pos,cz))
+                _sl = internal.slice(normal=normal_vec, origin=_orig)
+                if _sl.n_points == 0:
+                    return [], _pos, int(frac*100)
+                _tri = _sl.triangulate()
+                _pts = _tri.points
+                _rf = _tri.faces
+                if len(_rf) == 0:
+                    return [], _pos, int(frac*100)
+                _fc = _rf.reshape(-1, 4)[:, 1:]
+                _sc = _get_scalar(_tri, field)
+                _traces = []
+                _first_t = True
+                for (_ox, _oy) in _offsets:
+                    _mk = dict(
+                        x=_pts[:,0]+_ox, y=_pts[:,1]+_oy, z=_pts[:,2],
+                        i=_fc[:,0], j=_fc[:,1], k=_fc[:,2],
+                        intensity=_sc, colorscale=cmap,
+                        cmin=_cmin, cmax=_cmax,
+                        flatshading=False,
+                        lighting=dict(ambient=0.8, diffuse=0.5, specular=0.1),
+                        showlegend=False, showscale=_first_t,
+                        hovertemplate=f"{field}: %{{intensity:.4f}} {unit}<extra></extra>",
+                    )
+                    if _first_t:
+                        _mk["colorbar"] = dict(
+                            title=dict(text=f"{field} [{unit}]", side="right",
+                                       font=dict(size=12)),
+                            thickness=14, len=0.75, tickfont=dict(size=10))
+                    _traces.append(go.Mesh3d(**_mk))
+                    _first_t = False
+                return _traces, _pos, int(frac*100)
+
+            # ── 초기 표시용 슬라이스 ─────────────────────────────────────────
+            _init_frac = slice_fraction if n_frames <= 1 else 0.5
+            _init_slice_traces, pos, pct = _make_slice_traces(_init_frac)
+            if not _init_slice_traces:
+                return None
+
             fig = go.Figure()
-            _first = True
+            # 슬라이스 트레이스 (프레임에서 교체될 트레이스)
+            _slice_trace_indices = []
+            for t in _init_slice_traces:
+                _slice_trace_indices.append(len(fig.data))
+                fig.add_trace(t)
+            # 경계면 패치 (고정 — 프레임과 무관)
             for (ox, oy) in _offsets:
-                _mk = dict(
-                    x=pts[:,0]+ox, y=pts[:,1]+oy, z=pts[:,2],
-                    i=faces[:,0], j=faces[:,1], k=faces[:,2],
-                    intensity=scalar, colorscale=cmap,
-                    cmin=_cmin, cmax=_cmax,
-                    flatshading=False,
-                    lighting=dict(ambient=0.8, diffuse=0.5, specular=0.1),
-                    showlegend=False, showscale=_first,
-                    hovertemplate=f"{field}: %{{intensity:.4f}} {unit}<extra></extra>",
-                )
-                if _first:
-                    _mk["colorbar"] = dict(
-                        title=dict(text=f"{field} [{unit}]", side="right",
-                                   font=dict(size=12)),
-                        thickness=14, len=0.75, tickfont=dict(size=10))
-                fig.add_trace(go.Mesh3d(**_mk))
                 for (pp, pf) in _patches:
                     fig.add_trace(go.Mesh3d(
                         x=pp[:,0]+ox, y=pp[:,1]+oy, z=pp[:,2],
@@ -692,10 +724,9 @@ class CFDVisualizer:
                         color='lightgray', opacity=0.15,
                         showscale=False, showlegend=False, hoverinfo='skip',
                     ))
-                _first = False
 
-            # 유선 (Scatter3d 라인)
-            if show_streamlines and PYVISTA_OK and "U" in internal.array_names:
+            # 유선 (Scatter3d 라인) — 단일 프레임 모드에서만
+            if show_streamlines and n_frames <= 1 and PYVISTA_OK and "U" in internal.array_names:
                 try:
                     seeds = pv.Sphere(radius=(hi-lo)*0.05, center=list(origin))
                     stream = internal.streamlines_from_source(
@@ -711,8 +742,47 @@ class CFDVisualizer:
                 except Exception:
                     pass
 
-            # Annotation으로 슬라이스 위치 표시
-            pct = int(slice_fraction * 100)
+            # ── 다중 프레임 + Plotly 슬라이더 ───────────────────────────────
+            _plotly_sliders = []
+            if n_frames > 1:
+                _fracs = np.linspace(0.05, 0.95, n_frames)
+                _frames = []
+                for _frac in _fracs:
+                    _ftr, _fpos, _fpct = _make_slice_traces(_frac)
+                    if not _ftr:
+                        continue
+                    _ann_txt = (f"Slice {slice_normal.upper()} = {_fpos:.4f} m  ({_fpct}%)"
+                                + (f"   |  타일 {tile_nx}×{tile_ny}"
+                                   if tile_nx * tile_ny > 1 else ""))
+                    _frames.append(go.Frame(
+                        data=_ftr,
+                        traces=_slice_trace_indices,
+                        layout=go.Layout(annotations=[dict(
+                            text=_ann_txt, xref="paper", yref="paper",
+                            x=0.01, y=0.99, xanchor="left", yanchor="top",
+                            showarrow=False, font=dict(size=11, color="#1a4a8a"),
+                            bgcolor="rgba(255,255,255,0.82)", borderpad=4,
+                            bordercolor="#1a4a8a", borderwidth=1)]),
+                        name=str(_fpct),
+                    ))
+                fig.frames = _frames
+                _active_idx = len(_frames) // 2
+                _plotly_sliders = [dict(
+                    active=_active_idx,
+                    pad=dict(b=10, t=10), len=0.9, x=0.05, y=0,
+                    currentvalue=dict(
+                        prefix=f"Slice {slice_normal.upper()} ",
+                        suffix="%", visible=True, xanchor="right",
+                        font=dict(size=11)),
+                    transition=dict(duration=0),
+                    steps=[dict(
+                        method="animate",
+                        args=[[f.name], dict(mode="immediate",
+                                             frame=dict(duration=0, redraw=True),
+                                             transition=dict(duration=0))],
+                        label=f.name,
+                    ) for f in fig.frames],
+                )]
 
             # 씬 범위를 타일링된 XY 크기 기준으로 설정한다.
             # Z 도메인 길이를 포함하면 씬이 너무 넓어져 단위셀 그물망이 작게 보이므로
@@ -721,10 +791,6 @@ class CFDVisualizer:
             tiled_cy = cy + (tile_ny - 1) * dy / 2.0
             _half = max(tile_nx * dx, tile_ny * dy, 1e-6)
 
-            # 카메라 유지(uirevision)는 포기. uirevision을 두면 plotly.js가 명시한
-            # camera(eye)를 무시하고 이전 줌을 보존해 초기 확대가 화면에 반영되지
-            # 않는다. 따라서 uirevision을 빼고 camera를 매 렌더 항상 명시해 화면이
-            # 늘 1.6배 확대 상태(eye 거리 1.0)로 표시되게 한다. (init_camera 무시)
             scene = dict(
                 xaxis=dict(title="X [m]", range=[tiled_cx-_half, tiled_cx+_half],
                            visible=True, showticklabels=True,
@@ -740,25 +806,27 @@ class CFDVisualizer:
                            gridcolor="white", showbackground=True),
                 aspectmode='cube',
                 bgcolor='rgba(240,248,255,1)',
-                camera=dict(eye=dict(x=1.0, y=1.0, z=1.0)),
+                uirevision='flowfield',
             )
-            fig.update_layout(
-                annotations=[dict(
-                    text=f"Slice {slice_normal.upper()} = {pos:.4f} m  ({pct}%)"
+            if init_camera:
+                scene['camera'] = dict(eye=dict(x=1.0, y=1.0, z=1.0))
+            _ann_init = (f"Slice {slice_normal.upper()} = {pos:.4f} m  ({pct}%)"
                          + (f"   |  타일 {tile_nx}×{tile_ny}"
-                            if tile_nx * tile_ny > 1 else ""),
-                    xref="paper", yref="paper",
-                    x=0.01, y=0.99,
-                    xanchor="left", yanchor="top",
-                    showarrow=False,
-                    font=dict(size=11, color="#1a4a8a"),
+                            if tile_nx * tile_ny > 1 else ""))
+            _bottom = 60 if _plotly_sliders else 0
+            fig.update_layout(
+                uirevision='flowfield',
+                annotations=[dict(
+                    text=_ann_init, xref="paper", yref="paper",
+                    x=0.01, y=0.99, xanchor="left", yanchor="top",
+                    showarrow=False, font=dict(size=11, color="#1a4a8a"),
                     bgcolor="rgba(255,255,255,0.82)", borderpad=4,
-                    bordercolor="#1a4a8a", borderwidth=1,
-                )],
+                    bordercolor="#1a4a8a", borderwidth=1)],
                 scene=scene,
+                sliders=_plotly_sliders,
                 showlegend=False,
-                margin=dict(l=0, r=0, t=10, b=0),
-                height=520,
+                margin=dict(l=0, r=0, t=10, b=_bottom),
+                height=520 + _bottom,
                 paper_bgcolor='#f0f8ff',
             )
             return fig
@@ -843,10 +911,14 @@ class CFDVisualizer:
             # redraw=True 애니메이션은 프레임마다 Plotly.react()를 호출하는데,
             # scene에 camera가 명시되어 있으면 uirevision이 있어도 재적용되어
             # 사용자 카메라가 리셋된다. camera를 빼고 uirevision만 두면 보존된다.
-            # (초기 1.6× 확대 없음 — 재생 중 회전·줌 유지와 교환)
             scene['uirevision'] = 'iso_sweep_camera'
         else:
-            scene['camera'] = dict(eye=dict(x=1.0, y=1.0, z=1.0))
+            # Streamlit 리런(슬라이더·필드 변경) 시 uirevision이 동일하면
+            # Plotly.js가 사용자 카메라를 보존한다. 최초 렌더에만 camera를
+            # 명시해 1.6× 초기 확대를 적용하고, 이후 렌더는 camera를 생략한다.
+            scene['uirevision'] = 'flowfield'
+            if init_camera:
+                scene['camera'] = dict(eye=dict(x=1.0, y=1.0, z=1.0))
         return scene
 
     def render_field_3d(self, field: str = "U", level: Optional[float] = None,
@@ -1034,8 +1106,26 @@ class CFDVisualizer:
                 showlegend=False, margin=dict(l=0, r=0, t=10, b=0),
                 height=520, paper_bgcolor='#f0f8ff',
             )
-            if anim == 'sweep':
-                _layout_kw['uirevision'] = 'iso_sweep_camera'
+            _layout_kw['uirevision'] = ('iso_sweep_camera' if anim == 'sweep'
+                                        else 'flowfield')
+            if anim == 'sweep' and fig.frames:
+                _iso_steps = [dict(
+                    method='animate',
+                    args=[[f.name], dict(mode='immediate',
+                                        frame=dict(duration=0, redraw=True),
+                                        transition=dict(duration=0))],
+                    label=f"{float(f.name):.3g}",
+                ) for f in fig.frames]
+                _layout_kw['sliders'] = [dict(
+                    active=0, pad=dict(b=10, t=10),
+                    len=0.85, x=0.075, y=0,
+                    currentvalue=dict(prefix='등치값: ', visible=True,
+                                      xanchor='right', font=dict(size=11)),
+                    transition=dict(duration=0),
+                    steps=_iso_steps,
+                )]
+                _layout_kw['margin'] = dict(l=0, r=0, t=10, b=60)
+                _layout_kw['height'] = 580
             fig.update_layout(**_layout_kw)
             return fig
         except Exception as e:
