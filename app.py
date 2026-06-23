@@ -1884,9 +1884,39 @@ with tab_results:
 
                 if _fig_r1:
                     st.plotly_chart(_fig_r1, use_container_width=True, key="r1_chart")
-                    # 최초 1회 렌더 후 플래그를 세워, 이후(표시 방식 전환 포함) 모든
-                    # 렌더에서 camera를 빼고 uirevision 보존에 맡긴다 → 확대 유지.
                     ss["_cam_init_field"] = True
+                    if _vmode == "등치면(스윕)" and not _manual:
+                        import streamlit.components.v1 as _cv1
+                        _cv1.html("""<script>
+(function(){
+  function attach(gd){
+    var cam=null;
+    gd.on('plotly_relayout',function(){
+      var s=gd._fullLayout&&gd._fullLayout.scene;
+      if(s&&s.camera)cam=JSON.parse(JSON.stringify(
+        {eye:s.camera.eye,center:s.camera.center,up:s.camera.up}));
+    });
+    gd.on('plotly_animatingframe',function(){
+      if(!cam)return;
+      var c=cam;
+      Promise.resolve().then(function(){
+        window.parent.Plotly.relayout(gd,{'scene.camera':c});
+      });
+    });
+  }
+  function find(){
+    var plots=window.parent.document.querySelectorAll('.js-plotly-plot');
+    for(var i=0;i<plots.length;i++){
+      var p=plots[i];
+      if(p._fullLayout&&p._fullLayout.scene&&!p.__sweepCamOk){
+        p.__sweepCamOk=true;attach(p);return;
+      }
+    }
+    setTimeout(find,300);
+  }
+  setTimeout(find,600);
+})();
+</script>""", height=0)
                     st.caption(_cap)
                 else:
                     st.info("유동장 데이터를 불러오는 중이거나 렌더러를 사용할 수 없습니다.")

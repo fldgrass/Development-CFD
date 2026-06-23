@@ -838,12 +838,15 @@ class CFDVisualizer:
                        showticklabels=True, backgroundcolor="#dce9f5",
                        gridcolor="white", showbackground=True),
             aspectmode='cube', bgcolor='rgba(240,248,255,1)',
-            camera=dict(eye=dict(x=1.0, y=1.0, z=1.0)),
         )
         if anim == 'sweep':
-            # sweep는 프레임이 data만 교체하므로 uirevision으로 카메라 상태를 보존한다.
-            # 첫 렌더에서 camera(eye=1.0)가 적용된 뒤 재생해도 리셋되지 않는다.
+            # redraw=True 애니메이션은 프레임마다 Plotly.react()를 호출하는데,
+            # scene에 camera가 명시되어 있으면 uirevision이 있어도 재적용되어
+            # 사용자 카메라가 리셋된다. camera를 빼고 uirevision만 두면 보존된다.
+            # (초기 1.6× 확대 없음 — 재생 중 회전·줌 유지와 교환)
             scene['uirevision'] = 'iso_sweep_camera'
+        else:
+            scene['camera'] = dict(eye=dict(x=1.0, y=1.0, z=1.0))
         return scene
 
     def render_field_3d(self, field: str = "U", level: Optional[float] = None,
@@ -1002,8 +1005,6 @@ class CFDVisualizer:
             _menus = []
             if anim in ("rotate", "sweep"):
                 _dur = 90 if anim == "rotate" else 140
-                # 재생/정지 버튼은 좌하단에 둔다. 좌상단(0.01,0.99)에 모드 안내
-                # annotation 배지가 있어 그 자리에 두면 겹친다(E).
                 _menus = [dict(
                     type="buttons", showactive=False, direction="right",
                     x=0.02, y=0.02, xanchor="left", yanchor="bottom",
@@ -1021,7 +1022,7 @@ class CFDVisualizer:
 
             _ann = "입체 등치면" + ({"rotate": " · 카메라 회전 재생",
                                    "sweep": " · 등치값 자동 스윕"}.get(anim, ""))
-            fig.update_layout(
+            _layout_kw = dict(
                 annotations=[dict(text=_ann, xref="paper", yref="paper",
                     x=0.01, y=0.99, xanchor="left", yanchor="top", showarrow=False,
                     font=dict(size=11, color="#1a4a8a"),
@@ -1033,6 +1034,9 @@ class CFDVisualizer:
                 showlegend=False, margin=dict(l=0, r=0, t=10, b=0),
                 height=520, paper_bgcolor='#f0f8ff',
             )
+            if anim == 'sweep':
+                _layout_kw['uirevision'] = 'iso_sweep_camera'
+            fig.update_layout(**_layout_kw)
             return fig
         except Exception as e:
             logger.error(f"render_field_3d 오류: {e}")
