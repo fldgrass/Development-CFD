@@ -1779,7 +1779,8 @@ with tab_results:
                            for s in np.linspace(_um, _ux, max(1, _us))})
     _angles_grid = sorted({round(float(a), 1)
                            for a in np.linspace(_amn, _amx, max(1, _asp))})
-    _BOX = {"done": "☑", "running": "⏳", "none": "☐"}
+    # 항목2: 체크표시 대신 명시적 상태 텍스트 라벨.
+    _BOX = {"done": "해석 완료", "running": "해석 중", "none": "해석 전"}
     _MTXT = {"done": "완료", "running": "진행 중", "none": "미해석"}
 
     if not _speeds_grid or not _angles_grid:
@@ -1787,7 +1788,8 @@ with tab_results:
     else:
         # ─── 해석 매트릭스 ────────────────────────────────────────────────
         st.markdown("#### 🧮 해석 매트릭스")
-        st.caption("☑ 완료   ⏳ 진행 중   ☐ 미해석   ·   셀 클릭 → 유동장 표시. "
+        st.caption("'해석 완료' / '해석 중' / '해석 전'   ·   셀 클릭 → 유동장 표시"
+                   "(선택 셀은 색 반전으로 강조). "
                    "행·열은 **입력 설정의 유속·영각 단계**와 일치합니다.")
 
         _hdr = st.columns([0.9] + [1] * len(_speeds_grid))
@@ -1800,11 +1802,15 @@ with tab_results:
             for _j, _s in enumerate(_speeds_grid):
                 _ent = _by_cond.get((_s, _a))
                 _mst = _ent["mstatus"] if _ent else "none"
+                _cond_key = f"{_s:.2f}_{_a:.1f}"
+                # 항목7: 현재 선택된 조건 셀은 색 반전(primary)으로 활성 표시.
+                _is_sel = (ss.get("res_sel_cond") == _cond_key)
                 with _row[_j + 1]:
-                    if st.button(_BOX[_mst], key=f"mx_{_s:.2f}_{_a:.1f}",
+                    if st.button(_BOX[_mst], key=f"mx_{_cond_key}",
                                  help=f"U={_s:.2f}, α={_a:.1f}° — {_MTXT[_mst]}",
-                                 use_container_width=True):
-                        ss.res_sel_cond = f"{_s:.2f}_{_a:.1f}"
+                                 use_container_width=True,
+                                 type=("primary" if _is_sel else "secondary")):
+                        ss.res_sel_cond = _cond_key
                         st.rerun()
 
         # ── 입력 설정 밖의 디스크 완료 케이스 별도 표시 ──────────────────────
@@ -1825,12 +1831,15 @@ with tab_results:
                     for _dj, _ds in enumerate(_de_speeds):
                         _de_ent = _disk_extra.get((_ds, _da))
                         _de_mst = _de_ent["mstatus"] if _de_ent else "none"
+                        _de_key = f"{_ds:.2f}_{_da:.1f}"
+                        _de_sel = (ss.get("res_sel_cond") == _de_key)
                         with _de_row[_dj + 1]:
                             if st.button(_BOX[_de_mst],
-                                         key=f"de_{_ds:.2f}_{_da:.1f}",
+                                         key=f"de_{_de_key}",
                                          help=f"U={_ds:.2f}, α={_da:.1f}° — {_MTXT[_de_mst]}",
-                                         use_container_width=True):
-                                ss.res_sel_cond = f"{_ds:.2f}_{_da:.1f}"
+                                         use_container_width=True,
+                                         type=("primary" if _de_sel else "secondary")):
+                                ss.res_sel_cond = _de_key
                                 st.rerun()
 
         st.divider()
