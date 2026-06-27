@@ -355,6 +355,48 @@ def estimate_case_minutes(end_time: int, refine_level: int, n_cores: int) -> flo
     mesh_min   = 0.4 + 0.6 * f_refine                 # 직렬 snappy 메싱 오버헤드(실측 보정)
     return mesh_min + solver_min
 
+
+# ─── 실측 기반 추정 보정(항목1) ─────────────────────────────────────────────
+# 완료된 케이스의 실제 소요(분)를 모드별로 누적 기록하고, 그 중앙값을 다음 배치의
+# 케이스당 추정에 사용한다. 경험식만으로는 환경·격자 변화에 따라 빗나가므로,
+# 실제 실행시간이 쌓일수록 추정이 실측에 수렴한다.
+def _timing_store_path(mode):
+    return RESULTS_DIR / mode / ".case_timing.json"
+
+def record_case_minutes(mode, minutes):
+    """완료 케이스의 실제 소요(분)를 기록(최근 30개 유지)."""
+    try:
+        if not (minutes and minutes > 0):
+            return
+        p = _timing_store_path(mode)
+        hist = json.loads(p.read_text()) if p.exists() else []
+        hist.append(round(float(minutes), 3))
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(hist[-30:]))
+    except Exception:
+        pass
+
+def recent_case_minutes(mode):
+    """최근 실측 케이스 소요(분)의 중앙값. 기록이 없으면 None."""
+    try:
+        p = _timing_store_path(mode)
+        if p.exists():
+            hist = [float(x) for x in json.loads(p.read_text()) if float(x) > 0]
+            if hist:
+                hist.sort()
+                return hist[len(hist) // 2]
+    except Exception:
+        pass
+    return None
+
+def estimate_total_minutes(mode, n_cases, end_time, refine_level, n_cores):
+    """배치 총 예상(분). 최근 실측 중앙값이 있으면 우선 사용(코어/반복/정밀도가
+    유사할 때 경험식보다 정확), 없으면 경험식으로 폴백."""
+    per = recent_case_minutes(mode)
+    if per is None:
+        per = estimate_case_minutes(end_time, refine_level, n_cores)
+    return per * max(1, int(n_cases))
+
 def fmt_duration(minutes: float) -> str:
     """분 단위 시간을 '시간 분' 형식 문자열로."""
     if minutes < 1:
@@ -802,17 +844,29 @@ st.markdown("# 🌊 양식 가두리 CFD 해석 시스템")
 # 에 얼어붙는다. 이 값으로 '방금 끝났는지'를 판정해 마지막 한 번 더 그린다.
 _status_at_render = ss.job_status
 
-# 경과 시간 계산
+# 경과 시간 + 동적 남은시간 추정(항목1)
 _elapsed_str = ""
+_eta_str = ""
 if ss.job_status == "running" and ss.get("job_start_time"):
-    _elapsed_sec = int(time.time() - ss.job_start_time)
+    _elapsed_sec = time.time() - ss.job_start_time
     _elapsed_str = f"  &nbsp;&nbsp;⏱️ 경과: **{fmt_elapsed(_elapsed_sec)}**"
+    # 항목1: 실행 중 실제 경과·진행률로 남은시간을 동적 추정해 계속 갱신한다.
+    # 진행률이 충분히(≥3%) 쌓이면 실측 기반(remaining = 경과×(100-p)/p)으로,
+    # 그 전에는 시작 시 저장한 정적 추정에서 경과를 뺀 값으로 표시(초기 불안정 완화).
+    _p = float(ss.progress)
+    if _p >= 3.0:
+        _rem = _elapsed_sec * (100.0 - _p) / _p
+        _src = "실측"
+    else:
+        _rem = max(0.0, float(ss.get("est_total_min", 0.0)) * 60.0 - _elapsed_sec)
+        _src = "추정"
+    _eta_str = f"  &nbsp;&nbsp;⏳ 예상 남은: **{fmt_elapsed(_rem)}** ({_src})"
 
 st.markdown(
     f"**해석 모드:** {'🔬 단위 셀 (Unit Cell)' if mode=='unit_cell' else '🏗️ 전체 구조 (Full Structure)'}  "
     f"&nbsp;&nbsp;**상태:** {status_badge(ss.job_status)}  "
     f"&nbsp;&nbsp;**진행률:** {ss.progress:.1f}%"
-    f"{_elapsed_str}",
+    f"{_elapsed_str}{_eta_str}",
     unsafe_allow_html=True
 )
 
@@ -1098,6 +1152,11 @@ def _start_batch_analysis(mode, speeds, angles, csv_path, n_cores, rho, ti, nx=1
     add_log(f"계산 조건: 반복 {_bp['end_time']} · 정밀화 {_bp['refine_level']} · "
             f"수렴 {_bp['residual_control']:.0e} · {n_cores}코어")
 
+    # 항목1: 동적 ETA 의 초기(진행률<3%) 기준이 될 정적 총 예상시간을 저장.
+    _n_cases = max(1, len(speeds) * len(angles))
+    ss.est_total_min = estimate_total_minutes(
+        mode, _n_cases, _bp["end_time"], _bp["refine_level"], n_cores)
+
     manager = BatchAnalysisManager(
         mode=mode,
         stl_paths=stl_paths,
@@ -1121,8 +1180,11 @@ def _start_batch_analysis(mode, speeds, angles, csv_path, n_cores, rho, ti, nx=1
 
     def _run():
         try:
+            _t0 = time.time()
             manager.run_batch()
             try:
+                # 항목1: 실제 케이스당 소요(분)를 기록해 다음 추정을 실측에 보정.
+                record_case_minutes(mode, (time.time() - _t0) / 60.0 / _n_cases)
                 set_status("done", "배치 해석 완료!")
                 add_log(f"✅ 배치 완료! CSV: {csv_path}")
             except Exception:
@@ -1645,7 +1707,9 @@ with tab_input:
 
         run_disabled = (ss.job_status == "running")
         _ncase_run = len(speeds) * len(angles)
-        _est_total = _est * _ncase_run
+        # 항목1: 총 예상은 실측 보정(최근 실제 소요 중앙값)을 우선 반영.
+        _est_total = estimate_total_minutes(
+            mode, _ncase_run, int(end_time), int(_rl_e), n_cores)
         _run_label = ("▶️ 해석 시작 (단일)" if _ncase_run == 1
                       else f"🚀 배치 해석 시작 ({_ncase_run}개 · 예상 {fmt_duration(_est_total)})")
 
