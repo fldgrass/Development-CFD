@@ -974,7 +974,8 @@ class CFDVisualizer:
                         anim: Optional[str] = None,
                         tile_nx: int = 1, tile_ny: int = 1,
                         n_frames: int = 24,
-                        init_camera: bool = True) -> Optional[Any]:
+                        init_camera: bool = True,
+                        opacity: float = 0.55) -> Optional[Any]:
         """슬라이스가 아닌 **입체 등치면(Isosurface)** 3D 뷰.
 
         anim=None  : 정적. level 지정 시 그 |U| 등치면 1개, 없으면 다중 등치면.
@@ -1074,7 +1075,7 @@ class CFDVisualizer:
                     x=cp[:, 0]+ox, y=cp[:, 1]+oy, z=cp[:, 2],
                     i=cf[:, 0], j=cf[:, 1], k=cf[:, 2],
                     intensity=cintens, colorscale=cmap, cmin=vmin, cmax=vmax,
-                    opacity=0.55, flatshading=False, showscale=first,
+                    opacity=float(opacity), flatshading=False, showscale=first,
                     showlegend=False,
                     hovertemplate=f"{field}: %{{intensity:.4f}} {unit}<extra></extra>")
                 if first:

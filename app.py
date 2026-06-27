@@ -1696,7 +1696,10 @@ with tab_results:
     _by_cond = {}
     _mprio = {"running": 3, "done": 2}
     for _c in _cases:
-        if _c["status"] == "done":
+        # 항목5: 완료(☑)는 실제 결과 필드(reconstruct된 시간 디렉토리)가 있을 때만.
+        # 폴더명 접두어(해석완료_)만으로는 미완료/중단 케이스가 ☑로 오표시될 수 있어
+        # has_fields 를 함께 요구한다.
+        if _c["status"] == "done" and _c["has_fields"]:
             _mst = "done"
         elif _c["status"] == "running":
             _mst = "running"
@@ -1872,16 +1875,28 @@ with tab_results:
                         n_frames=11)
                     _cap = "💡 드래그: 회전 | 스크롤: 줌 | 차트 하단 슬라이더: 슬라이스 위치"
                 elif _vmode == "입체":
+                    # 항목4: 입체 모드 투명도 — 등치면 모드와 독립된 세션 키 사용.
+                    _op_vol = st.slider(
+                        "투명도(입체)", min_value=0.05, max_value=1.0,
+                        value=float(ss.get("r1_opacity_vol", 0.55)), step=0.05,
+                        key="r1_opacity_vol",
+                        help="등치면 표면의 불투명도(1.0=불투명). 입체 모드 전용.")
                     _fig_r1 = _viz_r1.render_field_3d(
                         _r1_field, tile_nx=_tnx, tile_ny=_tny,
-                        init_camera=_init_cam)
+                        init_camera=_init_cam, opacity=_op_vol)
                     _cap = "💡 드래그: 회전 | 스크롤: 줌 (등치면 3개)"
                 else:  # 등치면(스윕)
                     # 수동 슬라이더 체크박스 제거 — Plotly 내장 슬라이더가 수동·자동 모두 담당.
                     # ▶ 재생: 자동 스윕  |  차트 하단 슬라이더: 수동 위치 선택
+                    # 항목4: 등치면(스윕) 투명도 — 입체 모드와 독립된 세션 키 사용.
+                    _op_iso = st.slider(
+                        "투명도(등치면)", min_value=0.05, max_value=1.0,
+                        value=float(ss.get("r1_opacity_iso", 0.55)), step=0.05,
+                        key="r1_opacity_iso",
+                        help="등치면 표면의 불투명도(1.0=불투명). 등치면 모드 전용.")
                     _fig_r1 = _viz_r1.render_field_3d(
                         _r1_field, anim="sweep", tile_nx=_tnx, tile_ny=_tny,
-                        init_camera=_init_cam)
+                        init_camera=_init_cam, opacity=_op_iso)
                     _cap = "▶ 재생: 자동 스윕 | 차트 하단 슬라이더: 수동 위치 — 회전·확대 유지됨"
 
                 if _fig_r1:
