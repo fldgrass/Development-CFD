@@ -1404,16 +1404,30 @@ class CFDVisualizer:
                         marker=dict(size=6),
                     ), row=1, col=col_idx)
 
+            # 항목6: 배경이 흰색 고정이므로 모든 텍스트를 진한 색으로 고정해
+            # Streamlit 다크 테마에서도 가독성을 보장(테마 의존 기본색 회피).
+            _dark = "#1a1a1a"
             fig.update_xaxes(title_text="Angle of Attack [deg]",
-                             gridcolor='lightgray', showgrid=True)
-            fig.update_yaxes(gridcolor='lightgray', showgrid=True)
+                             gridcolor='#d0d0d0', showgrid=True,
+                             title_font=dict(color=_dark, size=12),
+                             tickfont=dict(color=_dark, size=10),
+                             linecolor='#888', zerolinecolor='#bbb')
+            fig.update_yaxes(gridcolor='#d0d0d0', showgrid=True,
+                             title_font=dict(color=_dark, size=12),
+                             tickfont=dict(color=_dark, size=10),
+                             linecolor='#888', zerolinecolor='#bbb')
             fig.update_layout(
                 title=dict(text="Force Coefficients (Cd / Cl)", x=0.5,
-                           font=dict(size=14)),
+                           font=dict(size=14, color=_dark)),
                 height=420, paper_bgcolor='white', plot_bgcolor='#fafafa',
-                legend=dict(font=dict(size=11)),
+                font=dict(color=_dark),
+                legend=dict(font=dict(size=11, color=_dark),
+                            bgcolor='rgba(255,255,255,0.9)',
+                            bordercolor='#888', borderwidth=1),
                 margin=dict(l=60, r=20, t=60, b=60),
             )
+            # subplot 제목(annotations)도 진한 색으로
+            fig.update_annotations(font=dict(color=_dark, size=13))
             return fig
 
         except Exception as e:

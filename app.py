@@ -2464,22 +2464,33 @@ with tab_results:
                     if _has_filter_cols:
                         _speeds_all  = sorted(df["speed_m_s"].dropna().unique())
                         _angles_all  = sorted(df["angle_deg"].dropna().unique())
+                        _sp_opts = [f"{s:.2f}" for s in _speeds_all]
+                        _ag_opts = [f"{a:.1f}" for a in _angles_all]
+                        # 항목5: 고정 키를 쓰면 세션 선택이 남아 새 유속/영각이 추가돼도
+                        # 옛 선택(예: 1.00만)에 가려져 표시되지 않는다. 위젯 키에 'CSV +
+                        # 가용 옵션 집합' 시그니처를 포함해, 조건이 바뀌면 위젯이 재생성되며
+                        # 항상 전체(default=모든 조건)가 선택되도록 한다.
+                        _sig = (csv_target.name + "|" + ",".join(_sp_opts)
+                                + "|" + ",".join(_ag_opts))
+                        import hashlib as _hl
+                        _sig = _hl.md5(_sig.encode()).hexdigest()[:8]
 
                         _fc1, _fc2 = st.columns(2)
                         with _fc1:
                             _sel_speeds = st.multiselect(
                                 "표시할 유속 [m/s]",
-                                options=[f"{s:.2f}" for s in _speeds_all],
-                                default=[f"{s:.2f}" for s in _speeds_all],
-                                key="r4_speed_filter",
+                                options=_sp_opts, default=_sp_opts,
+                                key=f"r4_speed_filter_{_sig}",
                             )
                         with _fc2:
                             _sel_angles = st.multiselect(
                                 "표시할 영각 [°]",
-                                options=[f"{a:.1f}" for a in _angles_all],
-                                default=[f"{a:.1f}" for a in _angles_all],
-                                key="r4_angle_filter",
+                                options=_ag_opts, default=_ag_opts,
+                                key=f"r4_angle_filter_{_sig}",
                             )
+                        # 방어: 빈 선택이면 전체로 간주(모든 조건 표시 보장)
+                        if not _sel_speeds: _sel_speeds = _sp_opts
+                        if not _sel_angles: _sel_angles = _ag_opts
 
                         # 필터 적용된 임시 CSV 생성
                         _sel_s_vals = [float(s) for s in _sel_speeds]
