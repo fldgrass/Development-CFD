@@ -697,8 +697,10 @@ class CFDVisualizer:
                     if _first_t:
                         _mk["colorbar"] = dict(
                             title=dict(text=f"{field} [{unit}]", side="right",
-                                       font=dict(size=12)),
-                            thickness=14, len=0.75, tickfont=dict(size=10))
+                                       font=dict(size=12, color="black")),
+                            thickness=14, len=0.75,
+                            tickfont=dict(size=10, color="black"),
+                            outlinecolor="#333", outlinewidth=1)
                     _traces.append(go.Mesh3d(**_mk))
                     _first_t = False
                 return _traces, _pos, int(frac*100)
@@ -760,9 +762,9 @@ class CFDVisualizer:
                         layout=go.Layout(annotations=[dict(
                             text=_ann_txt, xref="paper", yref="paper",
                             x=0.01, y=0.99, xanchor="left", yanchor="top",
-                            showarrow=False, font=dict(size=11, color="#1a4a8a"),
-                            bgcolor="rgba(255,255,255,0.82)", borderpad=4,
-                            bordercolor="#1a4a8a", borderwidth=1)]),
+                            showarrow=False, font=dict(size=12, color="black"),
+                            bgcolor="rgba(255,255,255,0.92)", borderpad=4,
+                            bordercolor="#333", borderwidth=1)]),
                         name=str(_fpct),
                     ))
                 fig.frames = _frames
@@ -770,10 +772,13 @@ class CFDVisualizer:
                 _plotly_sliders = [dict(
                     active=_active_idx,
                     pad=dict(b=10, t=10), len=0.9, x=0.05, y=0,
+                    # 항목3: 슬라이더 대비 강화 — 진한 글자·그립·테두리·눈금.
+                    bgcolor="#1a4a8a", bordercolor="#10243e", borderwidth=1,
+                    tickcolor="#10243e", tickwidth=1, font=dict(color="black", size=11),
                     currentvalue=dict(
                         prefix=f"Slice {slice_normal.upper()} ",
                         suffix="%", visible=True, xanchor="right",
-                        font=dict(size=11)),
+                        font=dict(size=12, color="black")),
                         transition=dict(duration=0),
                     steps=[dict
                     (
@@ -802,21 +807,28 @@ class CFDVisualizer:
             tiled_cy = cy + (tile_ny - 1) * dy / 2.0
             _half = max(tile_nx * dx, tile_ny * dy, 1e-6)
 
+            # 항목1: 슬라이스 모드는 배경 패널(박스 3면)을 끄고 단일 슬라이스만 표시.
+            # 항목2: 축 제목·눈금 글자를 검정으로, 단위[m] 포함.
+            _axttl = dict(color="black", size=12)
+            _axtck = dict(color="black", size=10)
             scene = dict(
-                xaxis=dict(title="X [m]", range=[tiled_cx-_half, tiled_cx+_half],
-                           visible=True, showticklabels=True,
-                           backgroundcolor="#eaf4fb",
-                           gridcolor="white", showbackground=True),
-                yaxis=dict(title="Y [m]", range=[tiled_cy-_half, tiled_cy+_half],
-                           visible=True, showticklabels=True,
-                           backgroundcolor="#eaf4fb",
-                           gridcolor="white", showbackground=True),
-                zaxis=dict(title="Z [m]", range=[cz-_half, cz+_half],
-                           visible=True, showticklabels=True,
-                           backgroundcolor="#dce9f5",
-                           gridcolor="white", showbackground=True),
+                xaxis=dict(title=dict(text="X [m]", font=_axttl),
+                           range=[tiled_cx-_half, tiled_cx+_half],
+                           visible=True, showticklabels=True, tickfont=_axtck,
+                           backgroundcolor="rgba(0,0,0,0)",
+                           gridcolor="#b9c6d6", showbackground=False),
+                yaxis=dict(title=dict(text="Y [m]", font=_axttl),
+                           range=[tiled_cy-_half, tiled_cy+_half],
+                           visible=True, showticklabels=True, tickfont=_axtck,
+                           backgroundcolor="rgba(0,0,0,0)",
+                           gridcolor="#b9c6d6", showbackground=False),
+                zaxis=dict(title=dict(text="Z [m]", font=_axttl),
+                           range=[cz-_half, cz+_half],
+                           visible=True, showticklabels=True, tickfont=_axtck,
+                           backgroundcolor="rgba(0,0,0,0)",
+                           gridcolor="#b9c6d6", showbackground=False),
                 aspectmode='cube',
-                bgcolor='rgba(240,248,255,1)',
+                bgcolor='rgba(255,255,255,1)',
                 uirevision='flowfield',
             )
             if init_camera:
@@ -834,9 +846,9 @@ class CFDVisualizer:
                 annotations=[dict(
                     text=_ann_init, xref="paper", yref="paper",
                     x=0.01, y=0.99, xanchor="left", yanchor="top",
-                    showarrow=False, font=dict(size=11, color="#1a4a8a"),
-                    bgcolor="rgba(255,255,255,0.82)", borderpad=4,
-                    bordercolor="#1a4a8a", borderwidth=1)],
+                    showarrow=False, font=dict(size=12, color="black"),
+                    bgcolor="rgba(255,255,255,0.92)", borderpad=4,
+                    bordercolor="#333", borderwidth=1)],
                 #scene=scene,
                 scene={
                     k:v
@@ -916,17 +928,26 @@ class CFDVisualizer:
         cy = (bounds[2]+bounds[3])/2 + (tile_ny-1)*dy/2.0
         cz = (bounds[4]+bounds[5])/2
         _half = max(tile_nx*dx, tile_ny*dy, 1e-6)
+        # 항목1/일관성: 배경 패널(박스 면) 제거. 항목2: 축 글자 검정·단위[m].
+        _axttl = dict(color="black", size=12)
+        _axtck = dict(color="black", size=10)
         scene = dict(
-            xaxis=dict(title="X [m]", range=[cx-_half, cx+_half], visible=True,
-                       showticklabels=True, backgroundcolor="#eaf4fb",
-                       gridcolor="white", showbackground=True),
-            yaxis=dict(title="Y [m]", range=[cy-_half, cy+_half], visible=True,
-                       showticklabels=True, backgroundcolor="#eaf4fb",
-                       gridcolor="white", showbackground=True),
-            zaxis=dict(title="Z [m]", range=[cz-_half, cz+_half], visible=True,
-                       showticklabels=True, backgroundcolor="#dce9f5",
-                       gridcolor="white", showbackground=True),
-            aspectmode='cube', bgcolor='rgba(240,248,255,1)',
+            xaxis=dict(title=dict(text="X [m]", font=_axttl),
+                       range=[cx-_half, cx+_half], visible=True,
+                       showticklabels=True, tickfont=_axtck,
+                       backgroundcolor="rgba(0,0,0,0)",
+                       gridcolor="#b9c6d6", showbackground=False),
+            yaxis=dict(title=dict(text="Y [m]", font=_axttl),
+                       range=[cy-_half, cy+_half], visible=True,
+                       showticklabels=True, tickfont=_axtck,
+                       backgroundcolor="rgba(0,0,0,0)",
+                       gridcolor="#b9c6d6", showbackground=False),
+            zaxis=dict(title=dict(text="Z [m]", font=_axttl),
+                       range=[cz-_half, cz+_half], visible=True,
+                       showticklabels=True, tickfont=_axtck,
+                       backgroundcolor="rgba(0,0,0,0)",
+                       gridcolor="#b9c6d6", showbackground=False),
+            aspectmode='cube', bgcolor='rgba(255,255,255,1)',
         )
         # 슬라이스·등치면 모두 동일한 uirevision으로 모드 전환 시 카메라 보존.
         # 등치면 스윕 재생 중 카메라 복원은 JS 핸들러(plotly_buttonclicked)가 담당.
@@ -1057,8 +1078,12 @@ class CFDVisualizer:
                     showlegend=False,
                     hovertemplate=f"{field}: %{{intensity:.4f}} {unit}<extra></extra>")
                 if first:
-                    kw["colorbar"] = dict(title=dict(text=f"{field} [{unit}]",
-                                          side="right"), thickness=14, len=0.75)
+                    kw["colorbar"] = dict(
+                        title=dict(text=f"{field} [{unit}]", side="right",
+                                   font=dict(size=12, color="black")),
+                        thickness=14, len=0.75,
+                        tickfont=dict(size=10, color="black"),
+                        outlinecolor="#333", outlinewidth=1)
                 return go.Mesh3d(**kw)
 
             fig = go.Figure()
@@ -1115,6 +1140,7 @@ class CFDVisualizer:
                     x=0.02, y=0.02, xanchor="left", yanchor="bottom",
                     bgcolor="rgba(255,255,255,0.88)", bordercolor="#1a4a8a",
                     borderwidth=1, pad=dict(t=3, b=3, l=5, r=5),
+                    font=dict(color="#10243e", size=12),
                     buttons=[
                         dict(label="▶ 재생", method="animate",
                              args=[None, dict(
@@ -1153,9 +1179,9 @@ class CFDVisualizer:
             _layout_kw = dict(
                 annotations=[dict(text=_ann, xref="paper", yref="paper",
                     x=0.01, y=0.99, xanchor="left", yanchor="top", showarrow=False,
-                    font=dict(size=11, color="#1a4a8a"),
-                    bgcolor="rgba(255,255,255,0.82)", borderpad=4,
-                    bordercolor="#1a4a8a", borderwidth=1)],
+                    font=dict(size=12, color="black"),
+                    bgcolor="rgba(255,255,255,0.92)", borderpad=4,
+                    bordercolor="#333", borderwidth=1)],
                 scene=_scene,
                 updatemenus=_menus,
                 showlegend=False,
@@ -1191,8 +1217,12 @@ class CFDVisualizer:
                 _layout_kw['sliders'] = [dict(
                     active=0, pad=dict(b=10, t=10),
                     len=0.85, x=0.075, y=0,
-                    currentvalue=dict(prefix='등치값: ', visible=True,
-                                      xanchor='right', font=dict(size=11)),
+                    # 항목3: 대비 강화 · 항목2: 단위 표시(등치값은 |field| → 필드 단위)
+                    bgcolor="#1a4a8a", bordercolor="#10243e", borderwidth=1,
+                    tickcolor="#10243e", tickwidth=1, font=dict(color="black", size=11),
+                    currentvalue=dict(prefix='등치값: ', suffix=f' {unit}',
+                                      visible=True, xanchor='right',
+                                      font=dict(size=12, color="black")),
                     transition=dict(duration=0),
                     
                     # currentvalue=dict(
