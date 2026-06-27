@@ -1984,15 +1984,19 @@ with tab_results:
       if(isPlay) _pt=setTimeout(function(){gd.__isPlayingAll=false;},15000);
     };
 
-    // 스윕 재생 중 각 프레임 렌더 후 카메라 복원
-    // (isPlayingAll=false 이면 슬라이더 단일 스텝 → 복원 안 함)
-    var af=function(){
-      if(!gd.__animCam||!gd.__isPlayingAll)return;
-      var c=gd.__animCam;
-      P.relayout(gd,{'scene.camera':c})['catch'](function(){});
+    // 애니메이트(슬라이더 스텝 + ▶재생) 프레임마다 사용자 카메라 복원.
+    // gl3d 는 마우스로 회전한 카메라가 layout 에 저장되지 않아, redraw 를 동반한
+    // Plotly.animate 가 카메라를 기본값으로 되돌린다. 따라서 isPlayingAll 여부와
+    // 무관하게 __animCam 이 있으면 항상 복원해 슬라이더·재생 모두 카메라를 유지한다.
+    var restore=function(){
+      if(!gd.__animCam)return;
+      P.relayout(gd,{'scene.camera':gd.__animCam})['catch'](function(){});
     };
+    var af=restore;
 
-    var ad=function(){gd.__isPlayingAll=false;clearTimeout(_pt);};
+    // 애니메이션 종료 시에도 한 번 더 복원(슬라이더 단일 스텝은 animatingframe 이
+    // 누락될 수 있어 animated 에서 확실히 복원).
+    var ad=function(){gd.__isPlayingAll=false;clearTimeout(_pt);restore();};
 
     gd.__camH={rl:rl,af:af,ad:ad,bc:bc};
     gd.on('plotly_relayout',rl);
