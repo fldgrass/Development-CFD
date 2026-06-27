@@ -579,7 +579,8 @@ class CFDVisualizer:
                              tile_nx: int = 1,
                              tile_ny: int = 1,
                              init_camera: bool = True,
-                             n_frames: int = 1) -> Optional[Any]:
+                             n_frames: int = 1,
+                             stl_opacity: float = 0.15) -> Optional[Any]:
         """
         PyVista로 슬라이스 추출 → Plotly go.Mesh3d 인터랙티브 3D 뷰어 반환.
         n_frames > 1: Streamlit 슬라이더 대신 Plotly 내장 슬라이더로 위치 제어.
@@ -732,15 +733,20 @@ class CFDVisualizer:
             for t in _init_slice_traces:
                 _slice_trace_indices.append(len(fig.data))
                 fig.add_trace(t)
-            # 경계면 패치 (고정 — 프레임과 무관)
-            for (ox, oy) in _offsets:
-                for (pp, pf) in _patches:
-                    fig.add_trace(go.Mesh3d(
-                        x=pp[:,0]+ox, y=pp[:,1]+oy, z=pp[:,2],
-                        i=pf[:,0], j=pf[:,1], k=pf[:,2],
-                        color='lightgray', opacity=0.15,
-                        showscale=False, showlegend=False, hoverinfo='skip',
-                    ))
+            # STL 형상 (고정 — 프레임과 무관). 메시 경계 패치가 추출되면 그것을,
+            # 아니면 STL 파일을 직접 읽어 표시한다(항목4: 모든 모드에서 STL 렌더).
+            if _patches:
+                for (ox, oy) in _offsets:
+                    for (pp, pf) in _patches:
+                        fig.add_trace(go.Mesh3d(
+                            x=pp[:,0]+ox, y=pp[:,1]+oy, z=pp[:,2],
+                            i=pf[:,0], j=pf[:,1], k=pf[:,2],
+                            color='#888', opacity=float(stl_opacity),
+                            showscale=False, showlegend=False, hoverinfo='skip',
+                        ))
+            else:
+                for t in self._stl_traces(go, _offsets, opacity=stl_opacity):
+                    fig.add_trace(t)
 
             # 유선 (Scatter3d 라인) — 단일 프레임 모드에서만
             if show_streamlines and n_frames <= 1 and PYVISTA_OK and "U" in internal.array_names:
@@ -906,8 +912,56 @@ class CFDVisualizer:
                 else np.asarray(arr, float))
         return internal, np.asarray(pts), np.asarray(vals, float)
 
-    def _boundary_traces(self, go, offsets):
-        """경계면(반투명) trace 목록 — 타일 오프셋 포함."""
+    def _stl_traces(self, go, offsets, opacity=0.15):
+        """case 의 STL 형상(constant/triSurface/*.stl)을 직접 읽어 Mesh3d 로 반환.
+        메시 경계 패치가 MultiBlock 이라 추출이 어려운 경우에도 STL 을 확실히
+        표시한다(항목4). STL 은 보통 mm 단위이므로 메시(미터) bounds 와 비교해
+        스케일을 자동 보정하고, 중심을 메시 중심에 맞춘다."""
+        out = []
+        if opacity is None or float(opacity) <= 0:
+            return out
+        try:
+            import pyvista as pv
+        except Exception:
+            return out
+        tri_dir = self.case_dir / "constant" / "triSurface"
+        if not tri_dir.exists():
+            return out
+        mesh = self._get_mesh()
+        internal = (mesh["internalMesh"] if mesh is not None
+                    and "internalMesh" in mesh.keys() else None)
+        mb = internal.bounds if internal is not None else None
+        for stl in sorted(tri_dir.glob("*.stl")):
+            try:
+                m = pv.read(str(stl))
+                if m.n_points == 0:
+                    continue
+                mt = m.triangulate()
+                pp = np.asarray(mt.points, float)
+                pf = mt.faces.reshape(-1, 4)[:, 1:]
+                # 단위 스케일 자동 보정(예: mm→m) + 중심 정렬
+                if mb is not None:
+                    sb = m.bounds
+                    sx = sb[1] - sb[0]; mx = mb[1] - mb[0]
+                    sc = (mx / sx) if sx > 1e-12 else 1.0
+                    if abs(sc - 1.0) > 0.05:
+                        s_ctr = np.array([(sb[0]+sb[1])/2, (sb[2]+sb[3])/2,
+                                          (sb[4]+sb[5])/2])
+                        m_ctr = np.array([(mb[0]+mb[1])/2, (mb[2]+mb[3])/2,
+                                          (mb[4]+mb[5])/2])
+                        pp = (pp - s_ctr) * sc + m_ctr
+                for (ox, oy) in offsets:
+                    out.append(go.Mesh3d(
+                        x=pp[:, 0]+ox, y=pp[:, 1]+oy, z=pp[:, 2],
+                        i=pf[:, 0], j=pf[:, 1], k=pf[:, 2],
+                        color='#777', opacity=float(opacity),
+                        showscale=False, showlegend=False, hoverinfo='skip'))
+            except Exception:
+                pass
+        return out
+
+    def _boundary_traces(self, go, offsets, opacity=0.15):
+        """STL 형상(메시 경계면) trace 목록 — 타일 오프셋 포함. opacity 로 가시성 조절."""
         mesh = self._get_mesh()
         out = []
         if mesh is None:
@@ -926,10 +980,13 @@ class CFDVisualizer:
                     out.append(go.Mesh3d(
                         x=pp[:, 0]+ox, y=pp[:, 1]+oy, z=pp[:, 2],
                         i=pf[:, 0], j=pf[:, 1], k=pf[:, 2],
-                        color='lightgray', opacity=0.12,
+                        color='#888', opacity=float(opacity),
                         showscale=False, showlegend=False, hoverinfo='skip'))
             except Exception:
                 pass
+        # 메시 경계 패치 추출이 비면(예: MultiBlock 'boundary') STL 파일로 폴백(항목4)
+        if not out:
+            return self._stl_traces(go, offsets, opacity=opacity)
         return out
 
     def _iso_scene(self, go, bounds, tile_nx, tile_ny, dx, dy,
@@ -990,7 +1047,8 @@ class CFDVisualizer:
                         tile_nx: int = 1, tile_ny: int = 1,
                         n_frames: int = 24,
                         init_camera: bool = True,
-                        opacity: float = 0.55) -> Optional[Any]:
+                        opacity: float = 0.55,
+                        stl_opacity: float = 0.15) -> Optional[Any]:
         """슬라이스가 아닌 **입체 등치면(Isosurface)** 3D 뷰.
 
         anim=None  : 정적. level 지정 시 그 |U| 등치면 1개, 없으면 다중 등치면.
@@ -1115,6 +1173,10 @@ class CFDVisualizer:
                 first = True
                 for (ox, oy) in offsets:
                     fig.add_trace(_mesh(_geoms[lv0], ox, oy, first)); first = False
+                # 항목4: 스윕 모드에도 STL 형상을 함께 표시(스윕 중 고정).
+                # 프레임은 앞쪽 n_tiles 트레이스만 교체하므로 경계는 유지된다.
+                for t in self._boundary_traces(go, offsets, opacity=stl_opacity):
+                    fig.add_trace(t)
                 fig.frames = [
                     go.Frame(data=[_mesh(_geoms[float(lv)], ox, oy, (idx == 0))
                                    for idx, (ox, oy) in enumerate(offsets)],
@@ -1131,7 +1193,7 @@ class CFDVisualizer:
                     g = _contour_geom(lv)
                     for (ox, oy) in offsets:
                         fig.add_trace(_mesh(g, ox, oy, first)); first = False
-                for t in self._boundary_traces(go, offsets):
+                for t in self._boundary_traces(go, offsets, opacity=stl_opacity):
                     fig.add_trace(t)
                 if anim == "rotate":
                     _nf = max(2, int(n_frames))

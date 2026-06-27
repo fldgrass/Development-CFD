@@ -503,36 +503,57 @@ def estimate_case_minutes(end_time: int, refine_level: int, n_cores: int) -> flo
 def _timing_store_path(mode):
     return RESULTS_DIR / mode / ".case_timing.json"
 
-def record_case_minutes(mode, minutes):
-    """완료 케이스의 실제 소요(분)를 기록(최근 30개 유지)."""
+def record_case_minutes(mode, minutes, end_time=None, refine_level=None,
+                        n_cores=None):
+    """완료 케이스의 실제 소요(분)와 그때의 설정(반복·정밀도·코어)을 함께 기록한다
+    (최근 30개). 설정을 저장해야 다음 추정에서 '현재 설정으로 스케일링'할 수 있다."""
     try:
         if not (minutes and minutes > 0):
             return
         p = _timing_store_path(mode)
-        hist = json.loads(p.read_text()) if p.exists() else []
-        hist.append(round(float(minutes), 3))
+        hist = []
+        if p.exists():
+            try:
+                hist = json.loads(p.read_text())
+            except Exception:
+                hist = []
+        rec = {"min": round(float(minutes), 3)}
+        if end_time is not None:     rec["et"] = int(end_time)
+        if refine_level is not None: rec["rl"] = int(refine_level)
+        if n_cores is not None:      rec["nc"] = int(n_cores)
+        hist.append(rec)
+        # dict 레코드만 유지(구버전 float 기록은 폐기)
+        hist = [r for r in hist if isinstance(r, dict)][-30:]
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(hist[-30:]))
+        p.write_text(json.dumps(hist))
     except Exception:
         pass
 
-def recent_case_minutes(mode):
-    """최근 실측 케이스 소요(분)의 중앙값. 기록이 없으면 None."""
+def _median(xs):
+    s = sorted(xs)
+    return s[len(s) // 2] if s else None
+
+def estimate_total_minutes(mode, n_cases, end_time, refine_level, n_cores):
+    """배치 총 예상(분). 항목3: 최근 실측 각각을 '경험식 비'(현재 설정/측정 당시
+    설정)로 스케일링한 뒤 중앙값을 사용 → 반복·정밀도·코어가 바뀌어도 실측에
+    기반해 정확히 추정한다. 기록이 없으면 경험식으로 폴백."""
+    per = None
     try:
         p = _timing_store_path(mode)
         if p.exists():
-            hist = [float(x) for x in json.loads(p.read_text()) if float(x) > 0]
-            if hist:
-                hist.sort()
-                return hist[len(hist) // 2]
+            recs = [r for r in json.loads(p.read_text())
+                    if isinstance(r, dict) and float(r.get("min", 0)) > 0]
+            if recs:
+                _cur = estimate_case_minutes(end_time, refine_level, n_cores)
+                _scaled = []
+                for r in recs:
+                    _base = estimate_case_minutes(
+                        r.get("et", end_time), r.get("rl", refine_level),
+                        r.get("nc", n_cores))
+                    _scaled.append(float(r["min"]) * (_cur / _base if _base > 0 else 1.0))
+                per = _median(_scaled)
     except Exception:
-        pass
-    return None
-
-def estimate_total_minutes(mode, n_cases, end_time, refine_level, n_cores):
-    """배치 총 예상(분). 최근 실측 중앙값이 있으면 우선 사용(코어/반복/정밀도가
-    유사할 때 경험식보다 정확), 없으면 경험식으로 폴백."""
-    per = recent_case_minutes(mode)
+        per = None
     if per is None:
         per = estimate_case_minutes(end_time, refine_level, n_cores)
     return per * max(1, int(n_cases))
@@ -1361,7 +1382,10 @@ def _start_batch_analysis(mode, speeds, angles, csv_path, n_cores, rho, ti, nx=1
             manager.run_batch()
             try:
                 # 항목1: 실제 케이스당 소요(분)를 기록해 다음 추정을 실측에 보정.
-                record_case_minutes(mode, (time.time() - _t0) / 60.0 / _n_cases)
+                record_case_minutes(
+                    mode, (time.time() - _t0) / 60.0 / _n_cases,
+                    end_time=_bp.get("end_time"),
+                    refine_level=_bp.get("refine_level"), n_cores=n_cores)
                 set_status("done", "배치 해석 완료!")
                 add_log(f"✅ 배치 완료! CSV: {csv_path}")
             except Exception:
@@ -2156,6 +2180,14 @@ with tab_results:
                     format_func=lambda x: {"U": "속도 |U|", "p": "압력 p",
                                            "k": "난류 k", "omega": "비소산율 ω"}[x],
                     key="r1_field")
+                # 항목4: 모든 표시 모드에서 STL 형상을 결과와 함께 렌더링하고,
+                # 그 가시성(불투명도)을 사용자가 조절하도록 STL 투명도 슬라이더 제공.
+                _stl_op = st.slider(
+                    "STL 형상 투명도", min_value=0.0, max_value=1.0,
+                    value=float(ss.get("r1_stl_opacity", 0.15)), step=0.05,
+                    key="r1_stl_opacity",
+                    help="그물망(STL) 형상의 불투명도(0=숨김, 1=불투명). "
+                         "슬라이스·입체·등치면 모든 모드에 적용됩니다.")
                 _viz_r1 = CFDVisualizer(selected_case_dir)
 
                 # 카메라 유지: 슬라이스·입체·등치면이 모두 동일 uirevision('flowfield')을
@@ -2192,7 +2224,7 @@ with tab_results:
                     _fig_r1 = _viz_r1.render_field_plotly(
                         _r1_field, _r1_sdir, 0.5, _r1_stream,
                         tile_nx=_tnx, tile_ny=_tny, init_camera=_init_cam,
-                        n_frames=11)
+                        n_frames=11, stl_opacity=_stl_op)
                     _cap = "💡 드래그: 회전 | 스크롤: 줌 | 차트 하단 슬라이더: 슬라이스 위치"
                 elif _vmode == "입체":
                     # 항목4: 입체 모드 투명도 — 등치면 모드와 독립된 세션 키 사용.
@@ -2203,7 +2235,8 @@ with tab_results:
                         help="등치면 표면의 불투명도(1.0=불투명). 입체 모드 전용.")
                     _fig_r1 = _viz_r1.render_field_3d(
                         _r1_field, tile_nx=_tnx, tile_ny=_tny,
-                        init_camera=_init_cam, opacity=_op_vol)
+                        init_camera=_init_cam, opacity=_op_vol,
+                        stl_opacity=_stl_op)
                     _cap = "💡 드래그: 회전 | 스크롤: 줌 (등치면 3개)"
                 else:  # 등치면(스윕)
                     # 수동 슬라이더 체크박스 제거 — Plotly 내장 슬라이더가 수동·자동 모두 담당.
@@ -2216,7 +2249,8 @@ with tab_results:
                         help="등치면 표면의 불투명도(1.0=불투명). 등치면 모드 전용.")
                     _fig_r1 = _viz_r1.render_field_3d(
                         _r1_field, anim="sweep", tile_nx=_tnx, tile_ny=_tny,
-                        init_camera=_init_cam, opacity=_op_iso)
+                        init_camera=_init_cam, opacity=_op_iso,
+                        stl_opacity=_stl_op)
                     _cap = "▶ 재생: 자동 스윕 | 차트 하단 슬라이더: 수동 위치 — 회전·확대 유지됨"
 
                 if _fig_r1:
