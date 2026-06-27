@@ -1934,87 +1934,93 @@ with tab_results:
                     _cv1.html("""<script>
 (function(){
   // ── 설계 원칙 ──────────────────────────────────────────────────────────
-  // 1. P.react 래퍼 없음 — react 래핑이 슬라이스 slider를 망가뜨림
-  // 2. plotly_buttonclicked 로 ▶ 재생과 슬라이더 구분
-  // 3. 이전 gd(이전 모드 원소)의 orphaned 애니메이션을 attach 시 중지
-  // 4. gd.__camBusy 없음 — camBusy 로 rl 핸들러를 막으면 카메라가 stale 해짐
+  // Streamlit 은 슬라이스 축/필드 변경(리런) 시 컴포넌트 iframe 은 재사용(스크립트
+  // 미실행)하면서 Plotly 차트 DOM 원소는 교체한다. 따라서 "스크립트 재실행 시 1회
+  // attach" 방식은 교체된 새 원소에 핸들러를 못 건다. 해결책: 부모 윈도우에 단일
+  // 영속 루프를 두어
+  //   1) 현재 scene 차트 원소를 매 틱 추적하고, 원소가 바뀌면 자동 재-attach + 복원
+  //   2) 라이브 gl 카메라를 폴링해 "안정(2회 연속 동일)·비애니메이션" 상태만 저장
+  //      → plotly_relayout 이 놓치는 2차 회전도 포착, 애니메이션 transient 는 제외
+  // 카메라는 W.__camStore(부모 윈도우)에 보관 → 리런·모드전환·축변경에도 지속.
+  // P(Plotly)는 iframe 초기 실행 시 로드 전일 수 있어 매번 지연 해석(PL).
   // ───────────────────────────────────────────────────────────────────────
-  var P=window.parent.Plotly;
-  var _id=Date.now();
-
-  function attach(gd){
-    if(gd.__camSetup===_id)return;
-
-    // 이전 모드의 orphaned gd 애니메이션 중지
-    // (모드 전환마다 새 DOM 원소가 생기므로, 이전 원소의 RAF가
-    //  교체된 프레임에 접근해 TypeError를 일으킴)
-    var prev=window.parent.__camPrevGd;
-    if(prev&&prev!==gd){
-      try{ P.animate(prev,[],{mode:'immediate'}); }catch(e){}
-    }
-    window.parent.__camPrevGd=gd;
-
-    if(gd.__camH){
-      try{
-        gd.removeListener('plotly_relayout',gd.__camH.rl);
-        gd.removeListener('plotly_animatingframe',gd.__camH.af);
-        gd.removeListener('plotly_animated',gd.__camH.ad);
-        gd.removeListener('plotly_buttonclicked',gd.__camH.bc);
-      }catch(e){}
-    }
-    gd.__camSetup=_id;
-    gd.__isPlayingAll=false;
-
-    var _pt=null;
-
-    // 사용자 카메라(회전·확대) 변경 시 저장
-    var rl=function(){
+  var W=window.parent;
+  function PL(){try{return W.Plotly||window.top.Plotly;}catch(e){return null;}}
+  function clone(c){return c?JSON.parse(JSON.stringify(
+    {eye:c.eye,center:c.center,up:c.up})):null;}
+  function liveCam(gd){
+    try{
       var s=gd._fullLayout&&gd._fullLayout.scene;
-      if(s&&s.camera)gd.__animCam=JSON.parse(JSON.stringify(
-        {eye:s.camera.eye,center:s.camera.center,up:s.camera.up}));
-    };
-
-    // ▶ 재생 버튼 클릭 시에만 isPlayingAll=true
-    // 슬라이더 단일 클릭은 plotly_buttonclicked를 발생시키지 않음
-    var bc=function(d){
-      var isPlay=d&&d.button&&d.button.args&&d.button.args[0]===null;
-      gd.__isPlayingAll=isPlay;
-      clearTimeout(_pt);
-      // 안전장치: 재생 도중 모드 전환으로 plotly_animated 미발생 시 자동 리셋
-      if(isPlay) _pt=setTimeout(function(){gd.__isPlayingAll=false;},15000);
-    };
-
-    // 애니메이트(슬라이더 스텝 + ▶재생) 프레임마다 사용자 카메라 복원.
-    // gl3d 는 마우스로 회전한 카메라가 layout 에 저장되지 않아, redraw 를 동반한
-    // Plotly.animate 가 카메라를 기본값으로 되돌린다. 따라서 isPlayingAll 여부와
-    // 무관하게 __animCam 이 있으면 항상 복원해 슬라이더·재생 모두 카메라를 유지한다.
-    var restore=function(){
-      if(!gd.__animCam)return;
-      P.relayout(gd,{'scene.camera':gd.__animCam})['catch'](function(){});
-    };
-    var af=restore;
-
-    // 애니메이션 종료 시에도 한 번 더 복원(슬라이더 단일 스텝은 animatingframe 이
-    // 누락될 수 있어 animated 에서 확실히 복원).
-    var ad=function(){gd.__isPlayingAll=false;clearTimeout(_pt);restore();};
-
-    gd.__camH={rl:rl,af:af,ad:ad,bc:bc};
-    gd.on('plotly_relayout',rl);
-    gd.on('plotly_buttonclicked',bc);
+      if(s&&s._scene&&s._scene.getCamera)return s._scene.getCamera();
+      return s?s.camera:null;
+    }catch(e){return null;}
+  }
+  function eq(a,b){
+    if(!a||!b)return false;
+    var ks=['eye','center','up'],ds=['x','y','z'];
+    for(var i=0;i<ks.length;i++){
+      if(!a[ks[i]]||!b[ks[i]])return false;
+      for(var j=0;j<ds.length;j++){
+        if(Math.abs(a[ks[i]][ds[j]]-b[ks[i]][ds[j]])>1e-5)return false;}}
+    return true;
+  }
+  function findGd(){
+    var ps=W.document.querySelectorAll('.js-plotly-plot'),i,p;
+    for(i=0;i<ps.length;i++){p=ps[i];
+      if(p._fullLayout&&p._fullLayout.scene&&p.offsetParent!==null)return p;}
+    for(i=0;i<ps.length;i++){p=ps[i];
+      if(p._fullLayout&&p._fullLayout.scene)return p;}
+    return null;
+  }
+  // 저장된 사용자 카메라를 gd 에 복원(+복원 동안 폴링 게이트)
+  function restore(gd){
+    var p=PL();if(!p||!W.__camStore)return;
+    gd.__animUntil=Date.now()+500;
+    try{p.relayout(gd,{'scene.camera':W.__camStore})['catch'](function(){});}
+    catch(e){}
+  }
+  // 애니메이션(슬라이더 스텝·▶재생) 이벤트 핸들러 부착 — 매 프레임 카메라 복원
+  function attachHandlers(gd){
+    if(gd.__camH){try{
+      gd.removeListener('plotly_animatingframe',gd.__camH.af);
+      gd.removeListener('plotly_animated',gd.__camH.ad);
+      gd.removeListener('plotly_sliderchange',gd.__camH.sc);
+      gd.removeListener('plotly_buttonclicked',gd.__camH.bc);
+    }catch(e){}}
+    var gate=function(){gd.__animUntil=Date.now()+700;};
+    var af=function(){restore(gd);};
+    var ad=function(){restore(gd);gd.__animUntil=Date.now()+300;};
+    var sc=function(){gate();restore(gd);};
+    var bc=function(){gate();};
+    gd.__camH={af:af,ad:ad,sc:sc,bc:bc};
     gd.on('plotly_animatingframe',af);
     gd.on('plotly_animated',ad);
+    gd.on('plotly_sliderchange',sc);
+    gd.on('plotly_buttonclicked',bc);
   }
 
-  function find(){
-    var plots=window.parent.document.querySelectorAll('.js-plotly-plot');
-    for(var i=0;i<plots.length;i++){
-      var p=plots[i];
-      if(p._fullLayout&&p._fullLayout.scene){attach(p);return;}
+  // 단일 영속 루프(부모 윈도우 타이머 — 0-height iframe 로컬 타이머는 throttle 됨)
+  if(W.__camLoop){try{W.clearInterval(W.__camLoop);}catch(e){}}
+  W.__camPrevPoll=null;
+  W.__camLoop=W.setInterval(function(){
+    var gd=findGd();if(!gd)return;
+    if(gd!==W.__camGd){
+      // 원소 교체(리런/모드전환/축변경) → 재-attach + 저장 카메라 복원
+      W.__camGd=gd;W.__camPrevPoll=null;
+      attachHandlers(gd);
+      restore(gd);
+      // 늦은 Plotly.react 기본값 덮어쓰기 대비 재복원(부모 타이머 — throttle 회피)
+      W.setTimeout(function(){restore(gd);},150);
+      W.setTimeout(function(){restore(gd);},400);
+      return;
     }
-    setTimeout(find,200);
-  }
-
-  find();
+    // 카메라 폴링: 안정(2회 연속 동일)·비애니메이션 상태만 저장
+    var now=Date.now();
+    if(now<(gd.__animUntil||0)){W.__camPrevPoll=null;return;}
+    var c=liveCam(gd);if(!c)return;
+    if(W.__camPrevPoll&&eq(W.__camPrevPoll,c)){W.__camStore=clone(c);}
+    W.__camPrevPoll=clone(c);
+  },100);
 })();
 </script>""", height=0)
 
