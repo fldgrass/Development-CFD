@@ -327,6 +327,86 @@ def _restore_input_state():
             ss[k] = data[k]
     ss._input_restored = True
 
+# ─── 프로젝트(케이스 묶음) 저장/불러오기/새로 만들기 (항목3·4) ────────────────
+# 프로젝트 = 사용자가 만든 '해석 조건 + 해석 결과(결과 CSV) + 물리/계산/시각화 설정'의
+# 묶음. 결과 CSV 파일명이 프로젝트의 결과 데이터 식별자가 된다(항목5: CSV 탭은 활성
+# 프로젝트 데이터만 표시). 메타데이터(이름·모드·저장시각)를 함께 보관하며, 키 목록만
+# 늘리면 항목을 확장할 수 있다(확장성).
+PROJECT_KEYS = [
+    # 해석 조건(유속·영각 범위)
+    "u_min", "u_max", "u_steps", "a_min", "a_max", "a_steps",
+    # 물리 조건
+    "rho", "nu", "ti",
+    # 계산량 프리셋
+    "end_time_preset", "refine_level_preset", "residual_preset",
+    "write_interval_preset",
+    # 형상/감지/타일
+    "analysis_mode", "stl_net_path", "stl_cage_path",
+    "auto_cell_size_mm", "auto_wire_d_mm", "auto_solidity",
+    "auto_frontal_area", "cell_size_mm", "solidity_input",
+    "unit_nx", "unit_ny",
+    # 결과 CSV(프로젝트 데이터) + 시각화 설정
+    "batch_csv_name",
+    "r1_viewmode", "r1_field", "r1_opacity_vol", "r1_opacity_iso",
+]
+# '새 프로젝트' 시 초기화할 기본값(깨끗한 상태)
+PROJECT_DEFAULTS = {
+    "u_min": 1.0, "u_max": 1.0, "u_steps": 1,
+    "a_min": 0.0, "a_max": 0.0, "a_steps": 1,
+    "rho": 1025.0, "nu": 1.19, "ti": 5,
+    "r1_viewmode": "슬라이스", "r1_field": "U",
+    "r1_opacity_vol": 0.55, "r1_opacity_iso": 0.55,
+}
+
+def _projects_dir(_mode):
+    return RESULTS_DIR / _mode / "projects"
+
+def list_project_names(_mode):
+    _d = _projects_dir(_mode)
+    return sorted(p.stem for p in _d.glob("*.json")) if _d.exists() else []
+
+def save_project(_mode, _name):
+    """현재 세션 상태를 프로젝트 JSON 으로 저장."""
+    _state = {k: ss.get(k) for k in PROJECT_KEYS}
+    _state["_meta"] = {"name": _name, "mode": _mode,
+                       "saved": datetime.now().isoformat()}
+    _d = _projects_dir(_mode); _d.mkdir(parents=True, exist_ok=True)
+    (_d / f"{_name}.json").write_text(
+        json.dumps(_state, ensure_ascii=False, indent=2))
+    ss.active_project = _name
+
+def _apply_project_load(_mode, _name):
+    """프로젝트 JSON 을 세션 상태에 반영(위젯 생성 전에 호출돼야 안전)."""
+    _p = _projects_dir(_mode) / f"{_name}.json"
+    if not _p.exists():
+        return False
+    try:
+        _data = json.loads(_p.read_text())
+    except Exception:
+        return False
+    for k in PROJECT_KEYS:
+        if k in _data and _data[k] is not None:
+            ss[k] = _data[k]
+    ss.active_project = _name
+    ss.res_sel_cond = None          # 결과 선택 초기화(새 프로젝트 데이터로)
+    return True
+
+def _apply_project_new():
+    """모든 조건/결과/시각화 상태를 기본값으로 초기화(깨끗한 새 프로젝트)."""
+    for k, v in PROJECT_DEFAULTS.items():
+        ss[k] = v
+    for k in ("stl_net_path", "stl_cage_path", "batch_csv_name",
+              "res_sel_cond", "result_csv_sel"):
+        ss[k] = None
+    ss.active_project = None
+
+# 위젯 생성 '이전'에 보류된 로드/새프로젝트를 적용(세션 상태 안전 변경).
+if ss.get("_pending_load_project"):
+    _apply_project_load(ss.get("analysis_mode", "unit_cell"),
+                        ss.pop("_pending_load_project"))
+if ss.pop("_pending_new_project", False):
+    _apply_project_new()
+
 # 매 렌더링마다 디스크 상태 확인 → 새로고침 후 진행 중인 작업 자동 복구
 _restore_job_state_if_detached()
 # 새로고침 후 STL 업로드 선택·미리보기 복구
@@ -789,13 +869,47 @@ with st.sidebar:
     )
     st.divider()
 
+    # ─── 프로젝트 (항목3·4) ───────────────────────────────────────────────
+    st.markdown("### 📁 프로젝트")
+    _active_proj = ss.get("active_project")
+    st.caption(f"현재 프로젝트: **{_active_proj}**" if _active_proj
+               else "현재 프로젝트: _(없음 — 임시 작업)_")
+    with st.expander("저장 / 불러오기 / 새로 만들기", expanded=True):
+        _pname = st.text_input("프로젝트 이름", value=(_active_proj or ""),
+                               key="proj_name_input",
+                               placeholder="예: onemesh2_기본")
+        if st.button("💾 현재 프로젝트 저장", use_container_width=True,
+                     key="proj_save_btn"):
+            _nm = (_pname or "").strip()
+            if _nm:
+                save_project(mode, _nm)
+                st.success(f"프로젝트 '{_nm}' 저장됨")
+                st.rerun()
+            else:
+                st.warning("프로젝트 이름을 입력하세요.")
+        _projs = list_project_names(mode)
+        if _projs:
+            st.selectbox("불러올 프로젝트", options=_projs, key="proj_load_sel")
+            if st.button("📂 프로젝트 불러오기", use_container_width=True,
+                         key="proj_load_btn"):
+                # 위젯 생성 전 적용을 위해 보류 플래그로 넘기고 재실행
+                ss._pending_load_project = ss.get("proj_load_sel")
+                st.rerun()
+        else:
+            st.caption("저장된 프로젝트가 없습니다.")
+        if st.button("🆕 새 프로젝트 (조건·결과 초기화)", use_container_width=True,
+                     key="proj_new_btn"):
+            ss._pending_new_project = True
+            st.rerun()
+    st.divider()
+
     # ─── 공통 물리 조건 ───────────────────────────────────────────────────
     st.markdown("### 🌊 물리 조건")
     rho = st.number_input("해수 밀도 ρ [kg/m³]", value=1025.0,
-                          min_value=1000.0, max_value=1100.0, step=1.0)
+                          min_value=1000.0, max_value=1100.0, step=1.0, key="rho")
     nu  = st.number_input("동점성계수 ν [×10⁻⁶ m²/s]",
-                          value=1.19, min_value=0.5, max_value=2.0, step=0.01)
-    ti  = st.slider("난류 강도 I [%]", 1, 20, 5)
+                          value=1.19, min_value=0.5, max_value=2.0, step=0.01, key="nu")
+    ti  = st.slider("난류 강도 I [%]", 1, 20, 5, key="ti")
     st.divider()
 
     # ─── 시스템 설정 ──────────────────────────────────────────────────────
@@ -2219,19 +2333,36 @@ with tab_results:
                 (RESULTS_DIR / mode).glob("*.csv"),
                 key=lambda c: c.stat().st_mtime, reverse=True
             )
+            # 항목5: 활성 프로젝트가 있으면 그 프로젝트의 결과 CSV 로 고정(타 프로젝트·
+            # stale 데이터 혼입 차단). 프로젝트가 없으면 모드 CSV 선택을 허용.
+            _active_proj = ss.get("active_project")
+            _forced_csv = None
+            if _active_proj and ss.get("batch_csv_name"):
+                _fp = RESULTS_DIR / mode / ss.get("batch_csv_name")
+                if _fp.exists():
+                    _forced_csv = _fp
 
-            if not all_csvs:
+            if not all_csvs and _forced_csv is None:
                 st.info(f"이 모드({mode})에 저장된 프로젝트(결과 CSV)가 없습니다. "
                         "해석을 완료하면 자동 생성됩니다.")
+            elif _active_proj and _forced_csv is None:
+                st.info(f"활성 프로젝트 **{_active_proj}** 의 결과 CSV가 아직 없습니다. "
+                        "이 프로젝트로 해석을 완료하면 생성됩니다.")
             else:
-                _csv_names = [c.name for c in all_csvs]
-                csv_sel = st.selectbox(
-                    "📂 프로젝트 불러오기 (결과 CSV 파일)",
-                    options=_csv_names,
-                    key="result_csv_sel",
-                    help="결과 CSV 한 파일이 하나의 프로젝트입니다. 선택한 프로젝트의 "
-                         "조건·Cd/Cl만 아래에 표시됩니다.")
-                csv_target = next(c for c in all_csvs if c.name == csv_sel)
+                if _forced_csv is not None:
+                    st.markdown(
+                        f"📁 **활성 프로젝트:** {_active_proj} — "
+                        f"`{_forced_csv.name}`  (이 프로젝트 데이터만 표시)")
+                    csv_target = _forced_csv
+                else:
+                    _csv_names = [c.name for c in all_csvs]
+                    csv_sel = st.selectbox(
+                        "📂 프로젝트 불러오기 (결과 CSV 파일)",
+                        options=_csv_names,
+                        key="result_csv_sel",
+                        help="결과 CSV 한 파일이 하나의 프로젝트입니다. 선택한 "
+                             "프로젝트의 조건·Cd/Cl만 아래에 표시됩니다.")
+                    csv_target = next(c for c in all_csvs if c.name == csv_sel)
 
                 try:
                     df = pd.read_csv(csv_target)
