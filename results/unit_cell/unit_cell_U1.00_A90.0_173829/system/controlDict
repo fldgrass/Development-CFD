@@ -1,0 +1,78 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  v2312                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      controlDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+// ─── UI 제어 변수 (Python에서 이 두 줄만 치환) ───────────────────────────
+endTimeValue        500;
+writeIntervalValue  100;
+
+application     simpleFoam;
+
+startFrom       startTime;
+startTime       0;
+stopAt          endTime;
+endTime         $endTimeValue;     // 반복 횟수 (정상 상태 수렴 기준)
+
+deltaT          1;                 // 반복 스텝 (steady-state이므로 1)
+writeControl    timeStep;
+writeInterval   $writeIntervalValue;  // N스텝마다 결과 저장
+purgeWrite      3;             // 최근 3개 결과만 유지 (디스크 절약)
+
+writeFormat     binary;        // binary가 ASCII보다 ~3배 빠름
+writePrecision  8;
+writeCompression off;
+
+timeFormat      general;
+timePrecision   6;
+
+runTimeModifiable true;
+
+// ─── 힘 계수 계산 함수 ───────────────────────────────────────────────────
+functions
+{
+    forceCoeffs
+    {
+        type            forceCoeffs;
+        libs            ("libforces.so");
+        writeControl    timeStep;
+        writeInterval   10;
+
+        log             true;
+
+        patches         (netSurface);
+        rho             rhoInf;
+        rhoInf          1025;       // 해수 밀도 [kg/m^3]
+
+        // 기준 방향 벡터 (Python에서 영각에 따라 자동 교체됨)
+        liftDir         (-1.0000 0 0.0000);
+        dragDir         (0.0000 0 1.0000);
+
+        CofR            (0 0 0);    // 기준 모멘트 중심
+
+        // 기준 면적 및 코드 길이 (단위 셀 면적으로 자동 계산됨)
+        magUInf         1.0000;
+        lRef            0.040004;
+        Aref            9.601920e-04;
+    }
+
+    residuals
+    {
+        type            solverInfo;
+        libs            ("libutilityFunctionObjects.so");
+        fields          (U p k omega);
+        writeControl    timeStep;
+        writeInterval   1;
+    }
+}
+
+// ************************************************************************* //

@@ -15,7 +15,7 @@ FoamFile
 // 권장: 물리 코어 수 (예: 16코어 CPU → numberOfSubdomains 16)
 // GPU 가속은 AmgX 라이브러리를 통해 선형 솔버 단계에서 별도 적용
 
-numberOfSubdomains  32;   // Python에서 자동으로 CPU 코어 수에 맞게 교체됨
+numberOfSubdomains  16;   // Python에서 자동으로 CPU 코어 수에 맞게 교체됨
 
 method          scotch;   // 자동 도메인 분할 (METIS보다 설치 용이)
 
