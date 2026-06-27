@@ -1043,6 +1043,31 @@ def _start_single_analysis(
     st.rerun()
 
 
+def _scan_done_conditions(mode):
+    """프로젝트(모드)에서 이미 완료된 (유속, 영각) 조건 집합을 반환.
+    항목9 덮어쓰기 경고용 — '해석완료_' 접두어 + 실제 결과(시간 디렉토리) 보유 기준."""
+    import re as _re_dc
+    _done = set()
+    _root = RESULTS_DIR / mode
+    if not _root.exists():
+        return _done
+    for _d in _root.iterdir():
+        if not _d.is_dir() or not _d.name.startswith("해석완료_"):
+            continue
+        _m = _re_dc.search(r"_U([0-9.]+)_A(-?[0-9.]+)", _d.name)
+        if not _m:
+            continue
+        try:
+            _tdirs = [t for t in _d.iterdir()
+                      if t.is_dir() and t.name not in ("0",)
+                      and t.name.replace(".", "", 1).isdigit()]
+        except Exception:
+            _tdirs = []
+        if _tdirs:
+            _done.add((round(float(_m.group(1)), 2), round(float(_m.group(2)), 1)))
+    return _done
+
+
 def _start_batch_analysis(mode, speeds, angles, csv_path, n_cores, rho, ti, nx=1, ny=1):
     """배치 해석 실행 (백그라운드 스레드)"""
     if ss.job_status == "running":
@@ -1626,13 +1651,24 @@ with tab_input:
 
         btn_col1, btn_col2 = st.columns(2)
 
+        # 항목9: 실행 전 이미 완료된 조건과의 중복 검사(덮어쓰기 경고용)
+        _run_conds = {(round(float(s), 2), round(float(a), 1))
+                      for s in speeds for a in angles}
+        _overlap_conds = sorted(_run_conds & _scan_done_conditions(mode))
+
         with btn_col1:
             if st.button(_run_label, disabled=run_disabled,
                          use_container_width=True, type="primary"):
-                _start_batch_analysis(
-                    mode, speeds, angles, csv_path, n_cores, rho, ti,
-                    nx=ss.unit_nx, ny=ss.unit_ny,
-                )
+                if _overlap_conds:
+                    # 완료 조건 중복 → 즉시 실행하지 않고 덮어쓰기 경고 표시
+                    ss["_ovw_overlap"] = _overlap_conds
+                    st.rerun()
+                else:
+                    ss["_ovw_overlap"] = None
+                    _start_batch_analysis(
+                        mode, speeds, angles, csv_path, n_cores, rho, ti,
+                        nx=ss.unit_nx, ny=ss.unit_ny,
+                    )
 
         with btn_col2:
             if st.button(
@@ -1642,6 +1678,28 @@ with tab_input:
                 type="secondary"
             ):
                 _stop_analysis()
+
+        # 항목9: 덮어쓰기 경고 + 확인. 기존 완료 결과가 있는 조건을 재해석할 때
+        # 사용자가 명시적으로 동의해야 진행(진행 시 케이스 디렉토리·CSV 행 모두 교체).
+        if ss.get("_ovw_overlap"):
+            _ct = ", ".join(f"U={s:.2f}·α={a:.1f}°" for s, a in ss["_ovw_overlap"])
+            st.warning(
+                f"⚠️ 조건 '{_ct}'에 이미 해석 결과가 있습니다. "
+                "계속하면 기존 결과를 덮어씁니다.")
+            _w1, _w2 = st.columns(2)
+            with _w1:
+                if st.button("✅ 덮어쓰기하고 진행", type="primary",
+                             use_container_width=True, key="ovw_go",
+                             disabled=run_disabled):
+                    ss["_ovw_overlap"] = None
+                    _start_batch_analysis(
+                        mode, speeds, angles, csv_path, n_cores, rho, ti,
+                        nx=ss.unit_nx, ny=ss.unit_ny,
+                    )
+            with _w2:
+                if st.button("취소", use_container_width=True, key="ovw_cancel"):
+                    ss["_ovw_overlap"] = None
+                    st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2073,26 +2131,43 @@ with tab_results:
                     st.info("유속 샘플링 데이터 없음 — 전체 구조 모드(full_structure)에서 이용 가능합니다.")
 
         with r_tab4:
-            # ── CSV 데이터 표시 ───────────────────────────────────────────
+            # ── 항목7·8: 프로젝트(=결과 CSV) 단위 데이터 관리 ──────────────
+            # 결과 CSV 한 파일 = 하나의 프로젝트(케이스 묶음). CSV 탭은 '현재 모드'의
+            # 프로젝트만 나열하고, 선택한 프로젝트 정보만 표시한다(다른 모드/프로젝트
+            # 데이터 혼입 방지). 표시 유속·Cd/Cl 요약은 이 CSV에서 자동 파생되므로
+            # 신규 조건이 추가되면 자동 갱신된다.
             import pandas as pd
-            all_csvs = (
-                list((RESULTS_DIR / "unit_cell").glob("*.csv")) +
-                list((RESULTS_DIR / "full_structure").glob("*.csv"))
+            all_csvs = sorted(
+                (RESULTS_DIR / mode).glob("*.csv"),
+                key=lambda c: c.stat().st_mtime, reverse=True
             )
 
             if not all_csvs:
-                st.info("저장된 결과 CSV가 없습니다. 해석을 완료하면 자동 생성됩니다.")
+                st.info(f"이 모드({mode})에 저장된 프로젝트(결과 CSV)가 없습니다. "
+                        "해석을 완료하면 자동 생성됩니다.")
             else:
                 _csv_names = [c.name for c in all_csvs]
                 csv_sel = st.selectbox(
-                    "CSV 파일 선택",
+                    "📂 프로젝트 불러오기 (결과 CSV 파일)",
                     options=_csv_names,
                     key="result_csv_sel",
-                )
+                    help="결과 CSV 한 파일이 하나의 프로젝트입니다. 선택한 프로젝트의 "
+                         "조건·Cd/Cl만 아래에 표시됩니다.")
                 csv_target = next(c for c in all_csvs if c.name == csv_sel)
 
                 try:
                     df = pd.read_csv(csv_target)
+
+                    # ── 프로젝트 요약 (조건 수·유속·영각) ──────────────────
+                    if {"speed_m_s", "angle_deg"}.issubset(df.columns):
+                        _p_sp = sorted(df["speed_m_s"].dropna().unique())
+                        _p_ag = sorted(df["angle_deg"].dropna().unique())
+                        _p_cd = int(df["Cd"].notna().sum()) if "Cd" in df.columns else 0
+                        st.caption(
+                            f"📁 프로젝트 **{csv_target.stem}** · 조건 {len(df)}개 "
+                            f"· 유속 {', '.join(f'{s:.2f}' for s in _p_sp)} m/s "
+                            f"· 영각 {', '.join(f'{a:.1f}' for a in _p_ag)}° "
+                            f"· Cd/Cl 유효 {_p_cd}행")
 
                     # ── 데이터 테이블 ──────────────────────────────────────
                     st.markdown(f"**{csv_target.name}** — {len(df)} 행, {len(df.columns)} 열")

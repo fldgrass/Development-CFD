@@ -1015,15 +1015,33 @@ class ResultExtractor:
         }
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        file_exists = output_path.exists()
 
-        with open(output_path, "a", newline="") as f:
+        # 항목9(덮어쓰기): 같은 (유속, 영각) 조건의 기존 행은 제거하고 새 행으로 교체한다.
+        # 단순 append 는 재해석 시 동일 조건 중복 행을 남겨 표시 유속·Cd/Cl 요약을
+        # 오염시키므로, 프로젝트 CSV는 조건당 1행만 유지(최신 결과로 덮어씀).
+        _existing = []
+        if output_path.exists():
+            try:
+                with open(output_path, newline="") as f:
+                    for r in csv.DictReader(f):
+                        try:
+                            _same = (abs(float(r.get("speed_m_s", "nan")) - float(self.speed)) < 1e-6
+                                     and abs(float(r.get("angle_deg", "nan")) - float(self.angle_deg)) < 1e-6)
+                        except (TypeError, ValueError):
+                            _same = False
+                        if not _same:
+                            _existing.append(r)
+            except Exception:
+                _existing = []
+
+        with open(output_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=self.HEADER)
-            if not file_exists:
-                writer.writeheader()
+            writer.writeheader()
+            for r in _existing:
+                writer.writerow({k: r.get(k, "") for k in self.HEADER})
             writer.writerow(row)
 
-        logger.info(f"결과 저장: {output_path}")
+        logger.info(f"결과 저장(조건당 1행 유지): {output_path}")
         return output_path
 
 
