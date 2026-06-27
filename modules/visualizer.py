@@ -627,12 +627,27 @@ class CFDVisualizer:
                 return None
             faces = raw_faces.reshape(-1, 4)[:, 1:]
 
-            # 스칼라 값 추출 (point data 우선)
+            # 스칼라 값 추출 — 반드시 '점(vertex) 데이터'로 반환한다.
+            # OpenFOAM 필드는 셀 중심값이라, 슬라이스 결과에 같은 이름의 point/cell
+            # 데이터가 함께 존재할 수 있다. ds[fname] 는 이때 cell 데이터(길이=면 수)를
+            # 돌려줘 Mesh3d 정점 수와 어긋나고, 색이 정점에 잘못 매핑되어 슬라이스가
+            # 셀 경계에서 '블록형 불연속'으로 보인다(항목8 원인). point_data 를 우선
+            # 사용하고, 없으면 cell→point 보간해 정점당 1값을 보장한다.
             def _get_scalar(ds, fname):
                 if fname not in ds.array_names:
                     return np.zeros(ds.n_points)
-                arr = ds[fname]
-                return np.linalg.norm(arr, axis=1) if arr.ndim == 2 else np.asarray(arr, float)
+                if fname in ds.point_data:
+                    arr = ds.point_data[fname]
+                elif fname in ds.cell_data:
+                    try:
+                        arr = ds.cell_data_to_point_data().point_data[fname]
+                    except Exception:
+                        arr = ds[fname]
+                else:
+                    arr = ds[fname]
+                arr = np.asarray(arr)
+                return (np.linalg.norm(arr, axis=1) if arr.ndim == 2
+                        else np.asarray(arr, float))
 
             scalar = _get_scalar(tri, field)
 
