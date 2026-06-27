@@ -774,12 +774,23 @@ class CFDVisualizer:
                         prefix=f"Slice {slice_normal.upper()} ",
                         suffix="%", visible=True, xanchor="right",
                         font=dict(size=11)),
-                    transition=dict(duration=0),
-                    steps=[dict(
+                        transition=dict(duration=0),
+                    steps=[dict
+                    (
                         method="animate",
-                        args=[[f.name], dict(mode="immediate",
-                                             frame=dict(duration=0, redraw=True),
-                                             transition=dict(duration=0))],
+                        args=[
+                            [f.name], 
+                            dict
+                            (
+                                mode="immediate",
+                                frame=dict(
+                                    duration=0,
+                                    redraw=True
+                                ),
+                                transition=dict(duration=0)
+                            )
+                        
+                        ],
                         label=f.name,
                     ) for f in fig.frames],
                 )]
@@ -814,6 +825,10 @@ class CFDVisualizer:
                          + (f"   |  타일 {tile_nx}×{tile_ny}"
                             if tile_nx * tile_ny > 1 else ""))
             _bottom = 60 if _plotly_sliders else 0
+
+            _scene = dict(scene)
+
+
             fig.update_layout(
                 uirevision='flowfield',
                 annotations=[dict(
@@ -822,7 +837,13 @@ class CFDVisualizer:
                     showarrow=False, font=dict(size=11, color="#1a4a8a"),
                     bgcolor="rgba(255,255,255,0.82)", borderpad=4,
                     bordercolor="#1a4a8a", borderwidth=1)],
-                scene=scene,
+                #scene=scene,
+                scene={
+                    k:v
+                    for k,v
+                    in scene.items()
+                    if k!="camera"
+                },
                 sliders=_plotly_sliders,
                 showlegend=False,
                 margin=dict(l=0, r=0, t=10, b=_bottom),
@@ -886,10 +907,10 @@ class CFDVisualizer:
 
     def _iso_scene(self, go, bounds, tile_nx, tile_ny, dx, dy,
                    init_camera=True, anim=None):
-        """등치면 뷰의 scene(축·카메라) 레이아웃.
+        """등치면·입체 뷰의 scene(축·카메라) 레이아웃.
 
-        anim='sweep': uirevision을 넣어 재생 중 사용자 카메라(회전·확대)를 보존한다.
-        그 외: uirevision 없이 camera를 항상 명시해 초기 1.6배 확대를 보장한다.
+        uirevision='flowfield' 고정으로 슬라이스·등치면 모드 전환 시 카메라 보존.
+        등치면 스윕 재생 중 카메라 복원은 JS iframe 핸들러(plotly_buttonclicked)가 담당.
         """
         cx = (bounds[0]+bounds[1])/2 + (tile_nx-1)*dx/2.0
         cy = (bounds[2]+bounds[3])/2 + (tile_ny-1)*dy/2.0
@@ -907,18 +928,24 @@ class CFDVisualizer:
                        gridcolor="white", showbackground=True),
             aspectmode='cube', bgcolor='rgba(240,248,255,1)',
         )
-        if anim == 'sweep':
-            # redraw=True 애니메이션은 프레임마다 Plotly.react()를 호출하는데,
-            # scene에 camera가 명시되어 있으면 uirevision이 있어도 재적용되어
-            # 사용자 카메라가 리셋된다. camera를 빼고 uirevision만 두면 보존된다.
-            scene['uirevision'] = 'iso_sweep_camera'
-        else:
-            # Streamlit 리런(슬라이더·필드 변경) 시 uirevision이 동일하면
-            # Plotly.js가 사용자 카메라를 보존한다. 최초 렌더에만 camera를
-            # 명시해 1.6× 초기 확대를 적용하고, 이후 렌더는 camera를 생략한다.
-            scene['uirevision'] = 'flowfield'
-            if init_camera:
-                scene['camera'] = dict(eye=dict(x=1.0, y=1.0, z=1.0))
+        # 슬라이스·등치면 모두 동일한 uirevision으로 모드 전환 시 카메라 보존.
+        # 등치면 스윕 재생 중 카메라 복원은 JS 핸들러(plotly_buttonclicked)가 담당.
+        scene['uirevision'] = 'flowfield'
+        
+        # if anim != 'sweep' and init_camera:
+        #     scene['camera'] = dict(eye=dict(x=1.0, y=1.0, z=1.0))
+            # 최초 생성 시에만 기본 카메라 적용
+        if init_camera and 'camera' not in scene:
+            scene.setdefault(
+                'camera',
+                dict(
+                    eye=dict(
+                        x=1.0,
+                        y=1.0,
+                        z=1.0
+                    )
+                )
+            )
         return scene
 
     def render_field_3d(self, field: str = "U", level: Optional[float] = None,
@@ -1067,12 +1094,18 @@ class CFDVisualizer:
                     fig.add_trace(t)
                 if anim == "rotate":
                     _nf = max(2, int(n_frames))
+                    # fig.frames = [
+                    #     go.Frame(layout=go.Layout(scene=dict(camera=dict(
+                    #         eye=dict(x=1.7*math.cos(2*math.pi*fi/_nf),
+                    #                  y=1.7*math.sin(2*math.pi*fi/_nf), z=1.0)))),
+                    #         name=str(fi))
+                    #     for fi in range(_nf)]
                     fig.frames = [
-                        go.Frame(layout=go.Layout(scene=dict(camera=dict(
-                            eye=dict(x=1.7*math.cos(2*math.pi*fi/_nf),
-                                     y=1.7*math.sin(2*math.pi*fi/_nf), z=1.0)))),
-                            name=str(fi))
-                        for fi in range(_nf)]
+                        go.Frame(
+                            name=str(fi)
+                        )
+                        for fi in range(_nf)
+                    ]
 
             _menus = []
             if anim in ("rotate", "sweep"):
@@ -1084,8 +1117,9 @@ class CFDVisualizer:
                     borderwidth=1, pad=dict(t=3, b=3, l=5, r=5),
                     buttons=[
                         dict(label="▶ 재생", method="animate",
-                             args=[None, dict(frame=dict(duration=_dur, redraw=True),
-                                              fromcurrent=True,
+                             args=[None, dict(
+                                mode="immediate", fromcurrent=True,
+                                frame=dict(duration=_dur, redraw=True),
                                               transition=dict(duration=0))]),
                         dict(label="⏸ 정지", method="animate",
                              args=[[None], dict(frame=dict(duration=0, redraw=False),
@@ -1094,34 +1128,80 @@ class CFDVisualizer:
 
             _ann = "입체 등치면" + ({"rotate": " · 카메라 회전 재생",
                                    "sweep": " · 등치값 자동 스윕"}.get(anim, ""))
+            # _layout_kw = dict(
+            #     annotations=[dict(text=_ann, xref="paper", yref="paper",
+            #         x=0.01, y=0.99, xanchor="left", yanchor="top", showarrow=False,
+            #         font=dict(size=11, color="#1a4a8a"),
+            #         bgcolor="rgba(255,255,255,0.82)", borderpad=4,
+            #         bordercolor="#1a4a8a", borderwidth=1)],
+                # scene=self._iso_scene(go, b, tile_nx, tile_ny, dx, dy,
+                #                       init_camera=init_camera, anim=anim),
+                
+            _scene = self._iso_scene(
+                go,
+                b,
+                tile_nx,
+                tile_ny,
+                dx,
+                dy,
+                init_camera=init_camera,
+                anim=anim
+            )
+
+            _scene.pop("camera", None)
+
             _layout_kw = dict(
                 annotations=[dict(text=_ann, xref="paper", yref="paper",
                     x=0.01, y=0.99, xanchor="left", yanchor="top", showarrow=False,
                     font=dict(size=11, color="#1a4a8a"),
                     bgcolor="rgba(255,255,255,0.82)", borderpad=4,
                     bordercolor="#1a4a8a", borderwidth=1)],
-                scene=self._iso_scene(go, b, tile_nx, tile_ny, dx, dy,
-                                      init_camera=init_camera, anim=anim),
+                scene=_scene,
                 updatemenus=_menus,
-                showlegend=False, margin=dict(l=0, r=0, t=10, b=0),
-                height=520, paper_bgcolor='#f0f8ff',
+                showlegend=False,
+                margin=dict(
+                    l=0,
+                    r=0,
+                    t=10,
+                    b=0
+                ),  
+                height=520,
+                paper_bgcolor='#f0f8ff',
             )
-            _layout_kw['uirevision'] = ('iso_sweep_camera' if anim == 'sweep'
-                                        else 'flowfield')
+
+            _layout_kw['uirevision'] = 'flowfield'
+
             if anim == 'sweep' and fig.frames:
-                _iso_steps = [dict(
-                    method='animate',
-                    args=[[f.name], dict(mode='immediate',
-                                        frame=dict(duration=0, redraw=True),
-                                        transition=dict(duration=0))],
-                    label=f"{float(f.name):.3g}",
-                ) for f in fig.frames]
+                _iso_steps = [
+                    dict(
+                        method='animate',
+                        args=[
+                            [f.name], 
+                            dict(
+                                mode='immediate',
+                                fromcurrent=True,
+                                frame=dict(duration=0, redraw=True),
+                                transition=dict(duration=0)
+                            ),
+                        ],                        
+                        label=f"{float(f.name):.3g}",
+                    ) 
+                    for f in fig.frames
+                ]
                 _layout_kw['sliders'] = [dict(
                     active=0, pad=dict(b=10, t=10),
                     len=0.85, x=0.075, y=0,
                     currentvalue=dict(prefix='등치값: ', visible=True,
                                       xanchor='right', font=dict(size=11)),
                     transition=dict(duration=0),
+                    
+                    # currentvalue=dict(
+                    #     prefix='등치값: ',
+                    #     visible=True,
+                    #     xanchor='right',
+                    #     font=dict(size=11)
+                    # ),
+                    
                     steps=_iso_steps,
                 )]
                 _layout_kw['margin'] = dict(l=0, r=0, t=10, b=60)

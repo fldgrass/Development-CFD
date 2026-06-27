@@ -1841,6 +1841,20 @@ with tab_results:
                 # plotly.js가 사용자의 확대/회전 상태를 보존하게 한다. 표시 방식을
                 # 바꿔도 플래그를 리셋하지 않으므로 확대 상태가 유지된다.
                 _init_cam = not ss.get("_cam_init_field", False)
+                # if "_cam_initialized" not in ss:
+                #     ss["_cam_initialized"] = {}
+
+                # _cam_key = (
+                #     f"{selected_case_dir}_"
+                #     f"{_vmode}_"
+                #     f"{_r1_field}_"
+                #     f"{_tnx}_{_tny}"
+                # )
+
+                # _init_cam = (
+                #     not ss["_cam_initialized"]
+                #     .get(_cam_key, False)
+                # )
 
                 if _vmode == "슬라이스":
                     _c1, _c2 = st.columns([1.2, 1])
@@ -1871,8 +1885,45 @@ with tab_results:
                     _cap = "▶ 재생: 자동 스윕 | 차트 하단 슬라이더: 수동 위치 — 회전·확대 유지됨"
 
                 if _fig_r1:
-                    st.plotly_chart(_fig_r1, use_container_width=True, key="r1_chart")
-                    ss["_cam_init_field"] = True
+                    # st.plotly_chart(_fig_r1, use_container_width=True, key="r1_chart")
+                    # ss["_cam_init_field"] = True
+
+                    if "_cam_initialized" not in ss:
+                        ss["_cam_initialized"] = {}
+
+                    _chart_key = (
+                        f"r1_chart_"
+                        f"{_vmode}_"
+                        f"{_r1_field}"
+                    )
+
+                    st.plotly_chart(
+                        _fig_r1,
+                        use_container_width=True,
+                        key=_chart_key
+                    )
+
+                    ss["_cam_initialized"][
+                        _chart_key
+                    ] = True
+
+                    # _chart_key = (
+                    #     f"r1_chart_"
+                    #     f"{_vmode}_"
+                    #     f"{_r1_field}"
+                    # )
+
+                    # st.plotly_chart(
+                    #     _fig_r1,
+                    #     use_container_width=True,
+                    #     key=_chart_key
+                    # )
+
+                    # ss["_cam_initialized"][
+                    #     _cam_key
+                    # ] = True
+
+
                     # 모든 3D 모드에 JS 주입 — 카메라(회전·확대) 유지.
                     # cam을 클로저 변수 대신 localStorage에 저장한다.
                     # Streamlit이 슬라이더 변경 시 Plotly.relayout()을 추가 호출해
@@ -1882,30 +1933,72 @@ with tab_results:
                     import streamlit.components.v1 as _cv1
                     _cv1.html("""<script>
 (function(){
-  // 슬라이스·등치면 모두 Plotly 애니메이션 프레임을 사용하므로
-  // plotly_animatingframe을 모든 모드에 공통으로 처리한다.
-  var animCam=null;
+  // ── 설계 원칙 ──────────────────────────────────────────────────────────
+  // 1. P.react 래퍼 없음 — react 래핑이 슬라이스 slider를 망가뜨림
+  // 2. plotly_buttonclicked 로 ▶ 재생과 슬라이더 구분
+  // 3. 이전 gd(이전 모드 원소)의 orphaned 애니메이션을 attach 시 중지
+  // 4. gd.__camBusy 없음 — camBusy 로 rl 핸들러를 막으면 카메라가 stale 해짐
+  // ───────────────────────────────────────────────────────────────────────
+  var P=window.parent.Plotly;
+  var _id=Date.now();
 
   function attach(gd){
-    if(gd.__camSetup)return;
-    gd.__camSetup=true;
+    if(gd.__camSetup===_id)return;
 
-    // 사용자 인터랙션(회전·줌)으로만 발동 — animCam에 저장
-    gd.on('plotly_relayout',function(){
-      if(gd.__camBusy)return;
+    // 이전 모드의 orphaned gd 애니메이션 중지
+    // (모드 전환마다 새 DOM 원소가 생기므로, 이전 원소의 RAF가
+    //  교체된 프레임에 접근해 TypeError를 일으킴)
+    var prev=window.parent.__camPrevGd;
+    if(prev&&prev!==gd){
+      try{ P.animate(prev,[],{mode:'immediate'}); }catch(e){}
+    }
+    window.parent.__camPrevGd=gd;
+
+    if(gd.__camH){
+      try{
+        gd.removeListener('plotly_relayout',gd.__camH.rl);
+        gd.removeListener('plotly_animatingframe',gd.__camH.af);
+        gd.removeListener('plotly_animated',gd.__camH.ad);
+        gd.removeListener('plotly_buttonclicked',gd.__camH.bc);
+      }catch(e){}
+    }
+    gd.__camSetup=_id;
+    gd.__isPlayingAll=false;
+
+    var _pt=null;
+
+    // 사용자 카메라(회전·확대) 변경 시 저장
+    var rl=function(){
       var s=gd._fullLayout&&gd._fullLayout.scene;
-      if(s&&s.camera)animCam=JSON.parse(JSON.stringify(
+      if(s&&s.camera)gd.__animCam=JSON.parse(JSON.stringify(
         {eye:s.camera.eye,center:s.camera.center,up:s.camera.up}));
-    });
+    };
 
-    // 슬라이더/재생 프레임 직전: 마이크로태스크로 카메라 복원
-    gd.on('plotly_animatingframe',function(){
-      if(!animCam)return;
-      var c=animCam;
-      Promise.resolve().then(function(){
-        window.parent.Plotly.relayout(gd,{'scene.camera':c});
-      });
-    });
+    // ▶ 재생 버튼 클릭 시에만 isPlayingAll=true
+    // 슬라이더 단일 클릭은 plotly_buttonclicked를 발생시키지 않음
+    var bc=function(d){
+      var isPlay=d&&d.button&&d.button.args&&d.button.args[0]===null;
+      gd.__isPlayingAll=isPlay;
+      clearTimeout(_pt);
+      // 안전장치: 재생 도중 모드 전환으로 plotly_animated 미발생 시 자동 리셋
+      if(isPlay) _pt=setTimeout(function(){gd.__isPlayingAll=false;},15000);
+    };
+
+    // 스윕 재생 중 각 프레임 렌더 후 카메라 복원
+    // (isPlayingAll=false 이면 슬라이더 단일 스텝 → 복원 안 함)
+    var af=function(){
+      if(!gd.__animCam||!gd.__isPlayingAll)return;
+      var c=gd.__animCam;
+      P.relayout(gd,{'scene.camera':c})['catch'](function(){});
+    };
+
+    var ad=function(){gd.__isPlayingAll=false;clearTimeout(_pt);};
+
+    gd.__camH={rl:rl,af:af,ad:ad,bc:bc};
+    gd.on('plotly_relayout',rl);
+    gd.on('plotly_buttonclicked',bc);
+    gd.on('plotly_animatingframe',af);
+    gd.on('plotly_animated',ad);
   }
 
   function find(){
@@ -1916,6 +2009,7 @@ with tab_results:
     }
     setTimeout(find,200);
   }
+
   find();
 })();
 </script>""", height=0)
