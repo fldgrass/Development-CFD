@@ -1772,8 +1772,13 @@ with tab_results:
     _us = int(ss.get("u_steps", 1))
     _amn = float(ss.get("a_min", 0.0)); _amx = float(ss.get("a_max", 0.0))
     _asp = int(ss.get("a_steps", 1))
-    _speeds_grid = [round(float(s), 2) for s in np.linspace(_um, _ux, max(1, _us))]
-    _angles_grid = [round(float(a), 1) for a in np.linspace(_amn, _amx, max(1, _asp))]
+    # 중복 제거: min==max 인데 단계수>1 이면 linspace 가 같은 값을 반복 생성해
+    # 매트릭스 버튼 키(mx_<s>_<a>)가 중복 → StreamlitDuplicateElementKey 발생.
+    # 정렬된 고유값만 사용해 조건당 셀 1개를 보장한다.
+    _speeds_grid = sorted({round(float(s), 2)
+                           for s in np.linspace(_um, _ux, max(1, _us))})
+    _angles_grid = sorted({round(float(a), 1)
+                           for a in np.linspace(_amn, _amx, max(1, _asp))})
     _BOX = {"done": "☑", "running": "⏳", "none": "☐"}
     _MTXT = {"done": "완료", "running": "진행 중", "none": "미해석"}
 
