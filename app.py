@@ -391,12 +391,16 @@ def list_project_names(_mode):
 
 def save_project(_mode, _name):
     """현재 세션 상태를 프로젝트 폴더의 project.json 으로 저장."""
-    _state = {k: ss.get(k) for k in PROJECT_KEYS}
+    # stl_net_path 등은 Path 객체일 수 있어 JSON 직렬화가 안 된다 → 문자열로 정규화.
+    def _ser(v):
+        return str(v) if isinstance(v, Path) else v
+    _state = {k: _ser(ss.get(k)) for k in PROJECT_KEYS}
     _state["_meta"] = {"name": _name, "mode": _mode,
                        "saved": datetime.now().isoformat()}
     _d = _project_dir(_mode, _name); _d.mkdir(parents=True, exist_ok=True)
+    # default=str: 예상치 못한 비직렬화 객체(Path 등)도 안전하게 문자열화.
     (_d / "project.json").write_text(
-        json.dumps(_state, ensure_ascii=False, indent=2))
+        json.dumps(_state, ensure_ascii=False, indent=2, default=str))
     ss.active_project = _name
 
 def create_project(_mode, _name):
