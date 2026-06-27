@@ -32,6 +32,11 @@ stl_uploads/*.stl
 .DS_Store
 Thumbs.db
 
+# Windows 탐색기 잔재 (복사본 / 다운로드 마크)
+* - 복사본.*
+*:Zone.Identifier
+*Zone.Identifier
+
 # IDE
 .vscode/
 .idea/
