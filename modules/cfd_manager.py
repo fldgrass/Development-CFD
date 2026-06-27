@@ -1064,7 +1064,8 @@ class BatchAnalysisManager:
                  output_csv: Path,
                  common_params: Optional[Dict] = None,
                  progress_cb: Optional[Callable] = None,
-                 log_cb: Optional[Callable] = None):
+                 log_cb: Optional[Callable] = None,
+                 results_root: Optional[Path] = None):
         self.mode        = mode          # "unit_cell" or "full_structure"
         self.stl_paths   = stl_paths
         self.speeds      = speeds
@@ -1073,6 +1074,8 @@ class BatchAnalysisManager:
         self.params      = common_params or {}
         self.progress_cb = progress_cb
         self.log_cb      = log_cb
+        # 케이스 디렉토리를 둘 루트. 프로젝트 폴더(있으면)로 라우팅, 없으면 모드 루트.
+        self.results_root = Path(results_root) if results_root else (RESULTS_DIR / mode)
         self._stop_flag  = threading.Event()
         self.results: List[Dict] = []
 
@@ -1094,8 +1097,8 @@ class BatchAnalysisManager:
             base_name    = f"{self.mode}_U{speed:.2f}_A{angle:.1f}"
             running_name = f"해석중_{base_name}"
             done_name    = f"해석완료_{base_name}"
-            case_dir  = RESULTS_DIR / self.mode / running_name
-            done_dir  = RESULTS_DIR / self.mode / done_name
+            case_dir  = self.results_root / running_name
+            done_dir  = self.results_root / done_name
             # 같은 조합의 이전 '해석중_' 잔여물 정리(완료본은 성공 시점에만 교체)
             if case_dir.exists():
                 shutil.rmtree(case_dir, ignore_errors=True)

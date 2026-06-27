@@ -361,23 +361,58 @@ PROJECT_DEFAULTS = {
 def _projects_dir(_mode):
     return RESULTS_DIR / _mode / "projects"
 
+def _project_dir(_mode, _name):
+    return _projects_dir(_mode) / _name
+
+def _active_project_dir():
+    """활성 프로젝트 폴더 경로(없으면 None)."""
+    _name = ss.get("active_project")
+    if not _name:
+        return None
+    return _project_dir(ss.get("analysis_mode", "unit_cell"), _name)
+
+def _results_root(_mode):
+    """결과(케이스 디렉토리·CSV)를 저장/스캔하는 루트.
+    활성 프로젝트가 있으면 그 폴더(항목1: 모든 산출물을 프로젝트 폴더 안에),
+    없으면 모드 루트(레거시/임시 작업)."""
+    _pd = _active_project_dir()
+    return _pd if _pd is not None else (RESULTS_DIR / _mode)
+
+def _project_csv_path(_mode, _csv_name):
+    """결과 CSV 경로 = 결과 루트 / 파일명."""
+    return _results_root(_mode) / _csv_name
+
 def list_project_names(_mode):
     _d = _projects_dir(_mode)
-    return sorted(p.stem for p in _d.glob("*.json")) if _d.exists() else []
+    if not _d.exists():
+        return []
+    return sorted(p.name for p in _d.iterdir()
+                  if p.is_dir() and (p / "project.json").exists())
 
 def save_project(_mode, _name):
-    """현재 세션 상태를 프로젝트 JSON 으로 저장."""
+    """현재 세션 상태를 프로젝트 폴더의 project.json 으로 저장."""
     _state = {k: ss.get(k) for k in PROJECT_KEYS}
     _state["_meta"] = {"name": _name, "mode": _mode,
                        "saved": datetime.now().isoformat()}
-    _d = _projects_dir(_mode); _d.mkdir(parents=True, exist_ok=True)
-    (_d / f"{_name}.json").write_text(
+    _d = _project_dir(_mode, _name); _d.mkdir(parents=True, exist_ok=True)
+    (_d / "project.json").write_text(
         json.dumps(_state, ensure_ascii=False, indent=2))
     ss.active_project = _name
 
+def create_project(_mode, _name):
+    """새 프로젝트 폴더 생성 + 깨끗한 상태로 초기화(항목1·2).
+    이후 모든 설정·조건·중간파일·결과는 이 폴더 안에 저장된다."""
+    for k, v in PROJECT_DEFAULTS.items():
+        ss[k] = v
+    ss["batch_csv_name"] = "force_coeffs.csv"   # 프로젝트 폴더 내부 파일
+    ss["res_sel_cond"] = None
+    ss["result_csv_sel"] = None
+    ss.active_project = _name
+    save_project(_mode, _name)                  # 폴더 + project.json 생성
+
 def _apply_project_load(_mode, _name):
-    """프로젝트 JSON 을 세션 상태에 반영(위젯 생성 전에 호출돼야 안전)."""
-    _p = _projects_dir(_mode) / f"{_name}.json"
+    """프로젝트 project.json 을 세션 상태에 반영(위젯 생성 전 호출돼야 안전)."""
+    _p = _project_dir(_mode, _name) / "project.json"
     if not _p.exists():
         return False
     try:
@@ -388,11 +423,11 @@ def _apply_project_load(_mode, _name):
         if k in _data and _data[k] is not None:
             ss[k] = _data[k]
     ss.active_project = _name
-    ss.res_sel_cond = None          # 결과 선택 초기화(새 프로젝트 데이터로)
+    ss.res_sel_cond = None          # 결과 선택 초기화(불러온 프로젝트 데이터로)
     return True
 
 def _apply_project_new():
-    """모든 조건/결과/시각화 상태를 기본값으로 초기화(깨끗한 새 프로젝트)."""
+    """프로젝트 미선택(임시 작업) 상태로 초기화 — 다이얼로그 취소/호환용."""
     for k, v in PROJECT_DEFAULTS.items():
         ss[k] = v
     for k in ("stl_net_path", "stl_cage_path", "batch_csv_name",
@@ -400,10 +435,35 @@ def _apply_project_new():
         ss[k] = None
     ss.active_project = None
 
-# 위젯 생성 '이전'에 보류된 로드/새프로젝트를 적용(세션 상태 안전 변경).
+
+@st.dialog("🆕 새 프로젝트 만들기")
+def _new_project_dialog():
+    """항목1: 프로젝트 이름을 입력받아 폴더를 생성한다. 이름이 비어있거나 이미
+    존재하면 만들 수 없다(항목2: 신규 생성 시 기존 파일이 없도록 보장 → 덮어쓰기
+    경고 불필요)."""
+    st.write("새 프로젝트 이름을 입력하세요. 입력한 이름으로 폴더가 생성되고, "
+             "이후 모든 설정·조건·중간파일·결과가 그 폴더에 저장됩니다.")
+    _nm = (st.text_input("프로젝트 이름", key="new_proj_name_input",
+                         placeholder="예: onemesh2_실험1") or "").strip()
+    _mode = ss.get("analysis_mode", "unit_cell")
+    _exists = _nm in list_project_names(_mode) if _nm else False
+    if _exists:
+        st.warning(f"'{_nm}' 프로젝트가 이미 있습니다. 다른 이름을 입력하세요.")
+    _c1, _c2 = st.columns(2)
+    if _c1.button("만들기", type="primary", use_container_width=True,
+                  disabled=(not _nm or _exists)):
+        ss._pending_create_project = _nm
+        st.rerun()
+    if _c2.button("취소", use_container_width=True):
+        st.rerun()
+
+# 위젯 생성 '이전'에 보류된 로드/생성/새프로젝트를 적용(세션 상태 안전 변경).
 if ss.get("_pending_load_project"):
     _apply_project_load(ss.get("analysis_mode", "unit_cell"),
                         ss.pop("_pending_load_project"))
+if ss.get("_pending_create_project"):
+    create_project(ss.get("analysis_mode", "unit_cell"),
+                   ss.pop("_pending_create_project"))
 if ss.pop("_pending_new_project", False):
     _apply_project_new()
 
@@ -897,10 +957,9 @@ with st.sidebar:
                 st.rerun()
         else:
             st.caption("저장된 프로젝트가 없습니다.")
-        if st.button("🆕 새 프로젝트 (조건·결과 초기화)", use_container_width=True,
+        if st.button("🆕 새 프로젝트 (이름 입력)", use_container_width=True,
                      key="proj_new_btn"):
-            ss._pending_new_project = True
-            st.rerun()
+            _new_project_dialog()
     st.divider()
 
     # ─── 공통 물리 조건 ───────────────────────────────────────────────────
@@ -1216,7 +1275,9 @@ def _scan_done_conditions(mode):
     항목9 덮어쓰기 경고용 — '해석완료_' 접두어 + 실제 결과(시간 디렉토리) 보유 기준."""
     import re as _re_dc
     _done = set()
-    _root = RESULTS_DIR / mode
+    # 항목2: 활성 프로젝트가 있으면 그 폴더만 검사 → 새 프로젝트(빈 폴더)는 완료
+    # 조건이 없어 덮어쓰기 경고가 뜨지 않는다.
+    _root = _results_root(mode)
     if not _root.exists():
         return _done
     for _d in _root.iterdir():
@@ -1288,7 +1349,9 @@ def _start_batch_analysis(mode, speeds, angles, csv_path, n_cores, rho, ti, nx=1
                 "label": label,
             })
         ),
-        log_cb=add_log
+        log_cb=add_log,
+        # 항목1: 활성 프로젝트가 있으면 케이스 디렉토리를 프로젝트 폴더 안에 둔다.
+        results_root=_results_root(mode),
     )
     ss.batch_manager = manager
 
@@ -1807,12 +1870,18 @@ with tab_input:
                      height=min(38 + len(angles) * 35, 320))
 
         # ─── 결과 CSV 파일명 ──────────────────────────────────────────────
+        _csv_default = f"force_coeffs_{mode}_{datetime.now():%Y%m%d}.csv"
         csv_name = st.text_input(
             "결과 CSV 파일명",
-            value=f"force_coeffs_{mode}_{datetime.now():%Y%m%d}.csv",
+            value=_csv_default,
             key="batch_csv_name",
         )
-        csv_path = RESULTS_DIR / mode / csv_name
+        # 항목7: None/빈 값 방어 — 새 프로젝트 초기화 등으로 batch_csv_name 이 None 이면
+        # PosixPath / None TypeError 가 발생하므로 기본값으로 폴백한다.
+        if not csv_name or not str(csv_name).strip():
+            csv_name = _csv_default
+        # 활성 프로젝트가 있으면 결과 CSV 를 프로젝트 폴더 안에 둔다(항목1).
+        csv_path = _project_csv_path(mode, csv_name)
 
         st.divider()
 
@@ -1889,9 +1958,10 @@ with tab_results:
 
     import re as _re_res
 
-    # ─── 현재 모드 케이스 스캔 (해석중_/해석완료_ 접두어로 상태 판정) ────────
+    # ─── 케이스 스캔 (해석중_/해석완료_ 접두어로 상태 판정) ───────────────────
+    # 활성 프로젝트가 있으면 그 폴더만 스캔(프로젝트 격리, 항목1·5).
     def _scan_result_cases(_md):
-        _root = RESULTS_DIR / _md
+        _root = _results_root(_md)
         _out = []
         if not _root.exists():
             return _out
@@ -2329,8 +2399,9 @@ with tab_results:
             # 데이터 혼입 방지). 표시 유속·Cd/Cl 요약은 이 CSV에서 자동 파생되므로
             # 신규 조건이 추가되면 자동 갱신된다.
             import pandas as pd
+            # 활성 프로젝트가 있으면 그 폴더의 CSV 만, 없으면 모드 루트의 CSV 를 나열.
             all_csvs = sorted(
-                (RESULTS_DIR / mode).glob("*.csv"),
+                _results_root(mode).glob("*.csv"),
                 key=lambda c: c.stat().st_mtime, reverse=True
             )
             # 항목5: 활성 프로젝트가 있으면 그 프로젝트의 결과 CSV 로 고정(타 프로젝트·
@@ -2338,7 +2409,7 @@ with tab_results:
             _active_proj = ss.get("active_project")
             _forced_csv = None
             if _active_proj and ss.get("batch_csv_name"):
-                _fp = RESULTS_DIR / mode / ss.get("batch_csv_name")
+                _fp = _results_root(mode) / ss.get("batch_csv_name")
                 if _fp.exists():
                     _forced_csv = _fp
 
