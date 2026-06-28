@@ -1422,13 +1422,28 @@ def _start_batch_analysis(mode, speeds, angles, csv_path, n_cores, rho, ti, nx=1
             _t0 = time.time()
             manager.run_batch()
             try:
-                # 항목1: 실제 케이스당 소요(분)를 기록해 다음 추정을 실측에 보정.
-                record_case_minutes(
-                    mode, (time.time() - _t0) / 60.0 / _n_cases,
-                    end_time=_bp.get("end_time"),
-                    refine_level=_bp.get("refine_level"), n_cores=n_cores)
-                set_status("done", "배치 해석 완료!")
-                add_log(f"✅ 배치 완료! CSV: {csv_path}")
+                _ns = int(getattr(manager, "n_success", 0))
+                _nf = int(getattr(manager, "n_failed", 0))
+                # 항목3: 정직한 완료 상태. 성공 케이스가 0이면 '완료'가 아니라 실패로
+                # 보고해야 한다(이전엔 전부 실패해도 '배치 해석 완료!'로 떠 사용자가
+                # 결과가 있다고 오인). 성공 시간만 기록해 추정 보정 오염도 방지.
+                if _ns > 0:
+                    record_case_minutes(
+                        mode, (time.time() - _t0) / 60.0 / _ns,
+                        end_time=_bp.get("end_time"),
+                        refine_level=_bp.get("refine_level"), n_cores=n_cores)
+                if _ns == 0:
+                    set_status("error",
+                               f"모든 케이스 실패 (0/{_n_cases} 완료) — 로그/형상을 확인하세요.")
+                    add_log(f"❌ 배치 종료: 0/{_n_cases} 완료 (전부 실패). "
+                            f"메싱/솔버 로그를 확인하세요.")
+                elif _ns < _n_cases:
+                    set_status("done", f"배치 부분 완료: {_ns}/{_n_cases} 성공 "
+                                       f"({_nf} 실패)")
+                    add_log(f"✅ 배치 부분 완료: {_ns}/{_n_cases} 성공, {_nf} 실패. CSV: {csv_path}")
+                else:
+                    set_status("done", f"배치 해석 완료! ({_ns}/{_n_cases})")
+                    add_log(f"✅ 배치 완료! {_ns}/{_n_cases} CSV: {csv_path}")
             except Exception:
                 pass
         except Exception as e:

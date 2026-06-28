@@ -1078,6 +1078,9 @@ class BatchAnalysisManager:
         self.results_root = Path(results_root) if results_root else (RESULTS_DIR / mode)
         self._stop_flag  = threading.Event()
         self.results: List[Dict] = []
+        # 실제 성공/실패 케이스 수(정직한 완료 보고용 — '완료'인데 결과 0 방지)
+        self.n_success = 0
+        self.n_failed = 0
 
     def run_batch(self) -> List[Dict]:
         """배치 해석 실행"""
@@ -1179,12 +1182,15 @@ class BatchAnalysisManager:
                     except Exception as _re:
                         self._log(f"⚠️ 완료 rename 실패({_re}) — '해석중_' 유지")
                     ResultExtractor(final_dir, speed, angle).save_csv(self.output_csv)
+                    self.n_success += 1
                     self._log(f"✅ 케이스 완료 [{final_dir.name}] — Cd={_cdv:.4f}")
                 else:
+                    self.n_failed += 1
                     self._log(f"❌ 케이스 결과 없음 [{running_name}] "
                               f"(forceCoeffs 미생성, 워크플로우 ok={ok})")
 
             except Exception as e:
+                self.n_failed += 1
                 self._log(f"❌ 케이스 오류 [{running_name}]: {e}")
 
             self._progress(round((i + 1) / total * 100, 1), i + 1, total)
