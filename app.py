@@ -442,32 +442,51 @@ def _apply_project_new():
 
 @st.dialog("🆕 새 프로젝트 만들기")
 def _new_project_dialog():
-    """항목1: 프로젝트 이름을 입력받아 폴더를 생성한다. 이름이 비어있거나 이미
-    존재하면 만들 수 없다(항목2: 신규 생성 시 기존 파일이 없도록 보장 → 덮어쓰기
-    경고 불필요)."""
+    """항목1: 프로젝트 이름을 입력받아 폴더를 생성한다. 동일 이름이 이미 있으면
+    덮어쓰기 확인을 묻고, '예'면 기존 프로젝트를 덮어쓰고 진행, '아니오/취소'면
+    생성을 취소(또는 다른 이름 입력)한다."""
     st.write("새 프로젝트 이름을 입력하세요. 입력한 이름으로 폴더가 생성되고, "
              "이후 모든 설정·조건·중간파일·결과가 그 폴더에 저장됩니다.")
     _nm = (st.text_input("프로젝트 이름", key="new_proj_name_input",
                          placeholder="예: onemesh2_실험1") or "").strip()
     _mode = ss.get("analysis_mode", "unit_cell")
     _exists = _nm in list_project_names(_mode) if _nm else False
-    if _exists:
-        st.warning(f"'{_nm}' 프로젝트가 이미 있습니다. 다른 이름을 입력하세요.")
     _c1, _c2 = st.columns(2)
-    if _c1.button("만들기", type="primary", use_container_width=True,
-                  disabled=(not _nm or _exists)):
-        ss._pending_create_project = _nm
-        st.rerun()
-    if _c2.button("취소", use_container_width=True):
-        st.rerun()
+    if _exists:
+        st.warning("⚠️ 동일 이름의 프로젝트가 이미 있습니다. 덮어쓸까요?")
+        if _c1.button("예, 덮어쓰기", type="primary", use_container_width=True):
+            ss._pending_overwrite_project = _nm
+            st.rerun()
+        if _c2.button("아니오 / 취소", use_container_width=True):
+            # 생성 취소(다이얼로그 닫기). 다른 이름을 쓰려면 이름 칸을 수정하면
+            # 경고가 사라지고 '만들기'가 활성화된다.
+            st.rerun()
+    else:
+        if _c1.button("만들기", type="primary", use_container_width=True,
+                      disabled=(not _nm)):
+            ss._pending_create_project = _nm
+            st.rerun()
+        if _c2.button("취소", use_container_width=True):
+            st.rerun()
 
-# 위젯 생성 '이전'에 보류된 로드/생성/새프로젝트를 적용(세션 상태 안전 변경).
+# 위젯 생성 '이전'에 보류된 로드/생성/덮어쓰기/새프로젝트를 적용(세션 상태 안전 변경).
 if ss.get("_pending_load_project"):
     _apply_project_load(ss.get("analysis_mode", "unit_cell"),
                         ss.pop("_pending_load_project"))
 if ss.get("_pending_create_project"):
     create_project(ss.get("analysis_mode", "unit_cell"),
                    ss.pop("_pending_create_project"))
+if ss.get("_pending_overwrite_project"):
+    # 항목1: 기존 프로젝트 폴더를 삭제(덮어쓰기) 후 깨끗하게 재생성.
+    _ovw_name = ss.pop("_pending_overwrite_project")
+    _ovw_mode = ss.get("analysis_mode", "unit_cell")
+    try:
+        _ovw_dir = _project_dir(_ovw_mode, _ovw_name)
+        if _ovw_dir.exists():
+            shutil.rmtree(_ovw_dir, ignore_errors=True)
+    except Exception:
+        pass
+    create_project(_ovw_mode, _ovw_name)
 if ss.pop("_pending_new_project", False):
     _apply_project_new()
 
@@ -512,7 +531,9 @@ def record_case_minutes(mode, minutes, end_time=None, refine_level=None,
     """완료 케이스의 실제 소요(분)와 그때의 설정(반복·정밀도·코어)을 함께 기록한다
     (최근 30개). 설정을 저장해야 다음 추정에서 '현재 설정으로 스케일링'할 수 있다."""
     try:
-        if not (minutes and minutes > 0):
+        # 항목2: 0.1분(6초) 미만은 메싱·솔버를 실제로 수행한 케이스일 수 없다(빠른
+        # 실패·중단 등 가비지). 보정 추정을 오염시키므로 기록하지 않는다.
+        if not (minutes and float(minutes) >= 0.1):
             return
         p = _timing_store_path(mode)
         hist = []
@@ -545,8 +566,10 @@ def estimate_total_minutes(mode, n_cases, end_time, refine_level, n_cores):
     try:
         p = _timing_store_path(mode)
         if p.exists():
+            # 항목2: 비현실적으로 작은(≥0.1분 미만) 가비지 기록은 추정에서 제외 →
+            # '총 < 1분' 같은 모순 방지. 유효 기록이 없으면 경험식으로 폴백.
             recs = [r for r in json.loads(p.read_text())
-                    if isinstance(r, dict) and float(r.get("min", 0)) > 0]
+                    if isinstance(r, dict) and float(r.get("min", 0)) >= 0.1]
             if recs:
                 _cur = estimate_case_minutes(end_time, refine_level, n_cores)
                 _scaled = []
@@ -1882,15 +1905,18 @@ with tab_input:
         # 입력 탭은 '총 예상 시간(전처리+솔버, 전 케이스)'을 표시해 실행 버튼과 일치시킨다.
         _rl_e = refine_level if mode == "unit_cell" else 3
         _n_cases = max(1, len(speeds) * len(angles))
-        _est_per   = estimate_case_minutes(end_time, _rl_e, n_cores)
         _est_total = estimate_total_minutes(mode, _n_cases, end_time, _rl_e, n_cores)
+        # 항목2: breakdown(케이스당)을 '총/케이스수'로 산출 → 총합과 항상 일치
+        # (모순 방지). 총 예상은 전처리(메싱)+솔버 시간 × 전 케이스를 반영한다.
+        _est_per = _est_total / _n_cases
         st.markdown("### ⏱️ 예상 소요 시간")
         _ec1, _ec2 = st.columns([1, 1.4])
         _ec1.metric("총 예상 시간", fmt_duration(_est_total))
         _ec2.caption(
             f"케이스 **{_n_cases}개 × 약 {fmt_duration(_est_per)}/케이스** "
-            f"(전처리+솔버 포함). 반복 {int(end_time)} · 정밀화 {int(_rl_e)} · "
-            f"{n_cores}코어. 실측 보정 반영 · 수렴 먼저 도달 시 더 빨리 끝납니다."
+            f"(전처리+솔버 포함) = 총 **{fmt_duration(_est_total)}**. "
+            f"반복 {int(end_time)} · 정밀화 {int(_rl_e)} · {n_cores}코어. "
+            f"실측 보정 반영 · 수렴 먼저 도달 시 더 빨리 끝납니다."
         )
         # 입력값(반복·정밀화·코어·nx/ny) 변경 시점 상태 저장
         _persist_input_state()
@@ -2048,10 +2074,14 @@ with tab_results:
     _by_cond = {}
     _mprio = {"running": 3, "done": 2}
     for _c in _cases:
-        # 항목5: 완료(☑)는 실제 결과 필드(reconstruct된 시간 디렉토리)가 있을 때만.
-        # 폴더명 접두어(해석완료_)만으로는 미완료/중단 케이스가 ☑로 오표시될 수 있어
-        # has_fields 를 함께 요구한다.
-        if _c["status"] == "done" and _c["has_fields"]:
+        # 완료 판정: '해석완료_' 접두어(status==done)는 솔버 종료 + Cd 추출 성공
+        # 시점에만 부여되므로 신뢰할 수 있는 '해석 완료' 신호다. 과거엔 has_fields
+        # (reconstruct된 시간 디렉토리)까지 요구했으나, full_structure 등에서
+        # reconstructPar 가 실패해 상위 시간 디렉토리가 없으면(병렬 데이터만 존재)
+        # 완료된 케이스인데도 '해석 전'으로 숨겨지는 문제가 있었다(항목3).
+        # → 완료(☑)는 status==done 만으로 등록하고, 3D 재구성 데이터 유무는
+        #   유동장 표시 단계에서 별도로 처리한다(필드 없으면 안내 + CSV 결과 제공).
+        if _c["status"] == "done":
             _mst = "done"
         elif _c["status"] == "running":
             _mst = "running"
@@ -2181,15 +2211,27 @@ with tab_results:
             _tnx = int(ss.get("unit_nx", 1)) if mode == "unit_cell" else 1
             _tny = int(ss.get("unit_ny", 1)) if mode == "unit_cell" else 1
 
-            if _sel_mst not in ("done", "running") or selected_case_dir is None \
-                    or not (_sel_case and _sel_case["has_fields"]):
-                # 미해석/결과 없음 — 빈 화면 + 안내(항목 9)
+            _has_3d = bool(_sel_case and _sel_case.get("has_fields"))
+            _is_done_or_run = _sel_mst in ("done", "running") and selected_case_dir is not None
+            if _is_done_or_run and not _has_3d:
+                # 항목3: 해석은 완료(또는 진행)됐으나 3D 재구성 데이터가 없는 경우
+                # — '해석 전'이 아니라 완료 상태를 명확히 안내하고 CSV 결과로 유도.
+                st.markdown("""
+                <div style="background:#e9f7ef;border:2px solid #0f9d58;
+                            border-radius:10px;padding:32px;text-align:center;">
+                    <h3 style="color:#0f9d58;">✅ 해석 완료 — 3D 재구성 데이터 없음</h3>
+                    <p style="color:#444;">이 조건은 해석이 완료되어 <b>Cd/Cl 결과가
+                    'CSV 데이터' 탭</b>에 있습니다. 다만 reconstructPar 단계가 수행되지
+                    않아 유동장 3D(슬라이스·등치면)는 표시할 수 없습니다.</p>
+                </div>""", unsafe_allow_html=True)
+            elif not _is_done_or_run or selected_case_dir is None:
+                # 미해석/결과 없음 — 빈 화면 + 안내
                 st.markdown("""
                 <div style="background:#f0f8ff;border:2px dashed #1a73e8;
                             border-radius:10px;padding:40px;text-align:center;">
                     <h3 style="color:#1a73e8;">🌊 해석 시작 전입니다</h3>
                     <p style="color:#666;">이 조건은 아직 유동장 결과가 없습니다.
-                    '입력 설정'에서 해석을 시작하거나, 완료/진행 중(☑/⏳) 셀을 선택하세요.</p>
+                    '입력 설정'에서 해석을 시작하거나, 완료/진행 중(해석 완료/해석 중) 셀을 선택하세요.</p>
                 </div>""", unsafe_allow_html=True)
             else:
                 _vmode = st.radio(
