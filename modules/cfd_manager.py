@@ -819,14 +819,15 @@ class OpenFOAMRunner:
         return False
 
     def run_snappyHexMesh(self) -> bool:
-        if self._has_cyclic_patches():
-            # OpenFOAM v2312 버그: 병렬 snappyHexMesh + cyclic 패치 →
-            # globalIndexAndTransform 충돌(transform sign mismatch) → serial로 우회
-            return self._run_step(
-                "snappyHexMesh -overwrite", "격자 스냅 (snappyHexMesh, 직렬)")
-        cmd = f"mpirun --oversubscribe -np {self.n_cores} snappyHexMesh -overwrite -parallel"
-        return self._run_step(cmd, "격자 스냅 (snappyHexMesh)", parallel=True,
-                              pre_cmd="decomposePar -force")
+        # 항상 직렬 실행. 병렬 snappy 는 decomposePar(블록메시 — netSurface 등 snappy 가
+        # 새로 만드는 wall 패치가 아직 없음) 이후 실행되는데, decomposePar 는 메시에
+        # 없는 패치의 필드 boundaryField 항목을 떨어뜨린다. 그 뒤 병렬 snappy 가
+        # netSurface 패치를 추가해도 processor 필드엔 항목이 없어 simpleFoam 이
+        # 'Cannot find patchField entry for netSurface' 로 즉시 실패한다(full_structure
+        # 가 늘 실패하던 원인). 직렬로 메싱해 패치를 먼저 생성한 뒤 run_solver 에서
+        # decomposePar 로 분할하면 필드 항목이 보존된다. (cyclic 도 동일하게 직렬.)
+        return self._run_step(
+            "snappyHexMesh -overwrite", "격자 스냅 (snappyHexMesh, 직렬)")
 
     def run_decomposePar(self) -> bool:
         return self._run_step("decomposePar -force", "도메인 분할 (decomposePar)")
@@ -834,8 +835,10 @@ class OpenFOAMRunner:
     def run_solver(self, end_time: int = 2000) -> bool:
         """병렬 simpleFoam 실행 + 실시간 잔차 모니터링"""
         cmd = f"mpirun --oversubscribe -np {self.n_cores} simpleFoam -parallel"
-        # cyclic 케이스는 serial snappyHexMesh 후 분할이 안 됐으므로 여기서 decomposePar 실행
-        pre = "decomposePar -force" if self._has_cyclic_patches() else None
+        # snappyHexMesh 를 직렬로 돌리므로(위 참조) 여기서 분할한다. 직렬 snappy 가
+        # 이미 netSurface 등 패치를 만든 메시를 기준으로 decomposePar 하므로 processor
+        # 필드에 패치 항목이 보존된다.
+        pre = "decomposePar -force"
         return self._run_step(cmd, "CFD 해석 (simpleFoam)", parallel=True,
                               pre_cmd=pre,
                               monitor_residuals=True, end_time=end_time)
