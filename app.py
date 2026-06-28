@@ -1078,9 +1078,20 @@ if ss.get("_detached_view"):
     )
 
 # ─── 진행률 바 + 마지막 로그 라인 실시간 표시 ────────────────────────────
+# 항목3: st.progress 는 0.0~1.0 만 허용. 진행률 계산(케이스별 pct 등)이 라운딩·
+# 타이밍·인덱싱으로 음수(-0.006 등)나 1 초과가 되면 StreamlitAPIException 으로
+# 해석 화면이 통째로 죽는다. 모든 진행값을 [0,1] 로 클램프해 방지한다.
+def _clamp01(x):
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return 0.0
+    return 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
+
 if ss.job_status == "running":
     _bar_text = f"⚙️ {ss.current_step}" if ss.current_step else "⚙️ 해석 진행 중..."
-    st.progress(ss.progress / 100, text=f"전체 진행률 {ss.progress:.1f}%  |  {_bar_text[2:].strip()}")
+    st.progress(_clamp01(ss.progress / 100),
+                text=f"전체 진행률 {ss.progress:.1f}%  |  {_bar_text[2:].strip()}")
     # 배치 케이스별 진행률
     _cp = ss.get("case_progress", {})
     if _cp and _cp.get("total", 1) > 1:
@@ -1088,8 +1099,8 @@ if ss.job_status == "running":
         _cp_idx = _cp.get("case_idx", 1)
         _cp_tot = _cp.get("total", 1)
         st.progress(
-            _cp_pct / 100,
-            text=f"케이스 {_cp_idx}/{_cp_tot} 진행률: {_cp_pct:.1f}%",
+            _clamp01(_cp_pct / 100),
+            text=f"케이스 {_cp_idx}/{_cp_tot} 진행률: {max(0.0, _cp_pct):.1f}%",
         )
     # 마지막 유효 로그 라인 강조 표시
     _last_logs = [l for l in (ss.log_lines or []) if l.strip()]
@@ -1365,12 +1376,15 @@ def _start_batch_analysis(mode, speeds, angles, csv_path, n_cores, rho, ti, nx=1
         output_csv=csv_path,
         common_params=_bp,
         progress_cb=lambda p, s, e, label="": (
-            setattr(ss, "progress", p),
+            setattr(ss, "progress", max(0.0, min(100.0, float(p)))),
             setattr(ss, "current_step",
                     label if label else f"케이스 {s}/{e}개  ← 완료/전체"),
             setattr(ss, "case_progress", {
                 "case_idx": s, "total": e,
-                "pct": round(min((p - (s - 1) / e * 100) * e, 100.0), 2),
+                # 항목3 원인: 전체진행률 p 가 (s-1)/e*100 보다 약간 작으면(라운딩·
+                # 단계 경계 타이밍) (p-(s-1)/e*100)*e 가 음수가 되어 case pct < 0 →
+                # st.progress(음수) 크래시. 0~100 으로 클램프해 원천 차단.
+                "pct": round(min(max((p - (s - 1) / e * 100) * e, 0.0), 100.0), 2),
                 "label": label,
             })
         ),
@@ -1862,16 +1876,21 @@ with tab_input:
         st.divider()
 
         # ─── 예상 소요 시간 (조건에 따라 동적 갱신) ────────────────────────
+        # 항목1·5: 입력 탭 추정과 실행 버튼 추정을 '동일한 중앙 로직'으로 통일한다.
+        #   - 1케이스 추정 estimate_case_minutes = 전처리(메싱) + 솔버 시간(둘 다 포함)
+        #   - 총 추정 estimate_total_minutes = 케이스당 추정 × 케이스 수(실측 보정 반영)
+        # 입력 탭은 '총 예상 시간(전처리+솔버, 전 케이스)'을 표시해 실행 버튼과 일치시킨다.
         _rl_e = refine_level if mode == "unit_cell" else 3
-        _est = estimate_case_minutes(end_time, _rl_e, n_cores)
+        _n_cases = max(1, len(speeds) * len(angles))
+        _est_per   = estimate_case_minutes(end_time, _rl_e, n_cores)
+        _est_total = estimate_total_minutes(mode, _n_cases, end_time, _rl_e, n_cores)
         st.markdown("### ⏱️ 예상 소요 시간")
         _ec1, _ec2 = st.columns([1, 1.4])
-        _ec1.metric("대략 예상", fmt_duration(_est))
+        _ec1.metric("총 예상 시간", fmt_duration(_est_total))
         _ec2.caption(
-            f"범위 **{fmt_duration(_est*0.6)} ~ {fmt_duration(_est*1.5)}** "
-            f"(반복 {int(end_time)} · 정밀화 {int(_rl_e)} · {n_cores}코어). "
-            f"단위셀은 주기 BC라 nx/ny와 무관하게 일정. "
-            f"수렴 기준에 먼저 도달하면 더 빨리 끝납니다."
+            f"케이스 **{_n_cases}개 × 약 {fmt_duration(_est_per)}/케이스** "
+            f"(전처리+솔버 포함). 반복 {int(end_time)} · 정밀화 {int(_rl_e)} · "
+            f"{n_cores}코어. 실측 보정 반영 · 수렴 먼저 도달 시 더 빨리 끝납니다."
         )
         # 입력값(반복·정밀화·코어·nx/ny) 변경 시점 상태 저장
         _persist_input_state()
@@ -1917,10 +1936,9 @@ with tab_input:
         st.markdown("### 🚀 해석 실행")
 
         run_disabled = (ss.job_status == "running")
-        _ncase_run = len(speeds) * len(angles)
-        # 항목1: 총 예상은 실측 보정(최근 실제 소요 중앙값)을 우선 반영.
-        _est_total = estimate_total_minutes(
-            mode, _ncase_run, int(end_time), int(_rl_e), n_cores)
+        # 항목1·5: '예상 소요 시간' 섹션에서 계산한 값(_n_cases·_est_total)을 그대로
+        # 재사용해 입력 탭 표시와 실행 버튼 표시가 항상 동일하도록 보장(중앙화).
+        _ncase_run = _n_cases
         _run_label = ("▶️ 해석 시작 (단일)" if _ncase_run == 1
                       else f"🚀 배치 해석 시작 ({_ncase_run}개 · 예상 {fmt_duration(_est_total)})")
 
