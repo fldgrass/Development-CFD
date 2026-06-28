@@ -500,23 +500,35 @@ def status_badge(status: str) -> str:
     return f'<span class="badge-{status}">{labels.get(status, status)}</span>'
 
 # ─── 예상 소요 시간 추정 ────────────────────────────────────────────────────
-def estimate_case_minutes(end_time: int, refine_level: int, n_cores: int) -> float:
-    """단일 케이스 예상 계산 시간(분) = 직렬 메싱 오버헤드 + 병렬 솔버 시간.
-    정밀화 레벨이 격자 셀 수(→메싱·솔버 시간)를 좌우하고, 솔버는 반복수에 비례·
-    코어 수에 반비례한다고 가정한 경험식. 주기(cyclic) 단위셀이라 격자는 항상 1셀
-    → nx/ny는 계산시간에 영향 없음.
+def estimate_case_minutes(end_time: int, refine_level: int, n_cores: int,
+                          mode: str = "unit_cell") -> float:
+    """단일 케이스 예상 소요(분) — 전 워크플로 기여분 합산(항목1):
+        전처리(surfaceFeatureExtract·decomposePar) + 메싱(직렬 snappy) +
+        솔버(병렬 simpleFoam) + 후처리(reconstructPar·I/O·시각화 준비).
+    정밀화 레벨이 격자 셀 수를, 솔버는 반복수에 비례·코어수에 반비례한다고 본다.
 
-    실측 재보정(2026-06-22): 격자 대폭 축소 후 단위셀 최소 프리셋
-    (end_time=500·정밀화2·16코어)의 실제 소요가 약 1.2분(72~74초)으로 측정됨.
-    이전 상수(솔버 25.0·메싱 3+4)는 옛 대형 격자 기준이라 같은 조건을 9분으로
-    과대평가 → 상수를 약 1/7로 낮춰 실측에 맞춤.
-    재보정 후 추정: 최소(500·lvl2)≈1.4분, 보통(2000·lvl3)≈5분, 정밀(5000·lvl4)≈24분."""
+    모드별 격자 규모 차이를 반영: unit_cell 은 주기 1셀(소형), full_structure 는
+    개방 도메인(대형 격자) → 메싱·솔버·후처리가 모두 더 크다. 경험식은 '초기(cold-start)
+    추정'이며, 케이스 완료 시 실측이 모드별로 누적되면 estimate_total_minutes 가 실측
+    중앙값으로 자동 보정해 예측-실측 오차를 줄인다.
+
+    재보정(2026-06-22, unit_cell): 최소(500·lvl2·16코어) 실측 ≈1.2분.
+    """
     f_iter   = max(1, end_time) / 2000.0
     f_refine = {1: 0.3, 2: 0.6, 3: 1.0, 4: 2.2, 5: 5.0}.get(int(refine_level), 1.0)
     f_cores  = 16.0 / max(1, int(n_cores))
-    solver_min = 4.0 * f_iter * f_refine * f_cores    # 병렬 솔버 시간(실측 보정)
-    mesh_min   = 0.4 + 0.6 * f_refine                 # 직렬 snappy 메싱 오버헤드(실측 보정)
-    return mesh_min + solver_min
+    if mode == "full_structure":
+        # 개방 도메인 대형 격자: 전처리·직렬 메싱·솔버·후처리 모두 가중.
+        pre_min    = 0.4 + 0.3 * f_refine                 # sfe + decomposePar(대형)
+        mesh_min   = 0.8 + 1.4 * f_refine                 # 직렬 snappy(대형 격자)
+        solver_min = 8.0 * f_iter * f_refine * f_cores    # 대형 격자 병렬 솔버
+        post_min   = 0.5 + 0.5 * f_refine                 # reconstructPar(16proc 재조합)+I/O
+    else:  # unit_cell (소형 주기 격자)
+        pre_min    = 0.1
+        mesh_min   = 0.4 + 0.6 * f_refine                 # 직렬 snappy 메싱
+        solver_min = 4.0 * f_iter * f_refine * f_cores    # 병렬 솔버
+        post_min   = 0.2                                  # 경량 후처리/IO
+    return pre_min + mesh_min + solver_min + post_min
 
 
 # ─── 실측 기반 추정 보정(항목1) ─────────────────────────────────────────────
@@ -571,18 +583,18 @@ def estimate_total_minutes(mode, n_cases, end_time, refine_level, n_cores):
             recs = [r for r in json.loads(p.read_text())
                     if isinstance(r, dict) and float(r.get("min", 0)) >= 0.1]
             if recs:
-                _cur = estimate_case_minutes(end_time, refine_level, n_cores)
+                _cur = estimate_case_minutes(end_time, refine_level, n_cores, mode)
                 _scaled = []
                 for r in recs:
                     _base = estimate_case_minutes(
                         r.get("et", end_time), r.get("rl", refine_level),
-                        r.get("nc", n_cores))
+                        r.get("nc", n_cores), mode)
                     _scaled.append(float(r["min"]) * (_cur / _base if _base > 0 else 1.0))
                 per = _median(_scaled)
     except Exception:
         per = None
     if per is None:
-        per = estimate_case_minutes(end_time, refine_level, n_cores)
+        per = estimate_case_minutes(end_time, refine_level, n_cores, mode)
     return per * max(1, int(n_cases))
 
 def fmt_duration(minutes: float) -> str:
@@ -1427,11 +1439,18 @@ def _start_batch_analysis(mode, speeds, angles, csv_path, n_cores, rho, ti, nx=1
                 # 항목3: 정직한 완료 상태. 성공 케이스가 0이면 '완료'가 아니라 실패로
                 # 보고해야 한다(이전엔 전부 실패해도 '배치 해석 완료!'로 떠 사용자가
                 # 결과가 있다고 오인). 성공 시간만 기록해 추정 보정 오염도 방지.
+                _elapsed_min = (time.time() - _t0) / 60.0
                 if _ns > 0:
                     record_case_minutes(
-                        mode, (time.time() - _t0) / 60.0 / _ns,
+                        mode, _elapsed_min / _ns,
                         end_time=_bp.get("end_time"),
                         refine_level=_bp.get("refine_level"), n_cores=n_cores)
+                    # 항목1 검증로그: 추정 vs 실측(전 워크플로 end-to-end)·오차율 표시.
+                    _est = float(ss.get("est_total_min", 0.0))
+                    if _est > 0:
+                        _err = abs(_elapsed_min - _est) / _est * 100.0
+                        add_log(f"⏱️ 추정 {_est:.1f}분 vs 실측 {_elapsed_min:.1f}분 "
+                                f"(오차 {_err:.0f}%) — 모드 {mode}. 실측은 다음 추정에 보정 반영.")
                 if _ns == 0:
                     set_status("error",
                                f"모든 케이스 실패 (0/{_n_cases} 완료) — 로그/형상을 확인하세요.")

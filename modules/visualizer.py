@@ -1424,15 +1424,29 @@ class CFDVisualizer:
             except Exception:
                 pass
 
-        fig.update_xaxes(title_text="Position [m]", gridcolor='lightgray', showgrid=True)
-        fig.update_yaxes(gridcolor='lightgray', showgrid=True)
+        # 항목2: 배경이 흰색 고정이므로 모든 텍스트를 진한 색으로 고정해 어떤 테마·해상도
+        # 에서도 또렷하게(테마 의존 기본색 회피, 저대비로 흐릿해 보이는 문제 해소).
+        _dark = "#1a1a1a"
+        fig.update_xaxes(title_text="Position [m]", gridcolor='#d0d0d0', showgrid=True,
+                         title_font=dict(color=_dark, size=12),
+                         tickfont=dict(color=_dark, size=10),
+                         linecolor='#888', zerolinecolor='#bbb')
+        fig.update_yaxes(gridcolor='#d0d0d0', showgrid=True,
+                         title_font=dict(color=_dark, size=12),
+                         tickfont=dict(color=_dark, size=10),
+                         linecolor='#888', zerolinecolor='#bbb')
         fig.update_layout(
-            title=dict(text="Velocity Profile (Wake)", font=dict(size=14), x=0.5),
+            title=dict(text="Velocity Profile (Wake)",
+                       font=dict(size=15, color=_dark), x=0.5),
             height=420,
-            legend=dict(font=dict(size=11)),
+            font=dict(color=_dark),
+            legend=dict(font=dict(size=11, color=_dark),
+                        bgcolor='rgba(255,255,255,0.9)',
+                        bordercolor='#888', borderwidth=1),
             paper_bgcolor='white', plot_bgcolor='#fafafa',
             margin=dict(l=60, r=20, t=60, b=60),
         )
+        fig.update_annotations(font=dict(color=_dark, size=13))  # subplot 제목
         return fig
 
     def plot_force_coefficients_plotly(self, csv_path: Path) -> Optional[Any]:
