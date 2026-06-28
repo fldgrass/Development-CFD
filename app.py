@@ -1968,30 +1968,35 @@ with tab_input:
 
         st.divider()
 
-        # ─── 좌표계 / 영각 해석 (항목5: 활성 좌표 해석 표시) ──────────────────
-        from cfd_manager import coordinate_convention, verify_coordinate_consistency
-        st.markdown("### 🧭 좌표계 · 영각 해석")
-        _conv = coordinate_convention(float(angles[0]) if angles else 0.0, mode)
-        _modetxt = ("단위 셀 — 그물면 고정(법선 z), 유속을 회전(주기 BC)"
-                    if mode == "unit_cell"
-                    else "전체 구조 — 유속 x 고정, 그물을 Y축 α 회전(풍동식)")
+        # ─── 좌표계 / 영각 해석 (통일 표시 좌표계) ──────────────────
+        from cfd_manager import display_convention, verify_coordinate_consistency
+        st.markdown("### 🧭 좌표계 · 영각 해석 (통일 규약)")
+        _a0 = float(angles[0]) if angles else 0.0
+        _disp = display_convention(_a0)
+        _fv = _disp["flow"]
         st.info(
-            f"**활성 좌표 해석:** {_modetxt}\n\n"
-            f"- 영각 해석: **α → 유속·그물면 상대각 = 90°−α** (두 모드 공통 규약)\n"
-            f"- dragDir = 유속 방향, liftDir = 유속 수직, pitchAxis = y\n"
-            f"- 전체 구조는 유속을 항상 x 로 두고 그물을 회전하므로 **고영각에서도 "
-            f"정상 유입**(힘이 비정상적으로 줄지 않음)")
-        with st.expander("🔍 좌표 일관성 자동 검증 (단위셀 ↔ 전체구조)", expanded=False):
+            "**통일 표시 좌표계 — 두 모드 공통**\n\n"
+            "- 전역 축: **+X = 그물면 법선(정면)**, **X–Y = 수면**, **+Z = 수심(↓)**\n"
+            "- 그물 형상은 **Y–Z 평면**에 놓임(법선 +X)\n"
+            "- 영각(AoA): **AoA=90° → 유속 −X→+X (정면)**, "
+            "**AoA=0° → 유속 +Y→−Y (그레이징)**\n"
+            f"- 유속 d(AoA) = (sinα, −cosα, 0)  →  현재 α={_a0:.1f}° 일 때 "
+            f"**({_fv[0]:.3f}, {_fv[1]:.3f}, {_fv[2]:.3f})**\n"
+            "- dragDir = 유속 방향, liftDir = 유속 수직(수면 내), pitchAxis = +Z(수심)\n\n"
+            "*솔버 내부 좌표는 모드별로 수치 안정성에 맞춰 두되, 화면·리포트·시각화는 "
+            "위 통일 좌표계로 변환해 표시합니다(저위험 프레임 통일).*")
+        with st.expander("🔍 좌표 일관성 자동 검증 (솔버→표시 프레임 변환)", expanded=False):
             _rep = verify_coordinate_consistency(tol_deg=1.0)
             import pandas as _pd_cc
             _rows = []
             for _a, _r in _rep.items():
+                _uf = _r["uc"]["flow_display"]; _ff = _r["fs"]["flow_display"]
                 _rows.append({
                     "α [°]": _a,
-                    "상대각(UC)": round(_r["uc"]["relative_angle_deg"], 2),
-                    "상대각(FS)": round(_r["fs"]["relative_angle_deg"], 2),
-                    "차이[°]": round(_r["rel_diff_deg"], 3),
-                    "dragDir·유속(UC/FS)": f"{_r['drag_aligned_uc']:.3f}/{_r['drag_aligned_fs']:.3f}",
+                    "표시유속(목표)": f"({_r['display_flow'][0]:.2f},{_r['display_flow'][1]:.2f},0)",
+                    "UC 변환유속": f"({_uf[0]:.2f},{_uf[1]:.2f},{_uf[2]:.2f})",
+                    "FS 변환유속": f"({_ff[0]:.2f},{_ff[1]:.2f},{_ff[2]:.2f})",
+                    "상대각차[°]": round(_r["rel_diff_deg"], 3),
                     "일치": "✅" if _r["ok"] else "⚠️",
                 })
             st.dataframe(_pd_cc.DataFrame(_rows), use_container_width=True, hide_index=True)
@@ -2000,8 +2005,8 @@ with tab_input:
                 for w in _warns:
                     st.warning(f"⚠️ {w}")
             else:
-                st.success("좌표 일관성 OK — 두 모드의 유속·그물면 상대각이 모든 영각에서 "
-                           "≤±1°로 일치하고 dragDir 이 유속과 정렬됩니다.")
+                st.success("좌표 통일 OK — 두 모드의 솔버 유속·법선이 모든 영각에서 통일 "
+                           "표시 프레임 d(AoA)=(sinα,−cosα,0)·법선(+X)으로 정확히 변환됩니다.")
 
         with st.expander("📐 단위셀 ↔ 전체구조 Cd 차이는 왜 생기나 (물리적 원인)",
                          expanded=False):

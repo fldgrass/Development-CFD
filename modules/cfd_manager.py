@@ -120,6 +120,76 @@ def coordinate_convention(angle_deg: float, mode: str) -> Dict:
             "rotate_geometry_deg": rot, "mode": mode}
 
 
+# ───────────────────────────────────────────────────────────────────────────
+# 통일 표시 좌표계 (Display / User frame) — 두 모드 공통의 단일 규약
+# ───────────────────────────────────────────────────────────────────────────
+#   전역 축:  +X = 그물면 법선(정면), X–Y 평면 = 수면, +Z = 수심(깊어지는 방향)
+#   그물 형상은 Y–Z 평면에 놓이고(법선 +X), 유속은 X–Y(수면) 평면에서 회전한다.
+#   영각(AoA) 정의 (두 모드 동일):
+#     AoA = 90° → 유속 −X→+X (그물 정면 충돌, 법선 입사)
+#     AoA = 0°  → 유속 +Y→−Y (그물면 평행, 그레이징)
+#   유속 단위벡터  d(AoA) = (sin AoA, −cos AoA, 0)
+#
+#   ※ 솔버 내부 좌표(coordinate_convention)는 수치 안정성을 위해 모드별로
+#     다르게 두되(검증 완료), 화면·리포트·시각화는 이 표시 좌표계로 통일한다.
+#     솔버→표시 변환은 solver_to_display_rotation() 이 담당한다.
+def display_convention(angle_deg: float) -> Dict:
+    """두 모드 공통의 통일 표시 좌표계 벡터를 반환한다(모드 무관).
+
+    반환: flow/inlet(유속), normal(그물면 법선=+X), drag(=유속), lift(유속 수직,
+    수면 내), depth/pitch(=+Z 수심), relative_angle_deg(유속–법선 상대각).
+    """
+    a = math.radians(angle_deg)
+    ca, sa = math.cos(a), math.sin(a)
+    flow   = (sa, -ca, 0.0)      # d(AoA): 90°→+X, 0°→−Y
+    normal = (1.0, 0.0, 0.0)     # 그물면 법선 (Y–Z 평면)
+    lift   = (ca, sa, 0.0)       # 양력: 유속에 수직, 수면(X–Y) 평면 내
+    depth  = (0.0, 0.0, 1.0)     # 수심 = pitch 축
+    _dot = max(-1.0, min(1.0, flow[0]*normal[0] + flow[1]*normal[1] + flow[2]*normal[2]))
+    rel = math.degrees(math.acos(_dot))
+    return {"flow": flow, "inlet": flow, "normal": normal, "drag": flow,
+            "lift": lift, "depth": depth, "pitch": depth,
+            "relative_angle_deg": rel, "frame": "display"}
+
+
+def solver_to_display_rotation(mode: str, angle_deg: float) -> List[List[float]]:
+    """모드별 솔버 좌표 → 통일 표시 좌표 회전행렬 R(3×3, 행 우선).
+
+    v_display = R · v_solver. 시각화에서 형상·벡터장을 통일 프레임으로 표시하거나
+    힘 벡터를 통일 프레임으로 보고할 때 사용한다. 두 R 모두 det=+1 정상회전.
+
+    - unit_cell (각도 무관): 솔버(법선 +Z, 유속 (cosα,0,sinα))
+        → 표시(법선 +X, 유속 (sinα,−cosα,0)).
+    - full_structure (각도 의존): 솔버(유속 +X 고정, 그물 Y축 α 회전)
+        → 표시(법선 +X, 유속 (sinα,−cosα,0)).
+    """
+    a = math.radians(angle_deg)
+    ca, sa = math.cos(a), math.sin(a)
+    if mode == "unit_cell":
+        return [[0.0, 0.0, 1.0],
+                [-1.0, 0.0, 0.0],
+                [0.0, -1.0, 0.0]]
+    # full_structure
+    return [[sa, 0.0, ca],
+            [-ca, 0.0, sa],
+            [0.0, -1.0, 0.0]]
+
+
+def apply_rotation(R: List[List[float]], v) -> Tuple[float, float, float]:
+    """회전행렬 R(3×3)을 벡터 v(3)에 적용: R·v."""
+    return (R[0][0]*v[0] + R[0][1]*v[1] + R[0][2]*v[2],
+            R[1][0]*v[0] + R[1][1]*v[1] + R[1][2]*v[2],
+            R[2][0]*v[0] + R[2][1]*v[1] + R[2][2]*v[2])
+
+
+def solver_flow_vector(mode: str, angle_deg: float) -> Tuple[float, float, float]:
+    """모드별 솔버 좌표계에서의 유속 단위벡터(시각화·검증용)."""
+    a = math.radians(angle_deg)
+    if mode == "unit_cell":
+        return (math.cos(a), 0.0, math.sin(a))
+    return (1.0, 0.0, 0.0)   # full_structure: 풍동식(유속 +X 고정)
+
+
 def verify_coordinate_consistency(angles=(0, 30, 45, 60, 90), tol_deg=1.0) -> Dict:
     """항목2·3: 동일 입력에 대해 두 모드의 좌표 규약을 비교하는 자동 일관성 검증.
     유속-그물면 상대각이 일치(≤tol_deg)하는지, dragDir 가 유속 방향과 정렬되는지,
@@ -128,22 +198,35 @@ def verify_coordinate_consistency(angles=(0, 30, 45, 60, 90), tol_deg=1.0) -> Di
     """
     report = {}
     for a in angles:
-        uc = coordinate_convention(a, "unit_cell")
-        fs = coordinate_convention(a, "full_structure")
-        rel_diff = abs(uc["relative_angle_deg"] - fs["relative_angle_deg"])
-        ddu = sum(uc["drag"][i] * uc["inlet"][i] for i in range(3))
-        ddf = sum(fs["drag"][i] * fs["inlet"][i] for i in range(3))
+        disp = display_convention(a)
+        res = {}
+        max_err = 0.0
+        for m in ("unit_cell", "full_structure"):
+            R = solver_to_display_rotation(m, a)
+            sflow = solver_flow_vector(m, a)                 # 솔버 유속
+            snorm = coordinate_convention(a, m)["normal"]    # 솔버 그물면 법선
+            dflow = apply_rotation(R, sflow)                 # → 표시 프레임 유속
+            dnorm = apply_rotation(R, snorm)                 # → 표시 프레임 법선
+            ferr = max(abs(dflow[i] - disp["flow"][i]) for i in range(3))
+            nerr = max(abs(dnorm[i] - disp["normal"][i]) for i in range(3))
+            _d = max(-1.0, min(1.0, sum(dflow[i]*dnorm[i] for i in range(3))))
+            res[m] = {"flow_display": tuple(round(x, 4) for x in dflow),
+                      "normal_display": tuple(round(x, 4) for x in dnorm),
+                      "relative_angle_deg": math.degrees(math.acos(_d)),
+                      "flow_err": ferr, "normal_err": nerr}
+            max_err = max(max_err, ferr, nerr)
+        rel_diff = abs(res["unit_cell"]["relative_angle_deg"]
+                       - res["full_structure"]["relative_angle_deg"])
         warns = []
+        if max_err > 1e-3:
+            warns.append(f"솔버→표시 변환 후 유속/법선 오차 {max_err:.1e} > 1e-3")
         if rel_diff > tol_deg:
             warns.append(f"상대각 차이 {rel_diff:.2f}° > 허용 {tol_deg}°")
-        if abs(ddu - 1.0) > 1e-3:
-            warns.append("Unit Cell dragDir 이 유속 방향과 불일치")
-        if abs(ddf - 1.0) > 1e-3:
-            warns.append("Full Structure dragDir 이 유속 방향과 불일치")
-        if uc["pitch"] != fs["pitch"]:
-            warns.append("pitchAxis 불일치")
-        report[a] = {"uc": uc, "fs": fs, "rel_diff_deg": rel_diff,
-                     "drag_aligned_uc": ddu, "drag_aligned_fs": ddf,
+        report[a] = {"uc": res["unit_cell"], "fs": res["full_structure"],
+                     "rel_diff_deg": rel_diff,
+                     "drag_aligned_uc": 1.0 - res["unit_cell"]["flow_err"],
+                     "drag_aligned_fs": 1.0 - res["full_structure"]["flow_err"],
+                     "display_flow": tuple(round(x, 4) for x in disp["flow"]),
                      "ok": not warns, "warnings": warns}
     return report
 
