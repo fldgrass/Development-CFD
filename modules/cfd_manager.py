@@ -484,6 +484,13 @@ class FullStructureCaseBuilder:
         if self.net_stl and self.net_stl.exists():
             shutil.copy2(self.net_stl, trisurf_dir / "netSurface.stl")
 
+        # 그물(net)만 있고 가두리(cage)가 없으면 'net-only' 모드 — 도메인을 net 크기에
+        # 맞추고 snappy 에서 cageSurface 참조를 제거해 net 만으로 메싱한다.
+        self._net_only = not (self.cage_stl and self.cage_stl.exists()) \
+            and bool(self.net_stl and self.net_stl.exists())
+        if self._net_only:
+            self._compute_net_domain()
+
         self._patch_velocity_fields()
         self._patch_turbulence_fields()
         self._patch_blockMesh()
@@ -511,17 +518,50 @@ class FullStructureCaseBuilder:
             text = re.sub(r"uniform\s+[\d.e+-]+;", f"uniform {new_val};", text)
             fpath.write_text(text)
 
-    def _patch_blockMesh(self):
-        """도메인 크기를 가두리 크기에 맞게 자동 계산"""
-        D, H = self.cage_D, self.cage_H
-        # 도메인: 상류 3D, 하류 7D, 횡방향 3D, 수심 H
-        x_min = -3 * D;  x_max = 7 * D
-        y_min = -3 * D;  y_max = 3 * D
-        z_min = -H;      z_max = 0.0
+    def _compute_net_domain(self):
+        """net STL 의 실제 바운딩박스(scale 0.001 적용 = m)를 읽어 net-only 도메인·
+        정밀화 박스·기준점을 계산해 self._dom_* / self._box_* / self._loc 에 저장한다.
+        가두리가 없을 때 도메인이 net 크기에 맞아야 snappy 가 net 을 제대로 포착한다."""
+        tris = read_stl_triangles(self.net_stl)
+        sc = 0.001  # snappyHexMeshDict scale (mm→m)와 일치
+        xs = [v[0]*sc for t in tris for v in t]
+        ys = [v[1]*sc for t in tris for v in t]
+        zs = [v[2]*sc for t in tris for v in t]
+        bxmin, bxmax = min(xs), max(xs)
+        bymin, bymax = min(ys), max(ys)
+        bzmin, bzmax = min(zs), max(zs)
+        cx = (bxmin+bxmax)/2; cy = (bymin+bymax)/2; cz = (bzmin+bzmax)/2
+        L = max(bxmax-bxmin, bymax-bymin, bzmax-bzmin, 1e-3)
+        self._net_L = L; self._net_c = (cx, cy, cz)
+        # 도메인: 상류 3L, 하류 7L, 횡·수직 ±3L (net 이 충분히 도메인 안에 들도록)
+        self._dom_min = (cx-3*L, cy-3*L, cz-3*L)
+        self._dom_max = (cx+7*L, cy+3*L, cz+3*L)
+        # 정밀화 박스: net + 근접 후류
+        self._box_min = (bxmin-0.5*L, bymin-0.5*L, bzmin-0.5*L)
+        self._box_max = (bxmax+1.5*L, bymax+0.5*L, bzmax+0.5*L)
+        # 기준점: net 상류(연결된 유체 영역 어디든 가능, net 표면만 피하면 됨)
+        self._loc = (cx-2.5*L, cy, cz)
 
-        nx = max(50, int(10 * D))
-        ny = max(40, int( 6 * D))
-        nz = max(10, int( 4 * H))
+    def _patch_blockMesh(self):
+        """도메인 크기 자동 계산. net-only 면 net 크기 기준, 아니면 가두리 크기 기준."""
+        if getattr(self, "_net_only", False):
+            x_min, y_min, z_min = self._dom_min
+            x_max, y_max, z_max = self._dom_max
+            L = self._net_L
+            # 기저 셀 ~ L/8, 도메인 비율에 맞춰 분할 수 산정(40~120 클램프)
+            _cell = max(L/8.0, 1e-4)
+            nx = max(40, min(120, int((x_max-x_min)/_cell)))
+            ny = max(30, min(100, int((y_max-y_min)/_cell)))
+            nz = max(30, min(100, int((z_max-z_min)/_cell)))
+        else:
+            D, H = self.cage_D, self.cage_H
+            # 도메인: 상류 3D, 하류 7D, 횡방향 3D, 수심 H
+            x_min = -3 * D;  x_max = 7 * D
+            y_min = -3 * D;  y_max = 3 * D
+            z_min = -H;      z_max = 0.0
+            nx = max(50, int(10 * D))
+            ny = max(40, int( 6 * D))
+            nz = max(10, int( 4 * H))
 
         bmd = self.case_dir / "system" / "blockMeshDict"
         replace_in_file(bmd, {
@@ -537,15 +577,111 @@ class FullStructureCaseBuilder:
         })
 
     def _patch_snappyHexMesh(self):
-        """가두리 크기에 맞게 정밀화 박스 조정"""
+        """가두리 크기에 맞게 정밀화 박스 조정. net-only 면 cageSurface 참조가 없는
+        snappyHexMeshDict 를 새로 써서 net 만으로 메싱한다."""
+        snappy = self.case_dir / "system" / "snappyHexMeshDict"
+        if getattr(self, "_net_only", False):
+            self._write_netonly_snappy(snappy)
+            return
         D, H = self.cage_D, self.cage_H
         r = D / 2 * 1.2
-        snappy = self.case_dir / "system" / "snappyHexMeshDict"
         replace_in_file(snappy, {
             "min     (-6 -6 -6);": f"min     ({-r:.2f} {-r:.2f} {-(H+1):.2f});",
             "max     ( 6  6  1);": f"max     ({r:.2f}  {r:.2f}  1.0);",
             "locationInMesh (0 0 -2.5);": f"locationInMesh (0 0 {-H/2:.2f});",
         })
+
+    def _write_netonly_snappy(self, snappy_path):
+        """그물만 있는 경우의 snappyHexMeshDict 생성 — cageSurface 참조 없이
+        netSurface 만 정밀화. net STL 은 열린 면(시트)이라 inside 제거 없이 표면 주변만
+        정밀화한다(unit_cell 의 net 처리와 동일 사상). 박스·기준점은 net 바운드 기반."""
+        bx0, by0, bz0 = self._box_min
+        bx1, by1, bz1 = self._box_max
+        lx, ly, lz = self._loc
+        content = f"""FoamFile
+{{
+    version 2.0; format ascii; class dictionary; object snappyHexMeshDict;
+}}
+
+castellatedMesh true;
+snap            true;
+addLayers       false;
+
+geometry
+{{
+    netSurface.stl
+    {{
+        type    triSurfaceMesh;
+        name    netSurface;
+        scale   0.001;
+    }}
+    refineBox
+    {{
+        type    searchableBox;
+        min     ({bx0:.5f} {by0:.5f} {bz0:.5f});
+        max     ({bx1:.5f} {by1:.5f} {bz1:.5f});
+    }}
+}}
+
+castellatedMeshControls
+{{
+    maxLocalCells       2000000;
+    maxGlobalCells      8000000;
+    minRefinementCells  10;
+    maxLoadUnbalance    -1;
+    nCellsBetweenLevels 3;
+
+    features ( {{ file "netSurface.eMesh"; level 2; }} );
+
+    refinementSurfaces
+    {{
+        netSurface
+        {{
+            level (2 3);
+            patchInfo {{ type wall; inGroups (wall); }}
+        }}
+    }}
+
+    refinementRegions
+    {{
+        refineBox {{ mode inside; levels ((1e10 2)); }}
+    }}
+
+    resolveFeatureAngle 30;
+    locationInMesh ({lx:.5f} {ly:.5f} {lz:.5f});
+    allowFreeStandingZoneFaces true;
+}}
+
+snapControls
+{{
+    nSmoothPatch 3; tolerance 2.0; nSolveIter 30; nRelaxIter 5;
+    nFeatureSnapIter 10; implicitFeatureSnap false; explicitFeatureSnap true;
+    multiRegionFeatureSnap false;
+}}
+
+addLayersControls
+{{
+    relativeSizes true;
+    layers {{}}
+    expansionRatio 1.2; finalLayerThickness 0.3; minThickness 0.1;
+    nGrow 0; featureAngle 60; nRelaxIter 3; nSmoothSurfaceNormals 1;
+    nSmoothNormals 3; nSmoothThickness 10; maxFaceThicknessRatio 0.5;
+    maxThicknessToMedialRatio 0.3; minMedialAxisAngle 90;
+    nBufferCellsNoExtrude 0; nLayerIter 50;
+}}
+
+meshQualityControls
+{{
+    maxNonOrtho 65; maxBoundarySkewness 20; maxInternalSkewness 4;
+    maxConcave 80; minVol 1e-13; minTetQuality 1e-15; minArea -1;
+    minTwist 0.02; minDeterminant 0.001; minFaceWeight 0.05;
+    minVolRatio 0.01; minTriangleTwist -1; nSmoothScale 4; errorReduction 0.75;
+}}
+
+writeFlags ( scalarLevels );
+mergeTolerance 1e-6;
+"""
+        snappy_path.write_text(content)
 
     def _patch_fvSolution(self):
         """수렴 기준(residualControl) 주입"""
@@ -555,9 +691,38 @@ class FullStructureCaseBuilder:
         })
 
     def _patch_controlDict(self):
+        ctrl = self.case_dir / "system" / "controlDict"
+        if getattr(self, "_net_only", False):
+            # net-only: 힘은 netSurface 패치에서만 계산. 기준면적은 그물면(법선 z)
+            # 투영 실측, 기준길이는 net 특성치 L. magUInf=유속.
+            try:
+                aref = compute_projected_area(self.net_stl, (0.0, 0.0, 1.0))
+            except Exception:
+                aref = 0.0
+            if not (aref and aref > 1e-9):
+                aref = max(self._net_L**2, 1e-6)
+            lref = self._net_L
+            cx, cy, cz = self._net_c
+            replace_in_file(ctrl, {
+                "endTimeValue        3000;": f"endTimeValue        {self.end_time};",
+                "writeIntervalValue  100;":  f"writeIntervalValue  {self.write_interval};",
+                "magUInf         1.0;": f"magUInf         {self.speed:.4f};",
+                "lRef            10.0;":  f"lRef            {lref:.6f};",
+                "Aref            50.0;":  f"Aref            {aref:.6e};",
+                "patches         (cageSurface netSurface);": "patches         (netSurface);",
+            })
+            # 샘플링 라인을 net 중심 부근으로(도메인 밖이면 무의미하므로)
+            replace_in_file(ctrl, {
+                "start       (-30 0 -2.5);": f"start       ({cx-2*self._net_L:.4f} {cy:.4f} {cz:.4f});",
+                "end         ( 70 0 -2.5);": f"end         ({cx+5*self._net_L:.4f} {cy:.4f} {cz:.4f});",
+                "start       (15 -15 -2.5);": f"start       ({cx:.4f} {cy-2*self._net_L:.4f} {cz:.4f});",
+                "end         (15  15 -2.5);": f"end         ({cx:.4f} {cy+2*self._net_L:.4f} {cz:.4f});",
+                "start       (35 -15 -2.5);": f"start       ({cx+self._net_L:.4f} {cy-2*self._net_L:.4f} {cz:.4f});",
+                "end         (35  15 -2.5);": f"end         ({cx+self._net_L:.4f} {cy+2*self._net_L:.4f} {cz:.4f});",
+            })
+            return
         D, H = self.cage_D, self.cage_H
         aref = D * H
-        ctrl = self.case_dir / "system" / "controlDict"
         replace_in_file(ctrl, {
             "endTimeValue        3000;":       f"endTimeValue        {self.end_time};",
             "writeIntervalValue  100;":        f"writeIntervalValue  {self.write_interval};",

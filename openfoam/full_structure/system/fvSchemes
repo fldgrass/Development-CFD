@@ -29,11 +29,19 @@ divSchemes
     div(phi,k)                      bounded Gauss upwind;
     div(phi,omega)                  bounded Gauss upwind;
     div((nuEff*dev(T(grad(U)))))    Gauss linear;
+    div((nuEff*dev2(T(grad(U)))))   Gauss linear;
 }
 
 laplacianSchemes { default Gauss linear corrected; }
 interpolationSchemes { default linear; }
 snGradSchemes   { default corrected; }
 fluxRequired    { default no; p; }
+
+// k-ω SST 등 벽거리 기반 모델에 필수 — 없으면 simpleFoam 이 'wallDist method
+// not found' 로 즉시 실패한다(unit_cell 과 동일).
+wallDist
+{
+    method          meshWave;
+}
 
 // ************************************************************************* //
