@@ -1412,8 +1412,13 @@ class BatchAnalysisManager:
                         cage_stl=self.stl_paths.get("cage"),
                         net_stl=self.stl_paths.get("net"),
                         speed=speed, angle_deg=angle,
+                        # end_time/residual/write_interval 도 전달해야 한다. 누락 시
+                        # 빌더 기본값(end_time=3000)으로 케이스가 생성돼, 진행바가
+                        # 쓰는 프리셋 end_time(예: 500)과 어긋나 솔버가 3000회까지 도는
+                        # 동안 진행바가 99.9%에 고착된다(케이스가 멈춘 것처럼 보임).
                         **{k: v for k, v in self.params.items()
-                           if k in ["cage_diameter", "cage_depth", "n_cores"]}
+                           if k in ["cage_diameter", "cage_depth", "n_cores",
+                                    "end_time", "residual_control", "write_interval"]}
                     )
 
                 builder.build()
