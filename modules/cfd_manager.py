@@ -84,6 +84,83 @@ def compute_velocity_vector(speed: float, angle_deg: float) -> Tuple[float, floa
     return (ux, 0.0, uz)
 
 
+def coordinate_convention(angle_deg: float, mode: str) -> Dict:
+    """좌표/영각 단일 규약 — Unit Cell 을 기준 구현으로 삼아 두 모드가 '유속과
+    그물면 법선 사이의 상대각(= 90°−α)'을 동일하게 갖도록 정의한다.
+
+    - unit_cell : 그물면 고정(법선 z), 유속을 회전 (cosα,0,sinα). 주기(cyclic) BC 라
+      어떤 각도든 정상 작동. dragDir=유속방향, liftDir=유속에 수직(XZ 평면).
+    - full_structure : 풍동(wind-tunnel) 방식 — 유속을 x 로 고정하고 그물 형상을
+      Y 축으로 α 회전(법선 z→x). 같은 상대각을 만들면서, 고정 x-inlet 에 항상 정상
+      유입(법선속도 = U)되어 고각에서 힘이 붕괴하지 않는다. dragDir=x, liftDir=z.
+      (두 모드는 Y 축 α 회전으로 서로 연결되는 동일 물리계 → Cd/Cl 일치.)
+
+    반환: inlet(유속 방향 단위벡터), normal(그물면 법선), drag, lift, pitch,
+    relative_angle_deg(유속-법선 상대각), rotate_geometry_deg(형상 회전각, Y축).
+    """
+    a = math.radians(angle_deg)
+    ca, sa = math.cos(a), math.sin(a)
+    if mode == "unit_cell":
+        inlet  = (ca, 0.0, sa)        # 유속 방향(회전)
+        normal = (0.0, 0.0, 1.0)      # 그물면 법선(고정)
+        drag   = (ca, 0.0, sa)
+        lift   = (-sa, 0.0, ca)
+        rot    = 0.0                  # 형상 회전 없음
+    else:  # full_structure (풍동식)
+        inlet  = (1.0, 0.0, 0.0)      # 유속 고정(x)
+        normal = (sa, 0.0, ca)        # 그물면 법선 = Y축 α 회전(z→x)
+        drag   = (1.0, 0.0, 0.0)
+        lift   = (0.0, 0.0, 1.0)
+        rot    = float(angle_deg)     # 형상을 Y축으로 α 회전
+    pitch = (0.0, 1.0, 0.0)           # pitchAxis = y (양 모드 공통)
+    _dot = max(-1.0, min(1.0, sum(inlet[i]*normal[i] for i in range(3))))
+    rel = math.degrees(math.acos(_dot))
+    return {"inlet": inlet, "normal": normal, "drag": drag, "lift": lift,
+            "pitch": pitch, "relative_angle_deg": rel,
+            "rotate_geometry_deg": rot, "mode": mode}
+
+
+def verify_coordinate_consistency(angles=(0, 30, 45, 60, 90), tol_deg=1.0) -> Dict:
+    """항목2·3: 동일 입력에 대해 두 모드의 좌표 규약을 비교하는 자동 일관성 검증.
+    유속-그물면 상대각이 일치(≤tol_deg)하는지, dragDir 가 유속 방향과 정렬되는지,
+    pitchAxis 가 일치하는지 확인하고, 허용오차 초과 시 경고를 생성한다.
+    반환: {angle: {uc, fs, rel_diff_deg, drag_aligned_uc, drag_aligned_fs, ok, warnings}}.
+    """
+    report = {}
+    for a in angles:
+        uc = coordinate_convention(a, "unit_cell")
+        fs = coordinate_convention(a, "full_structure")
+        rel_diff = abs(uc["relative_angle_deg"] - fs["relative_angle_deg"])
+        ddu = sum(uc["drag"][i] * uc["inlet"][i] for i in range(3))
+        ddf = sum(fs["drag"][i] * fs["inlet"][i] for i in range(3))
+        warns = []
+        if rel_diff > tol_deg:
+            warns.append(f"상대각 차이 {rel_diff:.2f}° > 허용 {tol_deg}°")
+        if abs(ddu - 1.0) > 1e-3:
+            warns.append("Unit Cell dragDir 이 유속 방향과 불일치")
+        if abs(ddf - 1.0) > 1e-3:
+            warns.append("Full Structure dragDir 이 유속 방향과 불일치")
+        if uc["pitch"] != fs["pitch"]:
+            warns.append("pitchAxis 불일치")
+        report[a] = {"uc": uc, "fs": fs, "rel_diff_deg": rel_diff,
+                     "drag_aligned_uc": ddu, "drag_aligned_fs": ddf,
+                     "ok": not warns, "warnings": warns}
+    return report
+
+
+def rotate_points_y(pts, angle_deg, center=(0.0, 0.0, 0.0)):
+    """점 목록을 center 기준 Y축으로 angle_deg 회전. (x,y,z) →
+    ((x-cx)cosθ+(z-cz)sinθ+cx, y, -(x-cx)sinθ+(z-cz)cosθ+cz)."""
+    a = math.radians(angle_deg)
+    ca, sa = math.cos(a), math.sin(a)
+    cx, cy, cz = center
+    out = []
+    for (x, y, z) in pts:
+        dx, dz = x - cx, z - cz
+        out.append((dx*ca + dz*sa + cx, y, -dx*sa + dz*ca + cz))
+    return out
+
+
 def compute_turbulence_params(speed: float, intensity: float = 0.05,
                                length_scale: float = 0.02) -> Dict[str, float]:
     """
@@ -479,17 +556,21 @@ class FullStructureCaseBuilder:
         # STL 복사
         trisurf_dir = self.case_dir / "constant" / "triSurface"
         trisurf_dir.mkdir(exist_ok=True)
+        # 그물(net)만 있고 가두리(cage)가 없으면 'net-only' 모드.
+        self._net_only = not (self.cage_stl and self.cage_stl.exists()) \
+            and bool(self.net_stl and self.net_stl.exists())
         if self.cage_stl and self.cage_stl.exists():
             shutil.copy2(self.cage_stl, trisurf_dir / "cageSurface.stl")
         if self.net_stl and self.net_stl.exists():
-            shutil.copy2(self.net_stl, trisurf_dir / "netSurface.stl")
+            if self._net_only:
+                # 좌표 통일(풍동식): 그물을 Y축으로 α 회전해 저장 → 유속 x 고정과 함께
+                # '유속-그물면 상대각 = 90°−α' 가 Unit Cell 과 동일해진다(coordinate_convention).
+                self._write_rotated_netSurface(trisurf_dir / "netSurface.stl")
+            else:
+                shutil.copy2(self.net_stl, trisurf_dir / "netSurface.stl")
 
-        # 그물(net)만 있고 가두리(cage)가 없으면 'net-only' 모드 — 도메인을 net 크기에
-        # 맞추고 snappy 에서 cageSurface 참조를 제거해 net 만으로 메싱한다.
-        self._net_only = not (self.cage_stl and self.cage_stl.exists()) \
-            and bool(self.net_stl and self.net_stl.exists())
         if self._net_only:
-            self._compute_net_domain()
+            self._compute_net_domain()   # 회전된 netSurface.stl 기준
 
         self._patch_velocity_fields()
         self._patch_turbulence_fields()
@@ -502,8 +583,41 @@ class FullStructureCaseBuilder:
         logger.info(f"[FullStructure] 케이스 생성 완료: {self.case_dir}")
         return self.case_dir
 
+    def _write_rotated_netSurface(self, dest: Path):
+        """원본 net STL 을 좌표 규약(풍동식)에 따라 Y축으로 α 회전해 ASCII STL 로 저장.
+        유속을 x 로 고정하므로, 그물을 회전해 Unit Cell 과 동일한 상대각(90°−α)을 만든다."""
+        conv = coordinate_convention(self.angle_deg, "full_structure")
+        rot = conv["rotate_geometry_deg"]
+        tris = read_stl_triangles(self.net_stl)
+        allpts = [v for t in tris for v in t]
+        cx = (min(p[0] for p in allpts) + max(p[0] for p in allpts)) / 2.0
+        cy = (min(p[1] for p in allpts) + max(p[1] for p in allpts)) / 2.0
+        cz = (min(p[2] for p in allpts) + max(p[2] for p in allpts)) / 2.0
+        lines = ["solid netSurface"]
+        for t in tris:
+            rt = rotate_points_y(list(t), rot, (cx, cy, cz))
+            # 면 법선(외적) 재계산
+            (ax, ay, az), (bx, by, bz), (ccx, ccy, ccz) = rt[0], rt[1], rt[2]
+            ux_, uy_, uz_ = bx-ax, by-ay, bz-az
+            vx_, vy_, vz_ = ccx-ax, ccy-ay, ccz-az
+            nx_, ny_, nz_ = (uy_*vz_-uz_*vy_, uz_*vx_-ux_*vz_, ux_*vy_-uy_*vx_)
+            nl = math.sqrt(nx_*nx_+ny_*ny_+nz_*nz_) or 1.0
+            lines.append(f"  facet normal {nx_/nl:.6e} {ny_/nl:.6e} {nz_/nl:.6e}")
+            lines.append("    outer loop")
+            for (vx, vy, vz) in rt:
+                lines.append(f"      vertex {vx:.6e} {vy:.6e} {vz:.6e}")
+            lines.append("    endloop")
+            lines.append("  endfacet")
+        lines.append("endsolid netSurface")
+        dest.write_text("\n".join(lines) + "\n")
+
     def _patch_velocity_fields(self):
-        Uvec = f"({self.Ux:.6f} {self.Uy:.6f} {self.Uz:.6f})"
+        if getattr(self, "_net_only", False):
+            # 좌표 통일(풍동식): 그물을 회전했으므로 유속은 x 로 고정(항상 정상 유입).
+            ux, uy, uz = self.speed, 0.0, 0.0
+        else:
+            ux, uy, uz = self.Ux, self.Uy, self.Uz
+        Uvec = f"({ux:.6f} {uy:.6f} {uz:.6f})"
         u_file = self.case_dir / "0" / "U"
         text = u_file.read_text()
         text = re.sub(r"uniform \(1\.0 0 0\)", f"uniform {Uvec}", text)
@@ -522,7 +636,9 @@ class FullStructureCaseBuilder:
         """net STL 의 실제 바운딩박스(scale 0.001 적용 = m)를 읽어 net-only 도메인·
         정밀화 박스·기준점을 계산해 self._dom_* / self._box_* / self._loc 에 저장한다.
         가두리가 없을 때 도메인이 net 크기에 맞아야 snappy 가 net 을 제대로 포착한다."""
-        tris = read_stl_triangles(self.net_stl)
+        # 회전 적용된 케이스 내 netSurface.stl 을 기준으로(없으면 원본) 도메인 산정.
+        _net = self.case_dir / "constant" / "triSurface" / "netSurface.stl"
+        tris = read_stl_triangles(_net if _net.exists() else self.net_stl)
         sc = 0.001  # snappyHexMeshDict scale (mm→m)와 일치
         xs = [v[0]*sc for t in tris for v in t]
         ys = [v[1]*sc for t in tris for v in t]

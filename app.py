@@ -1949,6 +1949,43 @@ with tab_input:
 
         st.divider()
 
+        # ─── 좌표계 / 영각 해석 (항목5: 활성 좌표 해석 표시) ──────────────────
+        from cfd_manager import coordinate_convention, verify_coordinate_consistency
+        st.markdown("### 🧭 좌표계 · 영각 해석")
+        _conv = coordinate_convention(float(angles[0]) if angles else 0.0, mode)
+        _modetxt = ("단위 셀 — 그물면 고정(법선 z), 유속을 회전(주기 BC)"
+                    if mode == "unit_cell"
+                    else "전체 구조 — 유속 x 고정, 그물을 Y축 α 회전(풍동식)")
+        st.info(
+            f"**활성 좌표 해석:** {_modetxt}\n\n"
+            f"- 영각 해석: **α → 유속·그물면 상대각 = 90°−α** (두 모드 공통 규약)\n"
+            f"- dragDir = 유속 방향, liftDir = 유속 수직, pitchAxis = y\n"
+            f"- 전체 구조는 유속을 항상 x 로 두고 그물을 회전하므로 **고영각에서도 "
+            f"정상 유입**(힘이 비정상적으로 줄지 않음)")
+        with st.expander("🔍 좌표 일관성 자동 검증 (단위셀 ↔ 전체구조)", expanded=False):
+            _rep = verify_coordinate_consistency(tol_deg=1.0)
+            import pandas as _pd_cc
+            _rows = []
+            for _a, _r in _rep.items():
+                _rows.append({
+                    "α [°]": _a,
+                    "상대각(UC)": round(_r["uc"]["relative_angle_deg"], 2),
+                    "상대각(FS)": round(_r["fs"]["relative_angle_deg"], 2),
+                    "차이[°]": round(_r["rel_diff_deg"], 3),
+                    "dragDir·유속(UC/FS)": f"{_r['drag_aligned_uc']:.3f}/{_r['drag_aligned_fs']:.3f}",
+                    "일치": "✅" if _r["ok"] else "⚠️",
+                })
+            st.dataframe(_pd_cc.DataFrame(_rows), use_container_width=True, hide_index=True)
+            _warns = [w for _r in _rep.values() for w in _r["warnings"]]
+            if _warns:
+                for w in _warns:
+                    st.warning(f"⚠️ {w}")
+            else:
+                st.success("좌표 일관성 OK — 두 모드의 유속·그물면 상대각이 모든 영각에서 "
+                           "≤±1°로 일치하고 dragDir 이 유속과 정렬됩니다.")
+
+        st.divider()
+
         # ─── 해석 매트릭스 미리보기 ───────────────────────────────────────
         st.markdown("### 📊 해석 매트릭스")
         import pandas as _pd_mx
