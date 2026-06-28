@@ -174,12 +174,81 @@ class CFDVisualizer:
         "nut":   {"label": "난류 점성계수 νt",      "cmap": "viridis",   "component": "scalar"},
     }
 
-    def __init__(self, case_dir: Path, window_size: Tuple[int,int] = (900, 600)):
+    def __init__(self, case_dir: Path, window_size: Tuple[int,int] = (900, 600),
+                 mode: Optional[str] = None, angle_deg: Optional[float] = None):
         self.case_dir    = Path(case_dir)
         self.window_size = window_size
         self.reader      = OpenFOAMResultReader(case_dir)
         self._mesh_cache = None
         self._cache_time = 0
+        # 통일 표시 좌표계: 솔버→표시 회전행렬 R(모드/영각 자동 감지, 미검출 시 변환 생략).
+        # 메시·STL·벡터장을 R 로 회전해 두 모드를 동일 프레임(그물 Y-Z, 유속 X-Y)으로 표시.
+        self.mode, self.angle_deg = self._detect_mode_angle(mode, angle_deg)
+        self._disp_R = self._compute_display_R()
+        self._disp_M = None        # 4×4(중심 기준 회전), _apply_display_frame 에서 설정
+        self._disp_center = None
+
+    def _detect_mode_angle(self, mode, angle_deg):
+        """케이스 경로/이름에서 모드와 영각을 감지(인자가 주어지면 우선)."""
+        s = str(self.case_dir).lower()
+        if mode is None:
+            if "full_structure" in s:
+                mode = "full_structure"
+            elif "unit_cell" in s:
+                mode = "unit_cell"
+        if angle_deg is None:
+            m = re.search(r"_a(\d+(?:\.\d+)?)", self.case_dir.name.lower())
+            if m:
+                try:
+                    angle_deg = float(m.group(1))
+                except ValueError:
+                    angle_deg = None
+        return mode, angle_deg
+
+    def _compute_display_R(self):
+        """모드/영각 기반 솔버→표시 회전행렬(3×3). 미검출 시 None(변환 생략)."""
+        if self.mode not in ("unit_cell", "full_structure"):
+            return None
+        ang = self.angle_deg if self.angle_deg is not None else 0.0
+        try:
+            from cfd_manager import solver_to_display_rotation
+            return solver_to_display_rotation(self.mode, ang)
+        except Exception:
+            return None
+
+    def _mesh_center(self, mesh):
+        try:
+            internal = (mesh["internalMesh"] if mesh is not None
+                        and "internalMesh" in mesh.keys() else None)
+            b = internal.bounds if internal is not None else mesh.bounds
+            return ((b[0]+b[1])/2.0, (b[2]+b[3])/2.0, (b[4]+b[5])/2.0)
+        except Exception:
+            return (0.0, 0.0, 0.0)
+
+    def _apply_display_frame(self, mesh):
+        """로드한 메시(MultiBlock)를 통일 표시 프레임으로 회전(중심 기준, 벡터장 포함).
+        실패 시 원본을 그대로 반환(안전 강등)."""
+        if self._disp_R is None or mesh is None:
+            return mesh
+        try:
+            c = np.asarray(self._mesh_center(mesh), float)
+            M = np.eye(4)
+            M[:3, :3] = np.asarray(self._disp_R, float)
+            M[:3, 3] = c - M[:3, :3] @ c       # 중심 기준 회전
+            self._disp_M = M
+            self._disp_center = c
+            for key in list(mesh.keys()):
+                blk = mesh[key]
+                if blk is None:
+                    continue
+                try:
+                    mesh[key] = blk.transform(
+                        M, transform_all_input_vectors=True, inplace=False)
+                except TypeError:
+                    mesh[key] = blk.transform(M, inplace=False)
+        except Exception as _e:
+            logger.warning(f"표시 프레임 변환 실패(원본 사용): {_e}")
+        return mesh
 
     # ─── 메인 렌더 함수 ───────────────────────────────────────────────────
 
@@ -540,7 +609,8 @@ class CFDVisualizer:
         """메시 캐시 관리 (30초 캐시)"""
         now = time.time()
         if self._mesh_cache is None or (now - self._cache_time) > max_cache_age:
-            self._mesh_cache = self.reader.load_openfoam_mesh()
+            _m = self.reader.load_openfoam_mesh()
+            self._mesh_cache = self._apply_display_frame(_m)
             self._cache_time = now
         return self._mesh_cache
 
@@ -939,17 +1009,25 @@ class CFDVisualizer:
                 mt = m.triangulate()
                 pp = np.asarray(mt.points, float)
                 pf = mt.faces.reshape(-1, 4)[:, 1:]
-                # 단위 스케일 자동 보정(예: mm→m) + 중심 정렬
+                # 단위 스케일 자동 보정(예: mm→m) + 중심 정렬.
+                # 스케일은 바운딩박스 '대각선'(회전 불변)으로 산정 → 표시 프레임
+                # 회전을 적용해도 왜곡 없이 메시와 일관되게 정렬된다.
                 if mb is not None:
                     sb = m.bounds
-                    sx = sb[1] - sb[0]; mx = mb[1] - mb[0]
-                    sc = (mx / sx) if sx > 1e-12 else 1.0
-                    if abs(sc - 1.0) > 0.05:
-                        s_ctr = np.array([(sb[0]+sb[1])/2, (sb[2]+sb[3])/2,
-                                          (sb[4]+sb[5])/2])
-                        m_ctr = np.array([(mb[0]+mb[1])/2, (mb[2]+mb[3])/2,
-                                          (mb[4]+mb[5])/2])
-                        pp = (pp - s_ctr) * sc + m_ctr
+                    sdiag = math.sqrt((sb[1]-sb[0])**2 + (sb[3]-sb[2])**2
+                                      + (sb[5]-sb[4])**2)
+                    mdiag = math.sqrt((mb[1]-mb[0])**2 + (mb[3]-mb[2])**2
+                                      + (mb[5]-mb[4])**2)
+                    sc = (mdiag / sdiag) if sdiag > 1e-12 else 1.0
+                    s_ctr = np.array([(sb[0]+sb[1])/2, (sb[2]+sb[3])/2,
+                                      (sb[4]+sb[5])/2])
+                    m_ctr = np.array([(mb[0]+mb[1])/2, (mb[2]+mb[3])/2,
+                                      (mb[4]+mb[5])/2])
+                    pp = (pp - s_ctr) * sc + m_ctr
+                    # 통일 표시 프레임 회전(메시와 동일: 중심 기준 R 적용)
+                    if getattr(self, "_disp_M", None) is not None:
+                        _R = np.asarray(self._disp_M[:3, :3], float)
+                        pp = (pp - m_ctr) @ _R.T + m_ctr
                 for (ox, oy) in offsets:
                     out.append(go.Mesh3d(
                         x=pp[:, 0]+ox, y=pp[:, 1]+oy, z=pp[:, 2],
