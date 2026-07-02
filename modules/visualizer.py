@@ -1001,6 +1001,25 @@ class CFDVisualizer:
         internal = (mesh["internalMesh"] if mesh is not None
                     and "internalMesh" in mesh.keys() else None)
         mb = internal.bounds if internal is not None else None
+        boundary = (mesh["boundary"] if mesh is not None
+                    and "boundary" in mesh.keys() else None)
+
+        def _patch_bounds(stem):
+            """STL 파일명(stem)과 같은 이름의 경계 패치 bounds(표시 프레임).
+            snappyHexMesh 가 STL 이름으로 벽 패치를 만들므로(netSurface.stl →
+            netSurface) 이 패치가 형상의 실제 위치·크기의 기준이 된다."""
+            if boundary is None:
+                return None
+            try:
+                for k in boundary.keys():
+                    if k.lower() == stem.lower():
+                        p = boundary[k]
+                        if p is not None and p.n_points > 0:
+                            return p.bounds
+            except Exception:
+                pass
+            return None
+
         for stl in sorted(tri_dir.glob("*.stl")):
             try:
                 m = pv.read(str(stl))
@@ -1009,18 +1028,34 @@ class CFDVisualizer:
                 mt = m.triangulate()
                 pp = np.asarray(mt.points, float)
                 pf = mt.faces.reshape(-1, 4)[:, 1:]
-                # 단위 스케일 자동 보정(예: mm→m) + 중심 정렬.
-                # 스케일은 바운딩박스 '대각선'(회전 불변)으로 산정 → 표시 프레임
-                # 회전을 적용해도 왜곡 없이 메시와 일관되게 정렬된다.
-                if mb is not None:
-                    sb = m.bounds
-                    sdiag = math.sqrt((sb[1]-sb[0])**2 + (sb[3]-sb[2])**2
-                                      + (sb[5]-sb[4])**2)
+                sb = m.bounds
+                sdiag = math.sqrt((sb[1]-sb[0])**2 + (sb[3]-sb[2])**2
+                                  + (sb[5]-sb[4])**2)
+                s_ctr = np.array([(sb[0]+sb[1])/2, (sb[2]+sb[3])/2,
+                                  (sb[4]+sb[5])/2])
+                pb = _patch_bounds(stl.stem)
+                if pb is not None:
+                    # 1순위: 같은 이름의 메시 경계 패치에 정합 — 도메인 크기와
+                    # 무관하게 실제 형상 위치·스케일과 일치(전체구조의 대형·비대칭
+                    # 도메인에서도 정확). 패치는 이미 표시 프레임이므로 STL 을
+                    # 자기 중심 기준 R 회전 후 패치 중심에 배치한다.
+                    pdiag = math.sqrt((pb[1]-pb[0])**2 + (pb[3]-pb[2])**2
+                                      + (pb[5]-pb[4])**2)
+                    sc = (pdiag / sdiag) if sdiag > 1e-12 else 1.0
+                    p_ctr = np.array([(pb[0]+pb[1])/2, (pb[2]+pb[3])/2,
+                                      (pb[4]+pb[5])/2])
+                    pp = (pp - s_ctr) * sc
+                    if getattr(self, "_disp_M", None) is not None:
+                        _R = np.asarray(self._disp_M[:3, :3], float)
+                        pp = pp @ _R.T
+                    pp = pp + p_ctr
+                elif mb is not None:
+                    # 폴백(패치 미검출): 종전 휴리스틱 — 단위 스케일 자동 보정
+                    # (예: mm→m) + 도메인 중심 정렬. 스케일은 바운딩박스
+                    # '대각선'(회전 불변)으로 산정.
                     mdiag = math.sqrt((mb[1]-mb[0])**2 + (mb[3]-mb[2])**2
                                       + (mb[5]-mb[4])**2)
                     sc = (mdiag / sdiag) if sdiag > 1e-12 else 1.0
-                    s_ctr = np.array([(sb[0]+sb[1])/2, (sb[2]+sb[3])/2,
-                                      (sb[4]+sb[5])/2])
                     m_ctr = np.array([(mb[0]+mb[1])/2, (mb[2]+mb[3])/2,
                                       (mb[4]+mb[5])/2])
                     pp = (pp - s_ctr) * sc + m_ctr
@@ -1119,6 +1154,64 @@ class CFDVisualizer:
             )
         return scene
 
+    def _focus_grid(self, mesh, b, ex):
+        """입체/등치면 리샘플용 '형상 집중' 비균일 rectilinear 격자.
+
+        고정 예산의 균일 격자는 전체구조처럼 도메인(≈1m)이 형상(≈0.1m)보다 훨씬
+        클 때 복셀이 ~25mm 로 굵어져, 등치면이 물리와 무관한 각진 덩어리(마칭큐브
+        앨리어싱)로 나온다. 도메인 경계에 닿지 않는 벽 패치(netSurface 등)를
+        관심영역으로 삼아 그 주변(+하류 후류 연장)에 격자를 집중(~10mm 이하)하고
+        원방(자유류, |U| 균일)은 성기게 둔다.
+        내부 패치 미검출/형상이 도메인 대부분이면 None(종전 균일 격자 폴백)."""
+        import pyvista as pv
+        boundary = (mesh["boundary"] if mesh is not None
+                    and "boundary" in mesh.keys() else None)
+        if boundary is None:
+            return None
+        diag = math.sqrt(ex[0]**2 + ex[1]**2 + ex[2]**2)
+        tol = 1e-3 * diag
+        lo = np.array([b[0], b[2], b[4]], float)
+        hi = np.array([b[1], b[3], b[5]], float)
+        fb_lo = fb_hi = None
+        for k in boundary.keys():
+            try:
+                p = boundary[k]
+                if p is None or p.n_points == 0:
+                    continue
+                pb = p.bounds
+            except Exception:
+                continue
+            plo = np.array([pb[0], pb[2], pb[4]], float)
+            phi = np.array([pb[1], pb[3], pb[5]], float)
+            # 도메인 경계에 닿지 않는 패치 = 내부 장애물(그물/가두리)
+            if (plo > lo + tol).all() and (phi < hi - tol).all():
+                fb_lo = plo if fb_lo is None else np.minimum(fb_lo, plo)
+                fb_hi = phi if fb_hi is None else np.maximum(fb_hi, phi)
+        if fb_lo is None:
+            return None
+        L = float(np.linalg.norm(fb_hi - fb_lo))
+        if L < 1e-9 or L > 0.7 * diag:   # 형상이 도메인 대부분이면 균일로 충분
+            return None
+        # 표시 프레임 유동방향 d(AoA): 하류(후류) 3L·상류 1L·측방 0.5L 연장
+        aa = math.radians(self.angle_deg if self.angle_deg is not None else 90.0)
+        d = np.array([math.sin(aa), -math.cos(aa), 0.0])
+        dpos, dneg = np.maximum(0.0, d), np.maximum(0.0, -d)
+        flo = np.maximum(fb_lo - L*(0.5 + 1.0*dpos + 3.0*dneg), lo)
+        fhi = np.minimum(fb_hi + L*(0.5 + 3.0*dpos + 1.0*dneg), hi)
+        fex = np.maximum(fhi - flo, 1e-9)
+        h = (float(np.prod(fex)) / 100000.0) ** (1.0/3.0)   # 세밀부 ~10만 점
+        axes = []
+        for i in range(3):
+            h_ax = max(h, float(fex[i]) / 100.0)   # 축당 세밀 노드 ≤ ~100
+            n = max(8, int(round(float(fex[i]) / h_ax)) + 1)
+            fine = np.linspace(flo[i], fhi[i], n)
+            pre = (np.linspace(lo[i], flo[i], 7, endpoint=False)
+                   if flo[i] - lo[i] > tol else np.empty(0))
+            post = (np.linspace(fhi[i], hi[i], 8)[1:]
+                    if hi[i] - fhi[i] > tol else np.empty(0))
+            axes.append(np.concatenate([pre, fine, post]))
+        return pv.RectilinearGrid(axes[0], axes[1], axes[2])
+
     def render_field_3d(self, field: str = "U", level: Optional[float] = None,
                         level_frac: Optional[float] = None,
                         anim: Optional[str] = None,
@@ -1152,18 +1245,31 @@ class CFDVisualizer:
             b = internal.bounds
             ex = [max(b[1]-b[0], 1e-9), max(b[3]-b[2], 1e-9), max(b[5]-b[4], 1e-9)]
             # 내부 메시 점 전체를 그대로 넘기면 figure가 수백 MB가 되어 웹소켓
-            # 한도를 초과한다. 도메인 비율에 맞춘 '거친 균일 격자'(~4.5만 점)로
-            # 리샘플해 데이터량을 수 MB로 제한한다.
-            _budget = 45000
-            _scale = (_budget / (ex[0]*ex[1]*ex[2])) ** (1.0/3.0)
-            _dims = [max(6, min(110, int(round(e*_scale)))) for e in ex]
-            grid = pv.ImageData()
-            grid.dimensions = _dims
-            grid.origin = (b[0], b[2], b[4])
-            grid.spacing = (ex[0]/max(1, _dims[0]-1),
-                            ex[1]/max(1, _dims[1]-1),
-                            ex[2]/max(1, _dims[2]-1))
-            sampled = grid.sample(internal)
+            # 한도를 초과한다. 형상(그물) 주변 집중 비균일 격자(_focus_grid)로
+            # 리샘플하고, 미적용 시 도메인 비율 균일 격자(~4.5만 점) 폴백.
+            # 리샘플은 필드 무관(전 필드 포함)이라 메시 캐시와 같은 수명으로 캐시.
+            sampled = None
+            _rs = getattr(self, "_rs_cache", None)
+            if _rs is not None and _rs[0] == self._cache_time:
+                sampled = _rs[1]
+            if sampled is None:
+                grid = None
+                try:
+                    grid = self._focus_grid(mesh, b, ex)
+                except Exception as _e:
+                    logger.warning(f"형상 집중 격자 생성 실패(균일 폴백): {_e}")
+                if grid is None:
+                    _budget = 45000
+                    _scale = (_budget / (ex[0]*ex[1]*ex[2])) ** (1.0/3.0)
+                    _dims = [max(6, min(110, int(round(e*_scale)))) for e in ex]
+                    grid = pv.ImageData()
+                    grid.dimensions = _dims
+                    grid.origin = (b[0], b[2], b[4])
+                    grid.spacing = (ex[0]/max(1, _dims[0]-1),
+                                    ex[1]/max(1, _dims[1]-1),
+                                    ex[2]/max(1, _dims[2]-1))
+                sampled = grid.sample(internal)
+                self._rs_cache = (self._cache_time, sampled)
             if field not in sampled.array_names:
                 return None
             arr = sampled[field]
