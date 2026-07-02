@@ -2454,6 +2454,11 @@ with tab_results:
                         f"{_r1_field}"
                     )
 
+                    # v11 항목2: Pan 버튼 제거 — 커서 중심 휠 줌(JS) + 우클릭
+                    # 팬(네이티브)로 대체. 버튼식 dragmode 전환이 카메라를
+                    # 리셋시키는 plotly gl3d 문제의 원천도 함께 제거된다.
+                    _fig_r1.update_layout(modebar=dict(remove=["pan3d"]))
+
                     st.plotly_chart(
                         _fig_r1,
                         use_container_width=True,
@@ -2533,6 +2538,8 @@ with tab_results:
   function restore(gd){
     var p=PL();if(!p||!W.__camStore)return;
     gd.__animUntil=Date.now()+500;
+    // v11: 프로그램적 relayout 이 유발하는 afterplot 을 무시(연쇄 복원 차단)
+    gd.__apGuard=Date.now()+900;
     try{p.relayout(gd,{'scene.camera':W.__camStore})['catch'](function(){});}
     catch(e){}
   }
@@ -2543,17 +2550,113 @@ with tab_results:
       gd.removeListener('plotly_animated',gd.__camH.ad);
       gd.removeListener('plotly_sliderchange',gd.__camH.sc);
       gd.removeListener('plotly_buttonclicked',gd.__camH.bc);
+      gd.removeListener('plotly_relayout',gd.__camH.rl);
+      gd.removeListener('plotly_afterplot',gd.__camH.ap);
     }catch(e){}}
     var gate=function(){gd.__animUntil=Date.now()+700;};
     var af=function(){restore(gd);};
     var ad=function(){restore(gd);gd.__animUntil=Date.now()+300;};
     var sc=function(){gate();restore(gd);};
-    var bc=function(){gate();};
-    gd.__camH={af:af,ad:ad,sc:sc,bc:bc};
+    // v11 항목1: 모드바 버튼(dragmode 전환 등)이 gl3d 카메라를 기본값으로
+    // 리셋하는 문제 — 버튼 클릭 직후 저장 카메라를 재적용해 팬·회전·줌이
+    // 서로를 리셋하지 않게 한다. 단 'reset camera' 계열 버튼은 사용자 의도가
+    // 리셋이므로 저장소를 비워 초기 뷰로 돌아가게 둔다.
+    var bc=function(ev){
+      gate();
+      var n=(ev&&ev.button&&ev.button.attr)||'';
+      if(String(n).indexOf('resetCamera')>=0){W.__camStore=null;return;}
+      W.setTimeout(function(){restore(gd);},60);
+      W.setTimeout(function(){restore(gd);},250);
+    };
+    // v11 항목1: 사용자 드래그(회전·팬) 종료 시 plotly 가 scene.camera 를
+    // relayout 으로 확정 → 그 즉시 저장(폴링 '2회 안정' 대기의 빈틈 제거).
+    var rl=function(ev){
+      try{
+        if(ev&&ev['scene.camera']){
+          W.__camStore=clone(ev['scene.camera']);
+          gd.__apGuard=Date.now()+400;   // 방금의 사용자 조작 — 복원 불필요
+        }
+      }catch(e){}
+    };
+    // Streamlit 리런(Plotly.react)이 uirevision 보존에 실패(gl3d flaky)해도
+    // afterplot 직후 저장 카메라로 복원. 단 restore()/사용자 드래그가 유발한
+    // afterplot 은 __apGuard 로 무시 — 복원 연쇄(스톰) 방지.
+    var ap=function(){
+      var now=Date.now();
+      if(now<(gd.__apGuard||0))return;
+      if(!W.__camStore)return;
+      gd.__apGuard=now+900;
+      gate();
+      W.setTimeout(function(){restore(gd);},30);
+    };
+    gd.__camH={af:af,ad:ad,sc:sc,bc:bc,rl:rl,ap:ap};
     gd.on('plotly_animatingframe',af);
     gd.on('plotly_animated',ad);
     gd.on('plotly_sliderchange',sc);
     gd.on('plotly_buttonclicked',bc);
+    gd.on('plotly_relayout',rl);
+    gd.on('plotly_afterplot',ap);
+  }
+
+  // ── v11 항목2: Rhino 식 커서 중심 휠 줌 ────────────────────────────────
+  // 기본 plotly 휠 줌(화면 중심 기준)을 가로채, 커서 아래 지점이 화면에
+  // 고정되도록 eye 와 center 를 함께 이동한다. 회전·팬과 같은 카메라 변환에
+  // 누적되며 즉시 __camStore 에 저장된다.
+  function attachWheel(gd){
+    if(gd.__wheelH){try{
+      gd.removeEventListener('wheel',gd.__wheelH,{capture:true});}catch(e){}}
+    var V={sub:function(a,b){return [a[0]-b[0],a[1]-b[1],a[2]-b[2]];},
+           add:function(a,b){return [a[0]+b[0],a[1]+b[1],a[2]+b[2]];},
+           mul:function(a,s){return [a[0]*s,a[1]*s,a[2]*s];},
+           crs:function(a,b){return [a[1]*b[2]-a[2]*b[1],
+                                     a[2]*b[0]-a[0]*b[2],
+                                     a[0]*b[1]-a[1]*b[0]];},
+           len:function(a){return Math.sqrt(a[0]*a[0]+a[1]*a[1]+a[2]*a[2]);},
+           nrm:function(a){var l=V.len(a)||1;return [a[0]/l,a[1]/l,a[2]/l];}};
+    var pend=null,raf=false;
+    function apply(){
+      raf=false;
+      if(!pend)return;
+      var p=PL();
+      var s=gd._fullLayout&&gd._fullLayout.scene;
+      if(!p||!s||!s._scene){pend=null;return;}
+      var cam=s._scene.getCamera();
+      var E=[cam.eye.x,cam.eye.y,cam.eye.z];
+      var C=[cam.center.x,cam.center.y,cam.center.z];
+      var U=[cam.up.x,cam.up.y,cam.up.z];
+      var f=pend.f,nx=pend.nx,ny=pend.ny,ar=pend.ar;pend=null;
+      var D=V.sub(E,C),dist=V.len(D);
+      if(dist<1e-9)return;
+      var fwd=V.nrm(V.mul(D,-1));
+      var right=V.nrm(V.crs(fwd,U));
+      var upv=V.crs(right,fwd);
+      // 커서 방향의 중심평면상 목표점 T (fov 45° 가정 — 검증으로 보정치 확인)
+      var t=Math.tan(22.5*Math.PI/180);
+      var T=V.add(C,V.add(V.mul(right,nx*t*dist*ar),V.mul(upv,ny*t*dist)));
+      var C2=V.add(T,V.mul(V.sub(C,T),f));
+      var E2=V.add(C2,V.mul(D,f));
+      var nc={eye:{x:E2[0],y:E2[1],z:E2[2]},
+              center:{x:C2[0],y:C2[1],z:C2[2]},up:cam.up};
+      W.__camStore=clone(nc);
+      gd.__animUntil=Date.now()+250;   // 폴링이 중간값을 저장하지 않게
+      try{p.relayout(gd,{'scene.camera':nc})['catch'](function(){});}catch(e){}
+    }
+    var h=function(ev){
+      var s=gd._fullLayout&&gd._fullLayout.scene;
+      if(!s||!s._scene)return;
+      ev.preventDefault();ev.stopImmediatePropagation();
+      var cv=gd.querySelector('canvas');
+      var r=(cv||gd).getBoundingClientRect();
+      if(r.width<2||r.height<2)return;
+      var nx=((ev.clientX-r.left)/r.width)*2-1;
+      var ny=-(((ev.clientY-r.top)/r.height)*2-1);
+      var step=Math.exp((ev.deltaY>0?1:-1)*0.14);   // 아래로=축소(f>1)
+      if(pend){pend.f*=step;pend.nx=nx;pend.ny=ny;}
+      else{pend={f:step,nx:nx,ny:ny,ar:r.width/r.height};}
+      if(!raf){raf=true;W.requestAnimationFrame(apply);}
+    };
+    gd.addEventListener('wheel',h,{capture:true,passive:false});
+    gd.__wheelH=h;
   }
 
   // 단일 영속 루프(부모 윈도우 타이머 — 0-height iframe 로컬 타이머는 throttle 됨)
@@ -2565,6 +2668,7 @@ with tab_results:
       // 원소 교체(리런/모드전환/축변경) → 재-attach + 저장 카메라 복원
       W.__camGd=gd;W.__camPrevPoll=null;
       attachHandlers(gd);
+      attachWheel(gd);
       restore(gd);
       // 늦은 Plotly.react 기본값 덮어쓰기 대비 재복원(부모 타이머 — throttle 회피)
       W.setTimeout(function(){restore(gd);},150);

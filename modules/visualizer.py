@@ -899,12 +899,15 @@ class CFDVisualizer:
                     ) for _fi, f in enumerate(fig.frames)],
                 )]
 
-            # 씬 범위를 타일링된 XY 크기 기준으로 설정한다.
-            # Z 도메인 길이를 포함하면 씬이 너무 넓어져 단위셀 그물망이 작게 보이므로
-            # XY 크기만 사용해 그물망이 씬의 ~50%를 채우도록 한다.
-            tiled_cx = cx + (tile_nx - 1) * dx / 2.0
-            tiled_cy = cy + (tile_ny - 1) * dy / 2.0
-            _half = max(tile_nx * dx, tile_ny * dy, 1e-6)
+            # v11 항목3: 씬 범위를 관심영역(형상+후류) 중심으로 — 해석 대상이
+            # 열자마자 화면 중앙에 크게 보이도록 한다(수동 이동 불필요).
+            _vc, _vh = self._view_box(bounds)
+            tiled_cx = _vc[0] + (tile_nx - 1) * dx / 2.0
+            tiled_cy = _vc[1] + (tile_ny - 1) * dy / 2.0
+            cz = _vc[2]
+            _half = max(_vh,
+                        (tile_nx * dx / 2.0) if tile_nx > 1 else 0.0,
+                        (tile_ny * dy / 2.0) if tile_ny > 1 else 0.0, 1e-6)
 
             # 항목1: 슬라이스 모드는 배경 패널(박스 3면)을 끄고 단일 슬라이스만 표시.
             # 항목2: 축 제목·눈금 글자를 검정으로, 단위[m] 포함.
@@ -1110,6 +1113,52 @@ class CFDVisualizer:
             return self._stl_traces(go, offsets, opacity=opacity)
         return out
 
+    def _view_box(self, bounds):
+        """v11 항목3: 초기 뷰 박스 — 관심영역(형상+후류) 중심과 반경.
+
+        내부 장애물 패치 기반 _focus_box 가 있으면 그 중심·크기(×1.15 여유)를,
+        없으면 도메인 전체를 사용한다. 전체구조처럼 도메인이 형상보다 훨씬 클 때
+        해석 대상이 화면 중앙에 크게 보이도록 한다."""
+        ex = [max(bounds[1]-bounds[0], 1e-9), max(bounds[3]-bounds[2], 1e-9),
+              max(bounds[5]-bounds[4], 1e-9)]
+        c = np.array([(bounds[0]+bounds[1])/2.0, (bounds[2]+bounds[3])/2.0,
+                      (bounds[4]+bounds[5])/2.0])
+        half = max(ex) / 2.0
+        # 내부 장애물(그물) 패치 bbox 를 '물체 중심'으로 사용, 뷰 크기는 물체의
+        # ~3.2배(후류 일부 포함, 물체가 화면의 ~1/3 차지). 커서 중심 줌으로
+        # 원방 확인은 쉬우므로 초기값은 물체 가시성을 우선한다.
+        try:
+            mesh = self._mesh_cache
+            boundary = (mesh["boundary"] if mesh is not None
+                        and "boundary" in mesh.keys() else None)
+            if boundary is not None:
+                diag = math.sqrt(ex[0]**2 + ex[1]**2 + ex[2]**2)
+                tol = 1e-3 * diag
+                lo = np.array([bounds[0], bounds[2], bounds[4]], float)
+                hi = np.array([bounds[1], bounds[3], bounds[5]], float)
+                blo = bhi = None
+                for k in boundary.keys():
+                    try:
+                        p = boundary[k]
+                        if p is None or p.n_points == 0:
+                            continue
+                        pb = p.bounds
+                    except Exception:
+                        continue
+                    plo = np.array([pb[0], pb[2], pb[4]], float)
+                    phi = np.array([pb[1], pb[3], pb[5]], float)
+                    if (plo > lo + tol).all() and (phi < hi - tol).all():
+                        blo = plo if blo is None else np.minimum(blo, plo)
+                        bhi = phi if bhi is None else np.maximum(bhi, phi)
+                if blo is not None:
+                    L = float(np.max(bhi - blo))
+                    if L > 1e-9:
+                        c = (blo + bhi) / 2.0
+                        half = min(1.6 * L, max(ex) / 2.0)
+        except Exception:
+            pass
+        return c, max(half, 1e-6)
+
     def _iso_scene(self, go, bounds, tile_nx, tile_ny, dx, dy,
                    init_camera=True, anim=None):
         """등치면·입체 뷰의 scene(축·카메라) 레이아웃.
@@ -1117,10 +1166,14 @@ class CFDVisualizer:
         uirevision='flowfield' 고정으로 슬라이스·등치면 모드 전환 시 카메라 보존.
         등치면 스윕 재생 중 카메라 복원은 JS iframe 핸들러(plotly_buttonclicked)가 담당.
         """
-        cx = (bounds[0]+bounds[1])/2 + (tile_nx-1)*dx/2.0
-        cy = (bounds[2]+bounds[3])/2 + (tile_ny-1)*dy/2.0
-        cz = (bounds[4]+bounds[5])/2
-        _half = max(tile_nx*dx, tile_ny*dy, 1e-6)
+        # v11 항목3: 관심영역(형상+후류) 중심 초기 뷰 — 대상이 화면 중앙에 크게.
+        _vc, _vh = self._view_box(bounds)
+        cx = _vc[0] + (tile_nx-1)*dx/2.0
+        cy = _vc[1] + (tile_ny-1)*dy/2.0
+        cz = _vc[2]
+        _half = max(_vh,
+                    (tile_nx*dx/2.0) if tile_nx > 1 else 0.0,
+                    (tile_ny*dy/2.0) if tile_ny > 1 else 0.0, 1e-6)
         # 항목1/일관성: 배경 패널(박스 면) 제거. 항목2: 축 글자 검정·단위[m].
         _axttl = dict(color="black", size=12)
         _axtck = dict(color="black", size=10)
@@ -1249,12 +1302,11 @@ class CFDVisualizer:
                 return out
             aa = math.radians(float(ang))
             d = np.array([math.sin(aa), -math.cos(aa), 0.0])
-            ex = [max(bounds[1]-bounds[0], 1e-9), max(bounds[3]-bounds[2], 1e-9),
-                  max(bounds[5]-bounds[4], 1e-9)]
-            diag = math.sqrt(ex[0]**2 + ex[1]**2 + ex[2]**2)
-            c = np.array([(bounds[0]+bounds[1])/2.0, (bounds[2]+bounds[3])/2.0,
-                          bounds[5] + 0.10*ex[2]])
-            A = 0.20 * diag
+            # v11 항목3: 뷰 박스(관심영역) 기준 배치 — 초기 뷰가 물체 중심으로
+            # 좁아져도 화살표가 항상 시야 안(물체 상공)에 위치.
+            _vc, _vh = self._view_box(bounds)
+            c = np.array([_vc[0], _vc[1], _vc[2] + 0.72*_vh])
+            A = 0.55 * _vh
             p0, p1 = c - d*A, c            # 꼬리→머리(도메인 중심 상공)
             col = "#c8102e"
             out.append(go.Scatter3d(
@@ -1369,6 +1421,9 @@ class CFDVisualizer:
                 return None
             vmin, vmax = float(_valid.min()), float(_valid.max())
             vals = np.nan_to_num(vals, nan=vmin)
+            # v11 항목5: 표시 범위 0 ~ 최대(저속 영역 포함). 음수 가능한 필드(p)는
+            # 실제 최소 사용.
+            lo_disp = 0.0 if vmin >= 0.0 else vmin
             # go.Volume 은 z-fastest 격자 순서를 가정 → pyvista(x-fastest)를 변환
             ax_lin = [np.linspace(lo3[i], hi3[i], dims[i]) for i in range(3)]
             X, Y, Z = np.meshgrid(*ax_lin, indexing="ij")
@@ -1378,7 +1433,8 @@ class CFDVisualizer:
             fig = go.Figure()
             fig.add_trace(go.Volume(
                 x=X.ravel(), y=Y.ravel(), z=Z.ravel(), value=value,
-                isomin=vmin, isomax=vmax,
+                isomin=lo_disp, isomax=vmax,
+                cmin=lo_disp, cmax=vmax,
                 opacity=float(opacity), surface_count=int(surface_count),
                 colorscale=cmap,
                 caps=dict(x_show=False, y_show=False, z_show=False),
@@ -1486,28 +1542,11 @@ class CFDVisualizer:
             vmin, vmax = float(_valid.min()), float(_valid.max())
             if not (vmax > vmin):
                 vmax = vmin + 1e-6
-
-            # v10 항목2: 등치값을 '관심영역(형상 주변+후류) 값 분위수'로 선정 —
-            # 원방 자유류(값 균일)에 낭비되는 레벨 없이 형상 크기에 자동 적응.
-            _fvals = _valid
-            try:
-                _fb = self._focus_box(mesh, b, ex)
-                if _fb is not None:
-                    _in = ((pts[:, 0] >= _fb[0][0]) & (pts[:, 0] <= _fb[1][0]) &
-                           (pts[:, 1] >= _fb[0][1]) & (pts[:, 1] <= _fb[1][1]) &
-                           (pts[:, 2] >= _fb[0][2]) & (pts[:, 2] <= _fb[1][2]) &
-                           ~np.isnan(vals))
-                    if int(_in.sum()) > 100:
-                        _fvals = vals[_in]
-            except Exception:
-                pass
-
-            def _qlvl(f):
-                """관심영역 분위수 f 의 등치값(폴백: 전역 선형)."""
-                try:
-                    return float(np.quantile(_fvals, min(max(float(f), 0.0), 1.0)))
-                except Exception:
-                    return vmin + (vmax - vmin) * float(f)
+            # v11 항목4·5: 표시 범위는 항상 0 ~ 최대값 — 슬라이더·등치값·컬러맵이
+            # 전체 속도 분포(0 m/s 포함)를 나타내야 한다. (v10 의 관심영역 분위수
+            # 레벨은 FS 에서 0.899 부터 시작하는 문제를 유발해 폐기.)
+            lo_disp = 0.0 if vmin >= 0.0 else vmin   # |U| 등은 0, 압력 등은 실제 최소
+            cmin_disp = lo_disp
 
             dx, dy = ex[0], ex[1]
             tile_nx = max(1, int(tile_nx)); tile_ny = max(1, int(tile_ny))
@@ -1563,7 +1602,8 @@ class CFDVisualizer:
                 kw = dict(
                     x=cp[:, 0]+ox, y=cp[:, 1]+oy, z=cp[:, 2],
                     i=cf[:, 0], j=cf[:, 1], k=cf[:, 2],
-                    intensity=cintens, colorscale=cmap, cmin=vmin, cmax=vmax,
+                    intensity=cintens, colorscale=cmap,
+                    cmin=cmin_disp, cmax=vmax,   # v11 항목5: 컬러맵 0~최대
                     opacity=float(opacity), flatshading=False, showscale=first,
                     showlegend=False,
                     hovertemplate=f"{field}: %{{intensity:.4f}} {unit}<extra></extra>")
@@ -1582,12 +1622,17 @@ class CFDVisualizer:
                 # 등치값을 낮은→높은 |field|로 자동 스윕. 프레임마다 메시 지오메트리
                 # 전체를 교체(각 등치면 수천 점이라 경량). 등치값별 지오메트리는 1회만
                 # 계산해 타일끼리 재사용한다.
-                # v10 항목3: 레벨 수 3배(16→48) + 관심영역 분위수 적응 분포.
+                # v11 항목4: 슬라이더가 0 m/s ~ 최대값 전체 범위를 나타내도록
+                # 선형 레벨(레벨 수는 v10 의 3배 유지). 0 등치면은 벽면 자체라
+                # 빈 지오메트리(STL 만 표시)일 수 있으며 이는 물리적으로 옳다.
                 _nlv = max(2, min(int(n_frames) * 2, 48))
                 _lvls = np.unique(np.round(
-                    [_qlvl(f) for f in np.linspace(0.05, 0.985, _nlv)], 6))
+                    np.linspace(lo_disp, vmax, _nlv), 6))
                 _geoms = {float(lv): _contour_geom(lv) for lv in _lvls}
-                lv0 = float(_lvls[0])
+                # v11: 초기 표시는 중간 레벨 — 0 등치면(빈 지오메트리)으로 시작하면
+                # 화면이 비어 보인다. 슬라이더 active 도 동일 인덱스로 동기화.
+                _init_idx = len(_lvls) // 2
+                lv0 = float(_lvls[_init_idx])
                 first = True
                 for (ox, oy) in offsets:
                     fig.add_trace(_mesh(_geoms[lv0], ox, oy, first)); first = False
@@ -1605,8 +1650,9 @@ class CFDVisualizer:
                 if level is not None:
                     _lvls = [float(level)]
                 else:
-                    # v10 항목2: 관심영역 분위수 기반 3개 등치면(형상 적응)
-                    _lvls = sorted({_qlvl(f) for f in (0.25, 0.5, 0.75)})
+                    # v11 항목5: 0~최대 전체 범위의 3개 등치면(저속 영역 포함)
+                    _lvls = [lo_disp + (vmax - lo_disp) * f
+                             for f in (0.25, 0.5, 0.75)]
                 first = True
                 for lv in _lvls:
                     g = _contour_geom(lv)
@@ -1712,12 +1758,16 @@ class CFDVisualizer:
                                 transition=dict(duration=0)
                             ),
                         ],                        
-                        label=f"{float(f.name):.3g}",
-                    ) 
-                    for f in fig.frames
+                        # v11: 레벨 48개 — 라벨은 1/8 만 표기(겹침 방지,
+                        # currentvalue 에 정확값 상시 표시)
+                        label=(f"{float(f.name):.3g}"
+                               if (_fi % max(1, len(fig.frames)//8) == 0)
+                               else ""),
+                    )
+                    for _fi, f in enumerate(fig.frames)
                 ]
                 _layout_kw['sliders'] = [dict(
-                    active=0, pad=dict(b=10, t=10),
+                    active=_init_idx, pad=dict(b=10, t=10),
                     len=0.85, x=0.075, y=0,
                     # 항목3: 대비 강화 · 항목2: 단위 표시(등치값은 |field| → 필드 단위)
                     bgcolor="#1a4a8a", bordercolor="#10243e", borderwidth=1,
