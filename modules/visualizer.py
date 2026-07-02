@@ -759,12 +759,12 @@ class CFDVisualizer:
                          "z": (cx,cy,_pos)}.get(slice_normal, (cx,_pos,cz))
                 _sl = internal.slice(normal=normal_vec, origin=_orig)
                 if _sl.n_points == 0:
-                    return [], _pos, int(frac*100)
+                    return [], _pos, frac*100.0
                 _tri = _sl.triangulate()
                 _pts = _tri.points
                 _rf = _tri.faces
                 if len(_rf) == 0:
-                    return [], _pos, int(frac*100)
+                    return [], _pos, frac*100.0
                 _fc = _rf.reshape(-1, 4)[:, 1:]
                 _sc = _get_scalar(_tri, field)
                 _traces = []
@@ -789,7 +789,7 @@ class CFDVisualizer:
                             outlinecolor="#333", outlinewidth=1)
                     _traces.append(go.Mesh3d(**_mk))
                     _first_t = False
-                return _traces, _pos, int(frac*100)
+                return _traces, _pos, frac*100.0
 
             # ── 초기 표시용 슬라이스 ─────────────────────────────────────────
             _init_frac = slice_fraction if n_frames <= 1 else 0.5
@@ -835,16 +835,21 @@ class CFDVisualizer:
                 except Exception:
                     pass
 
+            # v10 항목4: 유동방향 화살표(고정 트레이스 — 프레임 교체와 무관)
+            for t in self._flow_arrow_traces(go, bounds):
+                fig.add_trace(t)
+
             # ── 다중 프레임 + Plotly 슬라이더 ───────────────────────────────
             _plotly_sliders = []
             if n_frames > 1:
-                _fracs = np.linspace(0.05, 0.95, n_frames)
+                # v10 항목2·3: 형상 주변 세밀 + 원방 성김 적응 분율(3배 해상도).
+                _fracs = self._adaptive_fracs(mesh, slice_normal, bounds, n_frames)
                 _frames = []
                 for _frac in _fracs:
                     _ftr, _fpos, _fpct = _make_slice_traces(_frac)
                     if not _ftr:
                         continue
-                    _ann_txt = (f"Slice {slice_normal.upper()} = {_fpos:.4f} m  ({_fpct}%)"
+                    _ann_txt = (f"Slice {slice_normal.upper()} = {_fpos:.4f} m  ({_fpct:.1f}%)"
                                 + (f"   |  타일 {tile_nx}×{tile_ny}"
                                    if tile_nx * tile_ny > 1 else ""))
                     _frames.append(go.Frame(
@@ -856,7 +861,7 @@ class CFDVisualizer:
                             showarrow=False, font=dict(size=12, color="black"),
                             bgcolor="rgba(255,255,255,0.92)", borderpad=4,
                             bordercolor="#333", borderwidth=1)]),
-                        name=str(_fpct),
+                        name=f"{_fpct:.1f}",
                     ))
                 fig.frames = _frames
                 _active_idx = len(_frames) // 2
@@ -871,11 +876,13 @@ class CFDVisualizer:
                         suffix="%", visible=True, xanchor="right",
                         font=dict(size=12, color="black")),
                         transition=dict(duration=0),
+                    # v10 항목3: 프레임 수 3배로 라벨이 겹치므로 4개마다 1개만 표기
+                    # (currentvalue 에 정확한 % 상시 표시).
                     steps=[dict
                     (
                         method="animate",
                         args=[
-                            [f.name], 
+                            [f.name],
                             dict
                             (
                                 mode="immediate",
@@ -885,10 +892,11 @@ class CFDVisualizer:
                                 ),
                                 transition=dict(duration=0)
                             )
-                        
+
                         ],
-                        label=f.name,
-                    ) for f in fig.frames],
+                        label=(f.name if (_fi % max(1, len(fig.frames)//8) == 0)
+                               else ""),
+                    ) for _fi, f in enumerate(fig.frames)],
                 )]
 
             # 씬 범위를 타일링된 XY 크기 기준으로 설정한다.
@@ -924,7 +932,7 @@ class CFDVisualizer:
             )
             if init_camera:
                 scene['camera'] = dict(eye=dict(x=1.0, y=1.0, z=1.0))
-            _ann_init = (f"Slice {slice_normal.upper()} = {pos:.4f} m  ({pct}%)"
+            _ann_init = (f"Slice {slice_normal.upper()} = {pos:.4f} m  ({pct:.1f}%)"
                          + (f"   |  타일 {tile_nx}×{tile_ny}"
                             if tile_nx * tile_ny > 1 else ""))
             _bottom = 60 if _plotly_sliders else 0
@@ -1154,16 +1162,14 @@ class CFDVisualizer:
             )
         return scene
 
-    def _focus_grid(self, mesh, b, ex):
-        """입체/등치면 리샘플용 '형상 집중' 비균일 rectilinear 격자.
+    def _focus_box(self, mesh, b, ex):
+        """형상(내부 장애물 패치) 기반 관심영역 박스 (flo, fhi) 반환.
 
-        고정 예산의 균일 격자는 전체구조처럼 도메인(≈1m)이 형상(≈0.1m)보다 훨씬
-        클 때 복셀이 ~25mm 로 굵어져, 등치면이 물리와 무관한 각진 덩어리(마칭큐브
-        앨리어싱)로 나온다. 도메인 경계에 닿지 않는 벽 패치(netSurface 등)를
-        관심영역으로 삼아 그 주변(+하류 후류 연장)에 격자를 집중(~10mm 이하)하고
-        원방(자유류, |U| 균일)은 성기게 둔다.
-        내부 패치 미검출/형상이 도메인 대부분이면 None(종전 균일 격자 폴백)."""
-        import pyvista as pv
+        도메인 경계에 닿지 않는 벽 패치(netSurface 등)의 합집합 bbox 를,
+        표시 프레임 유동방향 d(AoA) 기준으로 상류 1L·하류(후류) 3L·측방 0.5L
+        확장한 뒤 도메인으로 클립한다. 형상 집중 리샘플 격자(_focus_grid)·
+        적응형 슬라이스 분율·연속 볼륨 모드가 공용한다.
+        내부 패치 미검출/형상이 도메인 대부분이면 None."""
         boundary = (mesh["boundary"] if mesh is not None
                     and "boundary" in mesh.keys() else None)
         if boundary is None:
@@ -1190,7 +1196,7 @@ class CFDVisualizer:
         if fb_lo is None:
             return None
         L = float(np.linalg.norm(fb_hi - fb_lo))
-        if L < 1e-9 or L > 0.7 * diag:   # 형상이 도메인 대부분이면 균일로 충분
+        if L < 1e-9 or L > 0.7 * diag:   # 형상이 도메인 대부분이면 무의미
             return None
         # 표시 프레임 유동방향 d(AoA): 하류(후류) 3L·상류 1L·측방 0.5L 연장
         aa = math.radians(self.angle_deg if self.angle_deg is not None else 90.0)
@@ -1198,6 +1204,25 @@ class CFDVisualizer:
         dpos, dneg = np.maximum(0.0, d), np.maximum(0.0, -d)
         flo = np.maximum(fb_lo - L*(0.5 + 1.0*dpos + 3.0*dneg), lo)
         fhi = np.minimum(fb_hi + L*(0.5 + 3.0*dpos + 1.0*dneg), hi)
+        return flo, fhi
+
+    def _focus_grid(self, mesh, b, ex):
+        """입체/등치면 리샘플용 '형상 집중' 비균일 rectilinear 격자.
+
+        고정 예산의 균일 격자는 전체구조처럼 도메인(≈1m)이 형상(≈0.1m)보다 훨씬
+        클 때 복셀이 ~25mm 로 굵어져, 등치면이 물리와 무관한 각진 덩어리(마칭큐브
+        앨리어싱)로 나온다. 관심영역(_focus_box)에 격자를 집중(~10mm 이하)하고
+        원방(자유류, |U| 균일)은 성기게 둔다.
+        관심영역 미검출이면 None(종전 균일 격자 폴백)."""
+        import pyvista as pv
+        fb = self._focus_box(mesh, b, ex)
+        if fb is None:
+            return None
+        flo, fhi = fb
+        diag = math.sqrt(ex[0]**2 + ex[1]**2 + ex[2]**2)
+        tol = 1e-3 * diag
+        lo = np.array([b[0], b[2], b[4]], float)
+        hi = np.array([b[1], b[3], b[5]], float)
         fex = np.maximum(fhi - flo, 1e-9)
         h = (float(np.prod(fex)) / 100000.0) ** (1.0/3.0)   # 세밀부 ~10만 점
         axes = []
@@ -1211,6 +1236,182 @@ class CFDVisualizer:
                     if hi[i] - fhi[i] > tol else np.empty(0))
             axes.append(np.concatenate([pre, fine, post]))
         return pv.RectilinearGrid(axes[0], axes[1], axes[2])
+
+    def _flow_arrow_traces(self, go, bounds):
+        """유동방향 표시기(v10 항목4): 표시 프레임 d(AoA) 3D 화살표 + 라벨.
+
+        도메인 상부(z_max 위)에 도메인 중심을 향하는 진홍색 화살표를 그려
+        카메라 방향과 무관하게 유동 방향을 즉시 식별하게 한다. 3모드 공통."""
+        out = []
+        try:
+            ang = self.angle_deg
+            if ang is None or self.mode not in ("unit_cell", "full_structure"):
+                return out
+            aa = math.radians(float(ang))
+            d = np.array([math.sin(aa), -math.cos(aa), 0.0])
+            ex = [max(bounds[1]-bounds[0], 1e-9), max(bounds[3]-bounds[2], 1e-9),
+                  max(bounds[5]-bounds[4], 1e-9)]
+            diag = math.sqrt(ex[0]**2 + ex[1]**2 + ex[2]**2)
+            c = np.array([(bounds[0]+bounds[1])/2.0, (bounds[2]+bounds[3])/2.0,
+                          bounds[5] + 0.10*ex[2]])
+            A = 0.20 * diag
+            p0, p1 = c - d*A, c            # 꼬리→머리(도메인 중심 상공)
+            col = "#c8102e"
+            out.append(go.Scatter3d(
+                x=[p0[0], p1[0]], y=[p0[1], p1[1]], z=[p0[2], p1[2]],
+                mode="lines", line=dict(color=col, width=8),
+                showlegend=False, hoverinfo="skip"))
+            out.append(go.Cone(
+                x=[p1[0]], y=[p1[1]], z=[p1[2]],
+                u=[d[0]], v=[d[1]], w=[d[2]],
+                sizemode="absolute", sizeref=0.30*A, anchor="tip",
+                colorscale=[[0, col], [1, col]], showscale=False,
+                hoverinfo="skip"))
+            out.append(go.Scatter3d(
+                x=[p0[0]], y=[p0[1]], z=[p0[2]], mode="text",
+                text=[f"유동 (AoA {float(ang):.0f}°)"],
+                textfont=dict(size=13, color=col), textposition="top center",
+                showlegend=False, hoverinfo="skip"))
+        except Exception:
+            return []
+        return out
+
+    def _adaptive_fracs(self, mesh, slice_normal, bounds, n_frames):
+        """v10 항목2·3: 슬라이스 위치 분율 — 형상 주변 세밀 + 원방 성김.
+
+        관심영역(_focus_box)이 슬라이스 축에서 차지하는 구간에 스텝의 ~70%를
+        집중 배치해, 도메인이 형상보다 훨씬 큰 전체구조에서도 그물 주변을
+        미세 간격으로 통과한다. 관심영역 미검출 시 균일 분포."""
+        n = max(2, int(n_frames))
+        ax = {"x": 0, "y": 1, "z": 2}.get(slice_normal, 1)
+        lo, hi = bounds[2*ax], bounds[2*ax+1]
+        span = max(hi - lo, 1e-12)
+        fb = None
+        try:
+            ex = [max(bounds[1]-bounds[0], 1e-9), max(bounds[3]-bounds[2], 1e-9),
+                  max(bounds[5]-bounds[4], 1e-9)]
+            fb = self._focus_box(mesh, bounds, ex)
+        except Exception:
+            fb = None
+        if fb is None:
+            return np.linspace(0.05, 0.95, n)
+        a = max(0.02, (float(fb[0][ax]) - lo) / span)
+        b2 = min(0.98, (float(fb[1][ax]) - lo) / span)
+        if not (b2 > a):
+            return np.linspace(0.05, 0.95, n)
+        n_fine = max(2, int(round(n * 0.7)))
+        n_coarse = max(2, n - n_fine)
+        fr = np.concatenate([np.linspace(0.02, 0.98, n_coarse),
+                             np.linspace(a, b2, n_fine)])
+        return np.unique(np.round(fr, 4))
+
+    def render_field_volume(self, field: str = "U",
+                            opacity: float = 0.12,
+                            surface_count: int = 17,
+                            stl_opacity: float = 0.15,
+                            init_camera: bool = True,
+                            tile_nx: int = 1, tile_ny: int = 1) -> Optional[Any]:
+        """v10 항목1: 슬라이스 사이를 보간한 **연속 볼륨** 뷰(go.Volume).
+
+        관심영역(_focus_box: 그물 주변 상류1L·하류3L·측방0.5L, 미검출 시 도메인
+        전체)을 균일 격자(~10만 점)로 리샘플해 반투명 연속 볼륨으로 표시한다.
+        원방은 균일 자유류라 표시 생략해도 정보 손실이 없다. 리샘플은 케이스당
+        1회 캐시(_vol_cache). 타일링은 데이터량 문제로 미지원(단일 표시)."""
+        try:
+            import plotly.graph_objects as go
+        except ImportError:
+            return None
+        if not PYVISTA_OK:
+            return None
+        try:
+            import pyvista as pv
+            mesh = self._get_mesh()
+            if mesh is None:
+                return None
+            internal = mesh["internalMesh"] if "internalMesh" in mesh.keys() else mesh
+            if field not in internal.array_names:
+                return None
+            b = internal.bounds
+            ex = [max(b[1]-b[0], 1e-9), max(b[3]-b[2], 1e-9), max(b[5]-b[4], 1e-9)]
+            _vc = getattr(self, "_vol_cache", None)
+            if _vc is not None and _vc[0] == self._cache_time:
+                sampled, lo3, hi3, dims = _vc[1:]
+            else:
+                fb = None
+                try:
+                    fb = self._focus_box(mesh, b, ex)
+                except Exception:
+                    fb = None
+                if fb is not None:
+                    lo3, hi3 = fb
+                else:
+                    lo3 = np.array([b[0], b[2], b[4]], float)
+                    hi3 = np.array([b[1], b[3], b[5]], float)
+                fex = np.maximum(hi3 - lo3, 1e-9)
+                h = (float(np.prod(fex)) / 100000.0) ** (1.0/3.0)
+                dims = tuple(int(np.clip(round(float(fex[i]) /
+                                                max(h, float(fex[i])/96.0)) + 1,
+                                          8, 96)) for i in range(3))
+                g = pv.ImageData()
+                g.dimensions = dims
+                g.origin = tuple(lo3)
+                g.spacing = tuple(float(fex[i])/max(1, dims[i]-1) for i in range(3))
+                sampled = g.sample(internal)
+                self._vol_cache = (self._cache_time, sampled, lo3, hi3, dims)
+            arr = sampled[field]
+            vals = (np.linalg.norm(arr, axis=1) if getattr(arr, "ndim", 1) == 2
+                    else np.asarray(arr, float))
+            if "vtkValidPointMask" in sampled.array_names:
+                _m = np.asarray(sampled["vtkValidPointMask"])
+                vals = np.where(_m > 0, vals, np.nan)
+            _valid = vals[~np.isnan(vals)]
+            if _valid.size == 0:
+                return None
+            vmin, vmax = float(_valid.min()), float(_valid.max())
+            vals = np.nan_to_num(vals, nan=vmin)
+            # go.Volume 은 z-fastest 격자 순서를 가정 → pyvista(x-fastest)를 변환
+            ax_lin = [np.linspace(lo3[i], hi3[i], dims[i]) for i in range(3)]
+            X, Y, Z = np.meshgrid(*ax_lin, indexing="ij")
+            value = vals.reshape(dims, order="F").ravel(order="C")
+            cmap = self._PLOTLY_CMAP.get(field, "Jet")
+            unit = self._FIELD_UNIT.get(field, "")
+            fig = go.Figure()
+            fig.add_trace(go.Volume(
+                x=X.ravel(), y=Y.ravel(), z=Z.ravel(), value=value,
+                isomin=vmin, isomax=vmax,
+                opacity=float(opacity), surface_count=int(surface_count),
+                colorscale=cmap,
+                caps=dict(x_show=False, y_show=False, z_show=False),
+                colorbar=dict(
+                    title=dict(text=f"{field} [{unit}]", side="right",
+                               font=dict(size=12, color="black")),
+                    thickness=14, len=0.75,
+                    tickfont=dict(size=10, color="black"),
+                    outlinecolor="#333", outlinewidth=1),
+                hoverinfo="skip"))
+            for t in self._boundary_traces(go, [(0.0, 0.0)], opacity=stl_opacity):
+                fig.add_trace(t)
+            for t in self._flow_arrow_traces(go, b):
+                fig.add_trace(t)
+            _scene = self._iso_scene(go, b, 1, 1, ex[0], ex[1],
+                                     init_camera=init_camera)
+            _scene.pop("camera", None)   # 카메라 보존(영속 루프)과 동일 패턴
+            fig.update_layout(
+                uirevision='flowfield',
+                annotations=[dict(
+                    text="연속 볼륨 (관심영역: 형상 주변+후류)",
+                    xref="paper", yref="paper", x=0.01, y=0.99,
+                    xanchor="left", yanchor="top", showarrow=False,
+                    font=dict(size=12, color="black"),
+                    bgcolor="rgba(255,255,255,0.92)", borderpad=4,
+                    bordercolor="#333", borderwidth=1)],
+                scene=_scene,
+                showlegend=False, margin=dict(l=0, r=0, t=10, b=0),
+                height=520, paper_bgcolor='#f0f8ff')
+            return fig
+        except Exception as e:
+            logger.error(f"연속 볼륨 렌더 오류: {e}")
+            return None
 
     def render_field_3d(self, field: str = "U", level: Optional[float] = None,
                         level_frac: Optional[float] = None,
@@ -1286,6 +1487,28 @@ class CFDVisualizer:
             if not (vmax > vmin):
                 vmax = vmin + 1e-6
 
+            # v10 항목2: 등치값을 '관심영역(형상 주변+후류) 값 분위수'로 선정 —
+            # 원방 자유류(값 균일)에 낭비되는 레벨 없이 형상 크기에 자동 적응.
+            _fvals = _valid
+            try:
+                _fb = self._focus_box(mesh, b, ex)
+                if _fb is not None:
+                    _in = ((pts[:, 0] >= _fb[0][0]) & (pts[:, 0] <= _fb[1][0]) &
+                           (pts[:, 1] >= _fb[0][1]) & (pts[:, 1] <= _fb[1][1]) &
+                           (pts[:, 2] >= _fb[0][2]) & (pts[:, 2] <= _fb[1][2]) &
+                           ~np.isnan(vals))
+                    if int(_in.sum()) > 100:
+                        _fvals = vals[_in]
+            except Exception:
+                pass
+
+            def _qlvl(f):
+                """관심영역 분위수 f 의 등치값(폴백: 전역 선형)."""
+                try:
+                    return float(np.quantile(_fvals, min(max(float(f), 0.0), 1.0)))
+                except Exception:
+                    return vmin + (vmax - vmin) * float(f)
+
             dx, dy = ex[0], ex[1]
             tile_nx = max(1, int(tile_nx)); tile_ny = max(1, int(tile_ny))
             offsets = [(i*dx, j*dy) for i in range(tile_nx) for j in range(tile_ny)]
@@ -1313,11 +1536,20 @@ class CFDVisualizer:
                 raw = ct.faces
                 if len(raw) == 0:
                     return None
-                cp = np.asarray(ct.points)
-                cf = raw.reshape(-1, 4)[:, 1:]
-                cintens = (np.asarray(ct["__mag__"], float)
-                           if "__mag__" in ct.array_names
-                           else np.full(cp.shape[0], float(lv)))
+                # 페이로드 절감 1: 대형 표면 데시메이션 — 등치면 위 스칼라는
+                # 상수(=lv)라 색 손실 없이 삼각형 수만 줄인다(레벨 48개 스윕 대응).
+                if ct.n_cells > 12000:
+                    try:
+                        ct = ct.decimate_pro(1.0 - 12000.0 / ct.n_cells)
+                        raw = ct.faces
+                        if len(raw) == 0:
+                            return None
+                    except Exception:
+                        pass
+                # 페이로드 절감 2: float32/int32 다운캐스트(바이너리 직렬화 ~1/2).
+                cp = np.asarray(ct.points, dtype=np.float32)
+                cf = raw.reshape(-1, 4)[:, 1:].astype(np.int32)
+                cintens = np.full(cp.shape[0], float(lv), dtype=np.float32)
                 return cp, cf, cintens
 
             def _mesh(geom, ox, oy, first):
@@ -1350,8 +1582,10 @@ class CFDVisualizer:
                 # 등치값을 낮은→높은 |field|로 자동 스윕. 프레임마다 메시 지오메트리
                 # 전체를 교체(각 등치면 수천 점이라 경량). 등치값별 지오메트리는 1회만
                 # 계산해 타일끼리 재사용한다.
-                _lvls = np.linspace(vmin+(vmax-vmin)*0.12, vmax-(vmax-vmin)*0.04,
-                                    max(2, min(int(n_frames), 16)))
+                # v10 항목3: 레벨 수 3배(16→48) + 관심영역 분위수 적응 분포.
+                _nlv = max(2, min(int(n_frames) * 2, 48))
+                _lvls = np.unique(np.round(
+                    [_qlvl(f) for f in np.linspace(0.05, 0.985, _nlv)], 6))
                 _geoms = {float(lv): _contour_geom(lv) for lv in _lvls}
                 lv0 = float(_lvls[0])
                 first = True
@@ -1371,7 +1605,8 @@ class CFDVisualizer:
                 if level is not None:
                     _lvls = [float(level)]
                 else:
-                    _lvls = [vmin + (vmax-vmin)*f for f in (0.25, 0.5, 0.75)]
+                    # v10 항목2: 관심영역 분위수 기반 3개 등치면(형상 적응)
+                    _lvls = sorted({_qlvl(f) for f in (0.25, 0.5, 0.75)})
                 first = True
                 for lv in _lvls:
                     g = _contour_geom(lv)
@@ -1393,6 +1628,11 @@ class CFDVisualizer:
                         )
                         for fi in range(_nf)
                     ]
+
+            # v10 항목4: 유동방향 화살표(고정 트레이스 — 스윕 프레임은 앞쪽
+            # n_tiles 트레이스만 교체하므로 영향 없음)
+            for t in self._flow_arrow_traces(go, b):
+                fig.add_trace(t)
 
             _menus = []
             if anim in ("rotate", "sweep"):

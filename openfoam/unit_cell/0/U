@@ -47,9 +47,13 @@ boundaryField
         type            fixedValue;
         value           uniform (1.0 0 0);
     }
+    // v10 항목5: 출구 역류 대비 inletOutlet(전체구조 템플릿과 동일 패턴).
+    // value 는 초기 추정값(빌더가 유속 벡터로 치환해도 무해).
     zMax
     {
-        type            zeroGradient;
+        type            inletOutlet;
+        inletValue      uniform (0 0 0);
+        value           uniform (1.0 0 0);
     }
     // ─── STL 그물 표면 ──────────────────────────────────────────────────
     netSurface

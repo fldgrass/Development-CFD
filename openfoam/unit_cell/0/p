@@ -37,14 +37,19 @@ boundaryField
     {
         type            cyclic;
     }
+    // v10 항목5 수정: 종전 zMin(p 고정)+zMax(zeroGradient)는 입구 과잉지정·
+    // 출구 과소지정(ill-posed) — 그물 항력으로 하류압이 떨어질수록 압력방정식이
+    // 입구 유량을 키우는 양성 되먹임(질량유량 폭주: t=500에 +38%, t=2000에
+    // +170%)을 유발했다. 표준 처방(전체구조 템플릿과 동일)으로 교체:
+    // 입구 p=zeroGradient, 출구 p=fixedValue 0.
     zMin
     {
-        type            fixedValue;
-        value           uniform 0;
+        type            zeroGradient;
     }
     zMax
     {
-        type            zeroGradient;
+        type            fixedValue;
+        value           uniform 0;
     }
     netSurface
     {
