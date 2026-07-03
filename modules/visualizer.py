@@ -770,7 +770,9 @@ class CFDVisualizer:
                         x=C[0] + np.float32(_ox), y=C[1] + np.float32(_oy),
                         z=C[2], surfacecolor=sc2d,
                         colorscale=cmap, cmin=_cmin, cmax=_cmax,
-                        lighting=dict(ambient=0.95, diffuse=0.15, specular=0.0),
+                        # v15: 순수 ambient(diffuse=0) — 셰이딩 없는 '순수 LUT 색'.
+                        # 볼륨 100% 불투명 노출면과 정확히 같은 색이 되도록 공유한다.
+                        lighting=dict(ambient=1.0, diffuse=0.0, specular=0.0),
                         showlegend=False, showscale=_first_t,
                         hovertemplate=f"{field}: %{{surfacecolor:.4f}} {unit}"
                                       "<extra></extra>",
@@ -1571,6 +1573,15 @@ class CFDVisualizer:
                 value = np.where(_keep, value, _hide)
             cmap = self._PLOTLY_CMAP.get(field, "Jet")
             unit = self._FIELD_UNIT.get(field, "")
+            # v15: 클리핑이 활성인 축은 cap 을 켠다 → 클립 노출 단면이 '슬라이스와
+            # 동일한 cross-section 색'의 깨끗한 면으로 렌더된다(색 일치 검증 대상).
+            # 비클립 축은 cap 을 끄고 외곽 shell 만 보여 종전 룩을 유지한다.
+            _caps = dict(x_show=False, y_show=False, z_show=False)
+            if _clip_bounds is not None:
+                for _ci, _ax in enumerate(("x", "y", "z")):
+                    _lo, _hi = _clip_bounds[_ci]
+                    if _lo > 1e-6 or _hi < 0.9999:
+                        _caps[f"{_ax}_show"] = True
             _a = min(max(float(opacity), 0.0), 1.0)
             # v14 항목2·3: opacity 를 '균일'하게 적용한다(값 의존 opacityscale 폐기).
             # 종전(v13) opacityscale 은 낮은 스칼라(=저속=dark blue)의 알파를 0 으로
@@ -1588,7 +1599,16 @@ class CFDVisualizer:
                 opacity=1.0, opacityscale=_opsc,
                 surface_count=max(int(surface_count), 25),
                 colorscale=cmap,
-                caps=dict(x_show=False, y_show=False, z_show=False),
+                caps=_caps,
+                # v15: 조명을 슬라이스(go.Surface)와 '동일'하게 — 종전 볼륨은
+                # plotly 기본 조명(diffuse 0.8 음영)이라 100% 불투명이어도 표면이
+                # 각도에 따라 어두워져 같은 스칼라가 슬라이스와 다른 색으로 보였다.
+                # 순수 ambient(diffuse=0·specular=0)를 슬라이스와 공유하면 표면
+                # 법선 방향과 무관하게 셰이딩이 없어(순수 LUT 색) 불투명 볼륨의
+                # 노출 단면 색이 슬라이스 색과 정확히 일치한다.
+                lighting=dict(ambient=1.0, diffuse=0.0, specular=0.0,
+                              roughness=1.0, fresnel=0.0),
+                lightposition=dict(x=0, y=0, z=1e5),
                 showscale=False,      # 컬러바는 아래 동기 전용 트레이스가 담당
                 hoverinfo="skip"))
             # v14 항목3: 컬러바(범례)는 '참 색상'(불투명 cmap)을 쓴다. 종전엔
