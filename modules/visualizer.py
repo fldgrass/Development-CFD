@@ -676,57 +676,60 @@ class CFDVisualizer:
             axis_map = {"x": (0, 1), "y": (2, 3), "z": (4, 5)}
             b_lo, b_hi = axis_map.get(slice_normal, (2, 3))
             lo, hi = bounds[b_lo], bounds[b_hi]
-            pos = lo + (hi - lo) * slice_fraction
-
-            normal_map = {"x": (1,0,0), "y": (0,1,0), "z": (0,0,1)}
-            normal_vec = normal_map.get(slice_normal, (0,1,0))
             cx = (bounds[0]+bounds[1])/2
             cy = (bounds[2]+bounds[3])/2
             cz = (bounds[4]+bounds[5])/2
-            origin = {"x": (pos,cy,cz), "y": (cx,pos,cz), "z": (cx,cy,pos)}.get(
-                slice_normal, (cx, pos, cz))
 
-            sliced = internal.slice(normal=normal_vec, origin=origin)
-            if sliced.n_points == 0:
+            # ── v12 항목2·3: 평면 격자 샘플링 기반 고해상 슬라이스 ──────────
+            # 종전(메시 단면 추출)은 해상도가 국소 셀 크기(원방 2.5~15mm)에 묶여
+            # 원방에서 블록형으로 보였다. 물체 중심 뷰 박스에 N×N 균일 격자를
+            # 깔고 내부 메시를 직접 프로브(선형 보간) → 셀 크기와 무관한 매끈한
+            # 단면(go.Surface, 4배 이상 세밀). 전 프레임 점을 단일 PolyData 로
+            # 묶어 1회 배치 프로브(locator 1회 구축)해 상호작용 성능을 유지한다.
+            _vc, _vh = self._view_box(bounds)
+            _axmap = {"x": 0, "y": 1, "z": 2}
+            n_ax = _axmap.get(slice_normal, 1)
+            in_ax = [a for a in range(3) if a != n_ax]
+            _N = 160
+            g1 = np.linspace(_vc[in_ax[0]]-_vh, _vc[in_ax[0]]+_vh, _N)
+            g2 = np.linspace(_vc[in_ax[1]]-_vh, _vc[in_ax[1]]+_vh, _N)
+            G1, G2 = np.meshgrid(g1, g2, indexing="ij")
+            if n_frames > 1:
+                _fracs = self._adaptive_fracs(mesh, slice_normal, bounds, n_frames)
+            else:
+                _fracs = np.array([min(max(float(slice_fraction), 0.0), 1.0)])
+            _npts = _N * _N
+            _allpts = np.empty((len(_fracs) * _npts, 3))
+            for _fi, _fr in enumerate(_fracs):
+                _blk = _allpts[_fi*_npts:(_fi+1)*_npts]
+                _blk[:, n_ax] = lo + (hi - lo) * float(_fr)
+                _blk[:, in_ax[0]] = G1.ravel()
+                _blk[:, in_ax[1]] = G2.ravel()
+            _sam = pv.PolyData(_allpts).sample(internal)
+            if field not in _sam.array_names:
                 return None
-
-            # 삼각화 후 메시 데이터 추출
-            tri = sliced.triangulate()
-            pts = tri.points
-            raw_faces = tri.faces
-            if len(raw_faces) == 0:
+            _arr = np.asarray(_sam[field])
+            _vals_all = (np.linalg.norm(_arr, axis=1)
+                         if _arr.ndim == 2 else _arr.astype(float))
+            if "vtkValidPointMask" in _sam.array_names:
+                _vmk = np.asarray(_sam["vtkValidPointMask"])
+                _vals_all = np.where(_vmk > 0, _vals_all, np.nan)
+            _fin = _vals_all[np.isfinite(_vals_all)]
+            if _fin.size == 0:
                 return None
-            faces = raw_faces.reshape(-1, 4)[:, 1:]
-
-            # 스칼라 값 추출 — 반드시 '점(vertex) 데이터'로 반환한다.
-            # OpenFOAM 필드는 셀 중심값이라, 슬라이스 결과에 같은 이름의 point/cell
-            # 데이터가 함께 존재할 수 있다. ds[fname] 는 이때 cell 데이터(길이=면 수)를
-            # 돌려줘 Mesh3d 정점 수와 어긋나고, 색이 정점에 잘못 매핑되어 슬라이스가
-            # 셀 경계에서 '블록형 불연속'으로 보인다(항목8 원인). point_data 를 우선
-            # 사용하고, 없으면 cell→point 보간해 정점당 1값을 보장한다.
-            def _get_scalar(ds, fname):
-                if fname not in ds.array_names:
-                    return np.zeros(ds.n_points)
-                if fname in ds.point_data:
-                    arr = ds.point_data[fname]
-                elif fname in ds.cell_data:
-                    try:
-                        arr = ds.cell_data_to_point_data().point_data[fname]
-                    except Exception:
-                        arr = ds[fname]
-                else:
-                    arr = ds[fname]
-                arr = np.asarray(arr)
-                return (np.linalg.norm(arr, axis=1) if arr.ndim == 2
-                        else np.asarray(arr, float))
-
-            scalar = _get_scalar(tri, field)
+            # 컬러 범위: 전 프레임 공통(속도류는 0~최대 — v11 항목5와 일관)
+            _cmax = float(_fin.max())
+            _cmin = 0.0 if float(_fin.min()) >= 0.0 else float(_fin.min())
+            if not (_cmax > _cmin):
+                _cmax = _cmin + 1e-9
+            _frame_vals = {round(float(_fr), 6):
+                           _vals_all[_fi*_npts:(_fi+1)*_npts]
+                           .reshape(_N, _N).astype(np.float32)
+                           for _fi, _fr in enumerate(_fracs)}
+            _G1f, _G2f = G1.astype(np.float32), G2.astype(np.float32)
 
             cmap   = self._PLOTLY_CMAP.get(field, "Jet")
             unit   = self._FIELD_UNIT.get(field, "")
-            cfg    = self.FIELD_CONFIG.get(field, self.FIELD_CONFIG["U"])
-            _cmin  = float(scalar.min()) if scalar.size else 0.0
-            _cmax  = float(scalar.max()) if scalar.size else 1.0
 
             # ── 타일링 오프셋 (주기 단위셀 nx×ny 복제 — 시각화 전용) ────────
             dx = bounds[1] - bounds[0]
@@ -751,34 +754,27 @@ class CFDVisualizer:
                 except Exception:
                     pass
 
-            # ── 슬라이스 트레이스 생성 클로저 ─────────────────────────────────
+            # ── 슬라이스 트레이스 생성 클로저 (배치 프로브 결과 → go.Surface) ──
             def _make_slice_traces(frac):
-                """frac 위치의 슬라이스 Mesh3d 리스트(타일별 1개)와 위치 문자열 반환."""
+                """frac 위치의 고해상 슬라이스 Surface 리스트(타일별 1개) 반환."""
+                frac = float(frac)
                 _pos = lo + (hi - lo) * frac
-                _orig = {"x": (_pos,cy,cz), "y": (cx,_pos,cz),
-                         "z": (cx,cy,_pos)}.get(slice_normal, (cx,_pos,cz))
-                _sl = internal.slice(normal=normal_vec, origin=_orig)
-                if _sl.n_points == 0:
+                sc2d = _frame_vals.get(round(frac, 6))
+                if sc2d is None or not np.isfinite(sc2d).any():
                     return [], _pos, frac*100.0
-                _tri = _sl.triangulate()
-                _pts = _tri.points
-                _rf = _tri.faces
-                if len(_rf) == 0:
-                    return [], _pos, frac*100.0
-                _fc = _rf.reshape(-1, 4)[:, 1:]
-                _sc = _get_scalar(_tri, field)
+                _pc = np.full((_N, _N), np.float32(_pos))
+                C = {n_ax: _pc, in_ax[0]: _G1f, in_ax[1]: _G2f}
                 _traces = []
                 _first_t = True
                 for (_ox, _oy) in _offsets:
                     _mk = dict(
-                        x=_pts[:,0]+_ox, y=_pts[:,1]+_oy, z=_pts[:,2],
-                        i=_fc[:,0], j=_fc[:,1], k=_fc[:,2],
-                        intensity=_sc, colorscale=cmap,
-                        cmin=_cmin, cmax=_cmax,
-                        flatshading=False,
-                        lighting=dict(ambient=0.8, diffuse=0.5, specular=0.1),
+                        x=C[0] + np.float32(_ox), y=C[1] + np.float32(_oy),
+                        z=C[2], surfacecolor=sc2d,
+                        colorscale=cmap, cmin=_cmin, cmax=_cmax,
+                        lighting=dict(ambient=0.95, diffuse=0.15, specular=0.0),
                         showlegend=False, showscale=_first_t,
-                        hovertemplate=f"{field}: %{{intensity:.4f}} {unit}<extra></extra>",
+                        hovertemplate=f"{field}: %{{surfacecolor:.4f}} {unit}"
+                                      "<extra></extra>",
                     )
                     if _first_t:
                         _mk["colorbar"] = dict(
@@ -787,15 +783,19 @@ class CFDVisualizer:
                             thickness=14, len=0.75,
                             tickfont=dict(size=10, color="black"),
                             outlinecolor="#333", outlinewidth=1)
-                    _traces.append(go.Mesh3d(**_mk))
+                    _traces.append(go.Surface(**_mk))
                     _first_t = False
                 return _traces, _pos, frac*100.0
 
-            # ── 초기 표시용 슬라이스 ─────────────────────────────────────────
-            _init_frac = slice_fraction if n_frames <= 1 else 0.5
+            # ── 초기 표시용 슬라이스 (프레임 목록의 중앙 위치) ────────────────
+            _init_frac = float(_fracs[len(_fracs)//2]) if n_frames > 1 \
+                else float(_fracs[0])
             _init_slice_traces, pos, pct = _make_slice_traces(_init_frac)
             if not _init_slice_traces:
                 return None
+            # 유선(streamlines) 씨앗 위치용
+            origin = {"x": (pos, cy, cz), "y": (cx, pos, cz),
+                      "z": (cx, cy, pos)}.get(slice_normal, (cx, pos, cz))
 
             fig = go.Figure()
             # 슬라이스 트레이스 (프레임에서 교체될 트레이스)
@@ -842,8 +842,7 @@ class CFDVisualizer:
             # ── 다중 프레임 + Plotly 슬라이더 ───────────────────────────────
             _plotly_sliders = []
             if n_frames > 1:
-                # v10 항목2·3: 형상 주변 세밀 + 원방 성김 적응 분율(3배 해상도).
-                _fracs = self._adaptive_fracs(mesh, slice_normal, bounds, n_frames)
+                # v10 항목2·3: 적응 분율(위에서 배치 샘플링에 사용한 것 재사용)
                 _frames = []
                 for _frac in _fracs:
                     _ftr, _fpos, _fpct = _make_slice_traces(_frac)
@@ -1290,6 +1289,32 @@ class CFDVisualizer:
             axes.append(np.concatenate([pre, fine, post]))
         return pv.RectilinearGrid(axes[0], axes[1], axes[2])
 
+    @staticmethod
+    def _alpha_colorscale(cmap_name: str, alpha: float):
+        """컬러스케일 각 색에 알파를 입힌 rgba 스케일 (v12 항목4).
+
+        투명도 슬라이더 값을 렌더링과 컬러바가 '같은 소스'로 공유하게 한다 —
+        트레이스에 이 스케일을 쓰면 표면 투명도와 우측 컬러바 색이 항상 일치."""
+        import plotly.colors as pc
+        a = min(max(float(alpha), 0.0), 1.0)
+        try:
+            base = pc.get_colorscale(cmap_name)
+        except Exception:
+            base = pc.get_colorscale("Jet")
+        out = []
+        for pos, col in base:
+            col = str(col)
+            try:
+                if col.startswith("#"):
+                    r, g, b = pc.hex_to_rgb(col)
+                else:   # 'rgb(r,g,b)' / 'rgba(r,g,b,a)'
+                    nums = col[col.find("(")+1:col.find(")")].split(",")
+                    r, g, b = (int(float(v)) for v in nums[:3])
+            except Exception:
+                r, g, b = 128, 128, 128
+            out.append([float(pos), f"rgba({r},{g},{b},{a:.3f})"])
+        return out
+
     def _flow_arrow_traces(self, go, bounds):
         """유동방향 표시기(v10 항목4): 표시 프레임 d(AoA) 3D 화살표 + 라벨.
 
@@ -1346,15 +1371,25 @@ class CFDVisualizer:
         except Exception:
             fb = None
         if fb is None:
-            return np.linspace(0.05, 0.95, n)
-        a = max(0.02, (float(fb[0][ax]) - lo) / span)
-        b2 = min(0.98, (float(fb[1][ax]) - lo) / span)
-        if not (b2 > a):
-            return np.linspace(0.05, 0.95, n)
-        n_fine = max(2, int(round(n * 0.7)))
-        n_coarse = max(2, n - n_fine)
-        fr = np.concatenate([np.linspace(0.02, 0.98, n_coarse),
-                             np.linspace(a, b2, n_fine)])
+            fr = np.linspace(0.05, 0.95, n)
+        else:
+            a = max(0.02, (float(fb[0][ax]) - lo) / span)
+            b2 = min(0.98, (float(fb[1][ax]) - lo) / span)
+            if not (b2 > a):
+                fr = np.linspace(0.05, 0.95, n)
+            else:
+                n_fine = max(2, int(round(n * 0.7)))
+                n_coarse = max(2, n - n_fine)
+                fr = np.concatenate([np.linspace(0.02, 0.98, n_coarse),
+                                     np.linspace(a, b2, n_fine)])
+        # v12 항목3: 물체 기하중심을 지나는 슬라이스를 각 축에서 항상 포함
+        try:
+            _vc, _ = self._view_box(bounds)
+            _cf = (float(_vc[ax]) - lo) / span
+            if 0.0 <= _cf <= 1.0:
+                fr = np.append(fr, _cf)
+        except Exception:
+            pass
         return np.unique(np.round(fr, 4))
 
     def render_field_volume(self, field: str = "U",
@@ -1362,7 +1397,9 @@ class CFDVisualizer:
                             surface_count: int = 17,
                             stl_opacity: float = 0.15,
                             init_camera: bool = True,
-                            tile_nx: int = 1, tile_ny: int = 1) -> Optional[Any]:
+                            tile_nx: int = 1, tile_ny: int = 1,
+                            clip: Optional[Tuple[float, float, float]] = None
+                            ) -> Optional[Any]:
         """v10 항목1: 슬라이스 사이를 보간한 **연속 볼륨** 뷰(go.Volume).
 
         관심영역(_focus_box: 그물 주변 상류1L·하류3L·측방0.5L, 미검출 시 도메인
@@ -1428,6 +1465,19 @@ class CFDVisualizer:
             ax_lin = [np.linspace(lo3[i], hi3[i], dims[i]) for i in range(3)]
             X, Y, Z = np.meshgrid(*ax_lin, indexing="ij")
             value = vals.reshape(dims, order="F").ravel(order="C")
+            # ── v12 항목5: XYZ 축별 클리핑 — clip=(fx,fy,fz), 1.0=전체 표시.
+            # 슬라이더가 최소로 갈수록 +축 쪽부터 절단: 임계 초과 영역의 값을
+            # isomin 아래로 밀어 렌더에서 제외(컬러맵·투명도 전달함수는 보존).
+            # 남은 볼륨의 내부 단면은 볼륨 렌더 특성상 자동으로 노출된다.
+            if clip is not None:
+                _hide = lo_disp - max(abs(vmax - lo_disp), 1e-6) * 0.05 - 1e-9
+                _keep = np.ones(value.shape, dtype=bool)
+                for _ci, (_arr3, _f) in enumerate(zip((X, Y, Z), clip)):
+                    _f = min(max(float(_f), 0.0), 1.0)
+                    if _f < 0.9999:
+                        _thr = lo3[_ci] + _f * (hi3[_ci] - lo3[_ci])
+                        _keep &= (_arr3.ravel() <= _thr + 1e-12)
+                value = np.where(_keep, value, _hide)
             cmap = self._PLOTLY_CMAP.get(field, "Jet")
             unit = self._FIELD_UNIT.get(field, "")
             fig = go.Figure()
@@ -1438,13 +1488,26 @@ class CFDVisualizer:
                 opacity=float(opacity), surface_count=int(surface_count),
                 colorscale=cmap,
                 caps=dict(x_show=False, y_show=False, z_show=False),
-                colorbar=dict(
-                    title=dict(text=f"{field} [{unit}]", side="right",
-                               font=dict(size=12, color="black")),
-                    thickness=14, len=0.75,
-                    tickfont=dict(size=10, color="black"),
-                    outlinecolor="#333", outlinewidth=1),
+                showscale=False,      # 컬러바는 아래 동기 전용 트레이스가 담당
                 hoverinfo="skip"))
+            # v12 항목4: 투명도 동기 컬러바 — 현재 투명도를 알파로 입힌 rgba
+            # 스케일을 쓰는 전용(비가시) 트레이스. 투명도 슬라이더 변경 시
+            # 컬러바 색이 함께 갱신되어 화면 표시와 항상 일치한다.
+            fig.add_trace(go.Scatter3d(
+                x=[lo3[0], lo3[0]], y=[lo3[1], lo3[1]], z=[lo3[2], lo3[2]],
+                mode="markers",
+                marker=dict(size=0.001, opacity=0.0,
+                            color=[lo_disp, vmax],
+                            colorscale=self._alpha_colorscale(cmap, opacity),
+                            cmin=lo_disp, cmax=vmax, showscale=True,
+                            colorbar=dict(
+                                title=dict(text=f"{field} [{unit}]",
+                                           side="right",
+                                           font=dict(size=12, color="black")),
+                                thickness=14, len=0.75,
+                                tickfont=dict(size=10, color="black"),
+                                outlinecolor="#333", outlinewidth=1)),
+                showlegend=False, hoverinfo="skip"))
             for t in self._boundary_traces(go, [(0.0, 0.0)], opacity=stl_opacity):
                 fig.add_trace(t)
             for t in self._flow_arrow_traces(go, b):
@@ -1555,6 +1618,8 @@ class CFDVisualizer:
                 level = vmin + float(level_frac) * (vmax - vmin)
             cmap = self._PLOTLY_CMAP.get(field, "Jet")
             unit = self._FIELD_UNIT.get(field, "")
+            # v12 항목4: 투명도 동기용 rgba 스케일(표면·컬러바 공통 소스)
+            _cscale_a = self._alpha_colorscale(cmap, opacity)
 
             # 등치면 렌더링: go.Isosurface는 plotly가 격자를 특정 순서(z-fastest)로
             # 재구성한다고 가정하는데, pyvista ImageData의 점 순서는 x-fastest라
@@ -1602,9 +1667,12 @@ class CFDVisualizer:
                 kw = dict(
                     x=cp[:, 0]+ox, y=cp[:, 1]+oy, z=cp[:, 2],
                     i=cf[:, 0], j=cf[:, 1], k=cf[:, 2],
-                    intensity=cintens, colorscale=cmap,
+                    intensity=cintens,
+                    # v12 항목4: 투명도를 rgba 컬러스케일로 적용(opacity 속성 대신)
+                    # → 표면 투명도와 우측 컬러바가 항상 동기화된다.
+                    colorscale=_cscale_a,
                     cmin=cmin_disp, cmax=vmax,   # v11 항목5: 컬러맵 0~최대
-                    opacity=float(opacity), flatshading=False, showscale=first,
+                    opacity=1.0, flatshading=False, showscale=first,
                     showlegend=False,
                     hovertemplate=f"{field}: %{{intensity:.4f}} {unit}<extra></extra>")
                 if first:

@@ -1623,24 +1623,32 @@ with tab_input:
             "최고정밀": {"end_time": 10000, "refine_level": 4, "residual": "1e-5", "write_interval": 500,
                          "desc": "검증용 (~45분)"},
         }
+        # v12 항목1: 프리셋 적용은 on_click 콜백으로 — 종전의 본문 내
+        # st.rerun() 은 스크립트를 조기 중단시켜 그 아래에서 생성되는 위젯
+        # (유속/영각 단계 수 등)의 상태를 Streamlit 이 청소 → 기본값(1)으로
+        # 리셋되는 버그를 유발했다. 콜백은 다음 런 '시작 전'에 실행되므로
+        # 전체 위젯이 정상 렌더되고 추정시간·해석조건이 즉시 반영된다.
+        def _apply_calc_preset(_pname: str):
+            _pv = _PRESETS[_pname]
+            ss.calc_preset_name      = _pname
+            ss.end_time_preset       = _pv["end_time"]
+            ss.refine_level_preset   = _pv["refine_level"]
+            ss.residual_preset       = _pv["residual"]
+            ss.write_interval_preset = _pv["write_interval"]
+
         _pcols = st.columns(4)
         for _col, (_pname, _pvals) in zip(_pcols, _PRESETS.items()):
             with _col:
                 _is_active = (ss.get("calc_preset_name") == _pname)
                 _btn_type = "primary" if _is_active else "secondary"
-                if st.button(
+                st.button(
                     f"{'✅ ' if _is_active else ''}{_pname}",
                     help=_pvals["desc"],
                     use_container_width=True,
                     type=_btn_type,
                     key=f"preset_btn_{_pname}",
-                ):
-                    ss.calc_preset_name     = _pname
-                    ss.end_time_preset      = _pvals["end_time"]
-                    ss.refine_level_preset  = _pvals["refine_level"]
-                    ss.residual_preset      = _pvals["residual"]
-                    ss.write_interval_preset = _pvals["write_interval"]
-                    st.rerun()
+                    on_click=_apply_calc_preset, args=(_pname,),
+                )
 
         _cur = _PRESETS.get(ss.get("calc_preset_name", "보통"), _PRESETS["보통"])
         st.caption(
@@ -2409,11 +2417,31 @@ with tab_results:
                         value=float(ss.get("r1_opacity_volc", 0.12)), step=0.02,
                         key="r1_opacity_volc",
                         help="연속 볼륨의 불투명도. 낮을수록 내부 구조가 잘 비칩니다.")
+                    # v12 항목5: XYZ 축별 클리핑 — 최대(100%)=전체, 줄일수록
+                    # 해당 축 +방향부터 절단되어 내부 단면이 실시간 노출.
+                    # 세 축 독립·동시 적용 가능.
+                    _cc1, _cc2, _cc3 = st.columns(3)
+                    with _cc1:
+                        _clip_x = st.slider(
+                            "X 클리핑 [%]", 0, 100,
+                            int(ss.get("r1_clip_x", 100)), 5, key="r1_clip_x",
+                            help="X축 표시 비율 — 100%=전체, 줄이면 +X쪽부터 절단")
+                    with _cc2:
+                        _clip_y = st.slider(
+                            "Y 클리핑 [%]", 0, 100,
+                            int(ss.get("r1_clip_y", 100)), 5, key="r1_clip_y",
+                            help="Y축 표시 비율")
+                    with _cc3:
+                        _clip_z = st.slider(
+                            "Z 클리핑 [%]", 0, 100,
+                            int(ss.get("r1_clip_z", 100)), 5, key="r1_clip_z",
+                            help="Z축 표시 비율")
                     _fig_r1 = _viz_r1.render_field_volume(
                         _r1_field, opacity=_op_volc, init_camera=_init_cam,
-                        stl_opacity=_stl_op, tile_nx=_tnx, tile_ny=_tny)
-                    _cap = ("💡 드래그: 회전 | 스크롤: 줌 — 형상 주변+후류 관심영역을 "
-                            "연속 반투명 볼륨으로 보간 표시")
+                        stl_opacity=_stl_op, tile_nx=_tnx, tile_ny=_tny,
+                        clip=(_clip_x/100.0, _clip_y/100.0, _clip_z/100.0))
+                    _cap = ("💡 드래그: 회전 | 스크롤: 줌 — 연속 볼륨 · "
+                            "XYZ 클리핑 슬라이더로 내부 단면 확인")
                 elif _vmode == "입체":
                     # 항목4: 입체 모드 투명도 — 등치면 모드와 독립된 세션 키 사용.
                     _op_vol = st.slider(
