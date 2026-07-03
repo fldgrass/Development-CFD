@@ -717,11 +717,10 @@ class CFDVisualizer:
             _fin = _vals_all[np.isfinite(_vals_all)]
             if _fin.size == 0:
                 return None
-            # 컬러 범위: 전 프레임 공통(속도류는 0~최대 — v11 항목5와 일관)
-            _cmax = float(_fin.max())
-            _cmin = 0.0 if float(_fin.min()) >= 0.0 else float(_fin.min())
-            if not (_cmax > _cmin):
-                _cmax = _cmin + 1e-9
+            # v14 항목3: 컬러 범위를 '내부 메시 전역'으로 고정 — 볼륨·등치면과
+            # 동일 정규화(같은 스칼라=같은 색). 슬라이스 평면 국소 최대에 맞추면
+            # 모드마다 cmax 가 달라져 색이 어긋난다.
+            _cmin, _cmax = self._field_range(internal, field)
             _frame_vals = {round(float(_fr), 6):
                            _vals_all[_fi*_npts:(_fi+1)*_npts]
                            .reshape(_N, _N).astype(np.float32)
@@ -1284,6 +1283,33 @@ class CFDVisualizer:
             axes.append(np.concatenate([pre, fine, post]))
         return pv.RectilinearGrid(axes[0], axes[1], axes[2])
 
+    def _field_range(self, internal, field):
+        """v14 항목3: 필드의 전역 표시 범위 (lo_disp, vmax) — 슬라이스·볼륨·
+        등치면이 '동일한 정규화'를 쓰도록 내부 메시 전체의 실제 최소/최대를
+        기준으로 한다. 같은 스칼라가 모든 모드에서 같은 색이 되게 한다.
+        (모드별 샘플 최대에 맞추면 cmax 가 어긋나 색이 달라졌다.)"""
+        try:
+            arr = (internal.cell_data[field] if field in internal.cell_data
+                   else internal.point_data[field])
+            a = np.asarray(arr, float)
+            mag = np.linalg.norm(a, axis=1) if a.ndim == 2 else a
+            mag = mag[np.isfinite(mag)]
+            if mag.size == 0:
+                return 0.0, 1.0
+            vmn = float(mag.min())
+            # 최대는 99.5 백분위 — 그물 틈 가속 같은 극소수 고속 복셀이 스케일을
+            # 압축해 전체가 창백해지는 것을 막고, 공통 범위를 선명하게 유지한다
+            # (모든 모드가 같은 값을 써 스칼라→색 일관성은 유지).
+            vmx = float(np.percentile(mag, 99.5))
+            lo = 0.0 if vmn >= 0.0 else vmn
+            if not (vmx > lo):
+                vmx = float(mag.max())
+            if not (vmx > lo):
+                vmx = lo + 1e-9
+            return lo, vmx
+        except Exception:
+            return 0.0, 1.0
+
     @staticmethod
     def _alpha_colorscale(cmap_name: str, alpha: float):
         """컬러스케일 각 색에 알파를 입힌 rgba 스케일 (v12 항목4).
@@ -1486,10 +1512,14 @@ class CFDVisualizer:
                     lo3 = np.array([b[0], b[2], b[4]], float)
                     hi3 = np.array([b[1], b[3], b[5]], float)
                 fex = np.maximum(hi3 - lo3, 1e-9)
-                h = (float(np.prod(fex)) / 100000.0) ** (1.0/3.0)
+                # v14 항목3: 격자 예산 상향(10만→28만 점) — 종전 96^3 균일격자는
+                # 그물실 사이 얇은 저속 후류 줄무늬를 놓쳐 볼륨의 최소 |U|가
+                # 0.137(슬라이스 0.001)로 dark blue 영역이 소실됐다. 해상도를
+                # 높여 저속 후류를 담는다.
+                h = (float(np.prod(fex)) / 280000.0) ** (1.0/3.0)
                 dims = tuple(int(np.clip(round(float(fex[i]) /
-                                                max(h, float(fex[i])/96.0)) + 1,
-                                          8, 96)) for i in range(3))
+                                                max(h, float(fex[i])/128.0)) + 1,
+                                          8, 128)) for i in range(3))
                 g = pv.ImageData()
                 g.dimensions = dims
                 g.origin = tuple(lo3)
@@ -1505,11 +1535,11 @@ class CFDVisualizer:
             _valid = vals[~np.isnan(vals)]
             if _valid.size == 0:
                 return None
-            vmin, vmax = float(_valid.min()), float(_valid.max())
+            vmin = float(_valid.min())
             vals = np.nan_to_num(vals, nan=vmin)
-            # v11 항목5: 표시 범위 0 ~ 최대(저속 영역 포함). 음수 가능한 필드(p)는
-            # 실제 최소 사용.
-            lo_disp = 0.0 if vmin >= 0.0 else vmin
+            # v14 항목3: 표시 범위를 슬라이스와 '동일'하게 — 내부 메시 전역
+            # (같은 스칼라=같은 색). vmax 도 전역 최대를 쓴다.
+            lo_disp, vmax = self._field_range(internal, field)
             # go.Volume 은 z-fastest 격자 순서를 가정 → pyvista(x-fastest)를 변환
             ax_lin = [np.linspace(lo3[i], hi3[i], dims[i]) for i in range(3)]
             X, Y, Z = np.meshgrid(*ax_lin, indexing="ij")
@@ -1542,32 +1572,35 @@ class CFDVisualizer:
             cmap = self._PLOTLY_CMAP.get(field, "Jet")
             unit = self._FIELD_UNIT.get(field, "")
             _a = min(max(float(opacity), 0.0), 1.0)
-            # v13 항목14: 볼륨 opacity 의 의미를 명확히 한다. go.Volume 은 광선이
-            # 통과하는 여러 반투명 층을 누적 블렌딩하므로, 단일 opacity 만으로는
-            # 100% 여도 최대색이 범례(불투명)보다 연하게 보였다(사용자 지적).
-            # opacityscale 로 '값이 높을수록 불투명' 전달함수를 주고, 슬라이더
-            # 값(_a)을 최고값의 알파로 직접 매핑 → opacity 를 올리면 실제로
-            # 불투명해지고(채도만이 아니라), 100% 에서 최대색이 범례색에 도달한다.
-            _opsc = [[0.0, 0.0], [0.35, _a*0.35], [0.7, _a*0.75], [1.0, _a]]
+            # v14 항목2·3: opacity 를 '균일'하게 적용한다(값 의존 opacityscale 폐기).
+            # 종전(v13) opacityscale 은 낮은 스칼라(=저속=dark blue)의 알파를 0 으로
+            # 눌러 후류가 통째로 사라지고 고속 free-stream 붉은색만 누적돼 연하게
+            # 보였다(항목3의 원인). 균일 알파를 쓰면 (1) 저속 dark blue 가 슬라이스와
+            # 같은 색으로 보이고, (2) 슬라이더가 전 범위에서 실제 투명도를 바꾸며,
+            # (3) 100% 면 앞면이 불투명해져 최대색이 범례색에 도달한다.
+            # 낮은 값도 보이도록 아주 낮은 값만 살짝 감쇠(0 근처=배경).
+            _opsc = [[0.0, 0.0], [0.04, _a], [1.0, _a]]
             fig = go.Figure()
             fig.add_trace(go.Volume(
                 x=X.ravel(), y=Y.ravel(), z=Z.ravel(), value=value,
                 isomin=lo_disp, isomax=vmax,
                 cmin=lo_disp, cmax=vmax,
                 opacity=1.0, opacityscale=_opsc,
-                surface_count=max(int(surface_count), 21),
+                surface_count=max(int(surface_count), 25),
                 colorscale=cmap,
                 caps=dict(x_show=False, y_show=False, z_show=False),
                 showscale=False,      # 컬러바는 아래 동기 전용 트레이스가 담당
                 hoverinfo="skip"))
-            # v12 항목4 / v13 항목14: 투명도 동기 컬러바 — opacityscale 의 최고
-            # 알파(_a)를 컬러바에도 그대로 입혀(rgba) 화면 표시색과 범례를 일치.
+            # v14 항목3: 컬러바(범례)는 '참 색상'(불투명 cmap)을 쓴다. 종전엔
+            # 투명도를 알파로 입혀 범례가 창백해졌는데(항목3), 범례는 '스칼라→색'
+            # 매핑의 기준이어야 하므로 항상 불투명 Jet 로 둔다. 투명도는 별개의
+            # 보기 보조수단이며 렌더의 색 자체(색상)는 범례와 동일하다.
             fig.add_trace(go.Scatter3d(
                 x=[lo3[0], lo3[0]], y=[lo3[1], lo3[1]], z=[lo3[2], lo3[2]],
                 mode="markers",
                 marker=dict(size=0.001, opacity=0.0,
                             color=[lo_disp, vmax],
-                            colorscale=self._alpha_colorscale(cmap, _a),
+                            colorscale=cmap,
                             cmin=lo_disp, cmax=vmax, showscale=True,
                             colorbar=dict(
                                 title=dict(text=f"{field} [{unit}]",
@@ -1700,24 +1733,19 @@ class CFDVisualizer:
             _valid = vals[~np.isnan(vals)]
             if _valid.size == 0:
                 return None
-            vmin, vmax = float(_valid.min()), float(_valid.max())
-            if not (vmax > vmin):
-                vmax = vmin + 1e-6
-            # v11 항목4·5: 표시 범위는 항상 0 ~ 최대값 — 슬라이더·등치값·컬러맵이
-            # 전체 속도 분포(0 m/s 포함)를 나타내야 한다. (v10 의 관심영역 분위수
-            # 레벨은 FS 에서 0.899 부터 시작하는 문제를 유발해 폐기.)
-            lo_disp = 0.0 if vmin >= 0.0 else vmin   # |U| 등은 0, 압력 등은 실제 최소
+            vmin = float(_valid.min())
+            # v14 항목3: 등치값·컬러맵 범위를 슬라이스·볼륨과 '동일'하게
+            # (내부 메시 전역, 같은 스칼라=같은 색).
+            lo_disp, vmax = self._field_range(internal, field)
             cmin_disp = lo_disp
 
             dx, dy = ex[0], ex[1]
             tile_nx = max(1, int(tile_nx)); tile_ny = max(1, int(tile_ny))
             offsets = [(i*dx, j*dy) for i in range(tile_nx) for j in range(tile_ny)]
             if level is None and level_frac is not None:
-                level = vmin + float(level_frac) * (vmax - vmin)
+                level = lo_disp + float(level_frac) * (vmax - lo_disp)
             cmap = self._PLOTLY_CMAP.get(field, "Jet")
             unit = self._FIELD_UNIT.get(field, "")
-            # v12 항목4: 투명도 동기용 rgba 스케일(표면·컬러바 공통 소스)
-            _cscale_a = self._alpha_colorscale(cmap, opacity)
 
             # 등치면 렌더링: go.Isosurface는 plotly가 격자를 특정 순서(z-fastest)로
             # 재구성한다고 가정하는데, pyvista ImageData의 점 순서는 x-fastest라
@@ -1762,24 +1790,22 @@ class CFDVisualizer:
                                      showscale=False, showlegend=False,
                                      hoverinfo="skip")
                 cp, cf, cintens = geom
+                # v14 항목2: 투명도는 반드시 Mesh3d 의 opacity '속성'으로 적용한다.
+                # 종전(v12·v13)엔 알파를 rgba 컬러스케일에 넣고 opacity=1.0 을
+                # 두었는데, go.Mesh3d 는 컬러스케일의 per-vertex 알파를 실제 표면
+                # 투명도로 렌더하지 않아 슬라이더를 바꿔도 아무 변화가 없었다.
+                # v14 항목3: 컬러스케일은 슬라이스와 동일한 원본(cmap)을 써서
+                # 같은 스칼라가 같은 색이 되게 한다(알파 틴트 제거).
                 kw = dict(
                     x=cp[:, 0]+ox, y=cp[:, 1]+oy, z=cp[:, 2],
                     i=cf[:, 0], j=cf[:, 1], k=cf[:, 2],
                     intensity=cintens,
-                    # v12 항목4: 투명도를 rgba 컬러스케일로 적용(opacity 속성 대신)
-                    # → 표면 투명도와 우측 컬러바가 항상 동기화된다.
-                    colorscale=_cscale_a,
+                    colorscale=cmap,
                     cmin=cmin_disp, cmax=vmax,   # v11 항목5: 컬러맵 0~최대
-                    opacity=1.0, flatshading=False, showscale=first,
+                    opacity=float(opacity),      # 실제 표면 투명도(0~1)
+                    flatshading=False, showscale=False,
                     showlegend=False,
                     hovertemplate=f"{field}: %{{intensity:.4f}} {unit}<extra></extra>")
-                if first:
-                    kw["colorbar"] = dict(
-                        title=dict(text=f"{field} [{unit}]", side="right",
-                                   font=dict(size=12, color="black")),
-                        thickness=14, len=0.75,
-                        tickfont=dict(size=10, color="black"),
-                        outlinecolor="#333", outlinewidth=1)
                 return go.Mesh3d(**kw)
 
             fig = go.Figure()
@@ -1840,6 +1866,24 @@ class CFDVisualizer:
                         )
                         for fi in range(_nf)
                     ]
+
+            # v14 항목2·3: 등치면은 showscale=False 이므로 컬러바 전용(비가시)
+            # 트레이스를 하나 둔다. 범례는 '참 색상'(불투명 cmap) — 스칼라→색
+            # 매핑의 기준. 실제 표면 투명도는 Mesh3d.opacity 로 별도 적용된다.
+            fig.add_trace(go.Scatter3d(
+                x=[b[0], b[0]], y=[b[2], b[2]], z=[b[4], b[4]],
+                mode="markers",
+                marker=dict(size=0.001, opacity=0.0,
+                            color=[cmin_disp, vmax],
+                            colorscale=cmap,
+                            cmin=cmin_disp, cmax=vmax, showscale=True,
+                            colorbar=dict(
+                                title=dict(text=f"{field} [{unit}]", side="right",
+                                           font=dict(size=12, color="black")),
+                                thickness=14, len=0.75,
+                                tickfont=dict(size=10, color="black"),
+                                outlinecolor="#333", outlinewidth=1)),
+                showlegend=False, hoverinfo="skip"))
 
             # v10 항목4: 유동방향 화살표(고정 트레이스 — 스윕 프레임은 앞쪽
             # n_tiles 트레이스만 교체하므로 영향 없음)
