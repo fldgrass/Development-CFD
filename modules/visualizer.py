@@ -165,6 +165,34 @@ class CFDVisualizer:
     Streamlit에 PNG/HTML로 임베드
     """
 
+    # v16: 프로세스(클래스) 레벨 캐시 — Streamlit 은 매 rerun(슬라이더·모드 전환)
+    # 마다 CFDVisualizer 를 새로 생성한다. 인스턴스 캐시는 그때마다 버려져 메시
+    # 재로드(수 초)+격자 재샘플(수 초)이 매번 반복됐다(볼륨 7초/조작). 케이스가
+    # 바뀌지 않는 한(케이스 폴더 mtime 시그니처 동일) 재계산하지 않도록 클래스
+    # 딕셔너리에 보관한다. 최근 소수 케이스만 유지(메모리 상한).
+    _MESH_STORE = {}   # {case_str: (sig, mesh)}      — 표시프레임 적용 메시
+    _VOL_STORE = {}    # {case_str: (sig, sampled, lo3, hi3, dims)}  — 볼륨 격자
+    _ISO_STORE = {}    # {case_str: (sig, sampled)}   — 등치면 격자
+    _STORE_CAP = 3     # 케이스 수 상한(메시가 커서 낮게)
+
+    @staticmethod
+    def _store_put(store, key, val, cap):
+        store[key] = val
+        if len(store) > cap:
+            # 가장 오래된 항목부터 제거(삽입 순서 = dict 순서)
+            for _k in list(store.keys())[:-cap]:
+                store.pop(_k, None)
+
+    def _case_sig(self):
+        """케이스 신선도 시그니처 — 완료 케이스는 정적이라 재사용, 진행 중
+        케이스는 새 시간 디렉토리가 써지며 mtime 이 바뀌어 자동 갱신된다."""
+        try:
+            _ts = [p.stat().st_mtime for p in self.case_dir.iterdir() if p.is_dir()]
+            return (str(self.case_dir.resolve()),
+                    round(max(_ts), 3) if _ts else 0.0)
+        except Exception:
+            return (str(self.case_dir), 0.0)
+
     # 컬러맵 설정
     FIELD_CONFIG = {
         "U":     {"label": "유속 |U| [m/s]",       "cmap": "coolwarm",  "component": "magnitude"},
@@ -606,12 +634,24 @@ class CFDVisualizer:
     # ─── 유틸리티 ─────────────────────────────────────────────────────────
 
     def _get_mesh(self, max_cache_age: float = 30.0):
-        """메시 캐시 관리 (30초 캐시)"""
-        now = time.time()
-        if self._mesh_cache is None or (now - self._cache_time) > max_cache_age:
-            _m = self.reader.load_openfoam_mesh()
-            self._mesh_cache = self._apply_display_frame(_m)
-            self._cache_time = now
+        """메시 캐시 관리 — v16: 프로세스 레벨(_MESH_STORE)에 보관해 매 rerun
+        새 인스턴스에서도 재로드하지 않는다. 케이스 mtime 시그니처가 같으면 재사용
+        (완료 케이스=정적), 바뀌면(진행 중) 재로드."""
+        if self._mesh_cache is not None:
+            return self._mesh_cache
+        sig = self._case_sig()
+        key = sig[0]
+        _ent = CFDVisualizer._MESH_STORE.get(key)
+        if _ent is not None and _ent[0] == sig:
+            self._mesh_cache = _ent[1]
+            self._cache_time = sig[1]
+            return self._mesh_cache
+        _m = self.reader.load_openfoam_mesh()
+        mesh = self._apply_display_frame(_m)
+        self._mesh_cache = mesh
+        self._cache_time = sig[1]
+        CFDVisualizer._store_put(CFDVisualizer._MESH_STORE, key,
+                                 (sig, mesh), CFDVisualizer._STORE_CAP)
         return self._mesh_cache
 
     def _get_output_path(self, suffix: str) -> Path:
@@ -623,6 +663,14 @@ class CFDVisualizer:
         """캐시 무효화 (새 결과가 생성된 경우 호출)"""
         self._mesh_cache = None
         self._cache_time = 0
+        # v16: 프로세스 레벨 스토어에서도 이 케이스 항목 제거
+        try:
+            _k = str(self.case_dir.resolve())
+        except Exception:
+            _k = str(self.case_dir)
+        for _store in (CFDVisualizer._MESH_STORE, CFDVisualizer._VOL_STORE,
+                       CFDVisualizer._ISO_STORE):
+            _store.pop(_k, None)
 
     # ═══════════════════════════════════════════════════════════════════════
     # Plotly 인터랙티브 시각화 (마우스 드래그 회전, 슬라이스 위치 이동)
@@ -1499,8 +1547,11 @@ class CFDVisualizer:
                 return None
             b = internal.bounds
             ex = [max(b[1]-b[0], 1e-9), max(b[3]-b[2], 1e-9), max(b[5]-b[4], 1e-9)]
-            _vc = getattr(self, "_vol_cache", None)
-            if _vc is not None and _vc[0] == self._cache_time:
+            # v16: 볼륨 격자 리샘플을 프로세스 레벨(_VOL_STORE)에 캐시 — 매 rerun
+            # 새 인스턴스에서도 재샘플(수 초)하지 않고 재사용한다.
+            _sig = self._case_sig(); _vkey = _sig[0]
+            _vc = CFDVisualizer._VOL_STORE.get(_vkey)
+            if _vc is not None and _vc[0] == _sig:
                 sampled, lo3, hi3, dims = _vc[1:]
             else:
                 fb = None
@@ -1527,7 +1578,9 @@ class CFDVisualizer:
                 g.origin = tuple(lo3)
                 g.spacing = tuple(float(fex[i])/max(1, dims[i]-1) for i in range(3))
                 sampled = g.sample(internal)
-                self._vol_cache = (self._cache_time, sampled, lo3, hi3, dims)
+                CFDVisualizer._store_put(
+                    CFDVisualizer._VOL_STORE, _vkey,
+                    (_sig, sampled, lo3, hi3, dims), CFDVisualizer._STORE_CAP)
             arr = sampled[field]
             vals = (np.linalg.norm(arr, axis=1) if getattr(arr, "ndim", 1) == 2
                     else np.asarray(arr, float))
@@ -1591,9 +1644,16 @@ class CFDVisualizer:
             # (3) 100% 면 앞면이 불투명해져 최대색이 범례색에 도달한다.
             # 낮은 값도 보이도록 아주 낮은 값만 살짝 감쇠(0 근처=배경).
             _opsc = [[0.0, 0.0], [0.04, _a], [1.0, _a]]
+            # v16: float32 다운캐스트 — plotly 는 배열을 바이너리(bdata)로
+            # 직렬화하므로 float64→float32 로 전송 페이로드가 절반이 되고
+            # (14MB→~7MB) 브라우저 WebGL 메모리도 줄어 상호작용이 가벼워진다.
+            _xf = X.ravel().astype(np.float32)
+            _yf = Y.ravel().astype(np.float32)
+            _zf = Z.ravel().astype(np.float32)
+            _vf = value.astype(np.float32)
             fig = go.Figure()
             fig.add_trace(go.Volume(
-                x=X.ravel(), y=Y.ravel(), z=Z.ravel(), value=value,
+                x=_xf, y=_yf, z=_zf, value=_vf,
                 isomin=lo_disp, isomax=vmax,
                 cmin=lo_disp, cmax=vmax,
                 opacity=1.0, opacityscale=_opsc,
@@ -1719,9 +1779,11 @@ class CFDVisualizer:
             # 한도를 초과한다. 형상(그물) 주변 집중 비균일 격자(_focus_grid)로
             # 리샘플하고, 미적용 시 도메인 비율 균일 격자(~4.5만 점) 폴백.
             # 리샘플은 필드 무관(전 필드 포함)이라 메시 캐시와 같은 수명으로 캐시.
+            # v16: 등치면 격자 리샘플도 프로세스 레벨(_ISO_STORE)에 캐시
+            _sig = self._case_sig(); _ikey = _sig[0]
             sampled = None
-            _rs = getattr(self, "_rs_cache", None)
-            if _rs is not None and _rs[0] == self._cache_time:
+            _rs = CFDVisualizer._ISO_STORE.get(_ikey)
+            if _rs is not None and _rs[0] == _sig:
                 sampled = _rs[1]
             if sampled is None:
                 grid = None
@@ -1740,7 +1802,8 @@ class CFDVisualizer:
                                     ex[1]/max(1, _dims[1]-1),
                                     ex[2]/max(1, _dims[2]-1))
                 sampled = grid.sample(internal)
-                self._rs_cache = (self._cache_time, sampled)
+                CFDVisualizer._store_put(CFDVisualizer._ISO_STORE, _ikey,
+                                         (_sig, sampled), CFDVisualizer._STORE_CAP)
             if field not in sampled.array_names:
                 return None
             arr = sampled[field]
