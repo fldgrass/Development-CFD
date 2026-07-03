@@ -284,7 +284,9 @@ def _persist_input_state():
     """업로드한 STL 선택과 자동 감지 정보를 디스크에 기록한다. STL 파일 자체는
     이미 stl_uploads/ 에 저장돼 있으므로, 여기서는 '어떤 파일을 쓰는지'와 감지
     결과만 저장해 두면 새로고침 후 새 세션이 그대로 복구할 수 있다."""
-    if not (ss.get("stl_net_path") or ss.get("stl_cage_path")):
+    # v13 항목1: 활성 프로젝트가 있으면 STL 이 없어도 상태를 기록한다(F5 후 복구).
+    if not (ss.get("stl_net_path") or ss.get("stl_cage_path")
+            or ss.get("active_project")):
         return
     try:
         state = {k: ss.get(k) for k in (
@@ -292,9 +294,11 @@ def _persist_input_state():
             "auto_cell_size_mm", "auto_wire_d_mm", "auto_solidity",
             "auto_frontal_area", "cell_size_mm", "solidity_input",
             "unit_nx", "unit_ny",
+            # v13 항목1: 활성 프로젝트도 저장 → 새로고침 후 자동 로드
+            "active_project",
         )}
         tmp = INPUT_STATE_FILE.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(state, ensure_ascii=False))
+        tmp.write_text(json.dumps(state, ensure_ascii=False, default=str))
         tmp.replace(INPUT_STATE_FILE)
     except Exception:
         pass
@@ -325,6 +329,16 @@ def _restore_input_state():
               "unit_nx", "unit_ny"):
         if data.get(k) is not None:
             ss[k] = data[k]
+    # v13 항목1: 활성 프로젝트가 있었으면 새로고침 후 자동으로 다시 로드해
+    # 조건·결과·매트릭스를 복원한다(프로젝트 폴더가 실제 존재할 때만).
+    # _restore_input_state 는 _pending_load_project 처리 지점보다 뒤에서
+    # 호출되므로 즉시 반영을 위해 직접 로드한다.
+    _ap = data.get("active_project")
+    if _ap:
+        _apmode = data.get("analysis_mode") or ss.get("analysis_mode", "unit_cell")
+        if (_project_dir(_apmode, _ap) / "project.json").exists():
+            _apply_project_load(_apmode, _ap)
+            ss["_last_synced_proj_name"] = None
     ss._input_restored = True
 
 # ─── 프로젝트(케이스 묶음) 저장/불러오기/새로 만들기 (항목3·4) ────────────────
@@ -440,6 +454,100 @@ def _apply_project_new():
     ss.active_project = None
 
 
+def _project_has_unsaved_changes(_mode):
+    """현재 세션의 프로젝트 설정이 저장된 project.json 과 다른지(항목5).
+    활성 프로젝트가 없으면(임시 작업) 변경 여부를 판단할 기준이 없으므로,
+    조건/결과가 하나라도 설정돼 있으면 '미저장'으로 본다."""
+    _name = ss.get("active_project")
+    if not _name:
+        # 임시 작업: 기본값과 다른 조건이 하나라도 있으면 미저장으로 간주
+        for k, v in PROJECT_DEFAULTS.items():
+            if k in ss and ss.get(k) != v:
+                return True
+        return bool(ss.get("stl_net_path") or ss.get("stl_cage_path"))
+    _p = _project_dir(_mode, _name) / "project.json"
+    if not _p.exists():
+        return True
+    try:
+        _saved = json.loads(_p.read_text())
+    except Exception:
+        return True
+    def _norm(v):
+        return str(v) if isinstance(v, Path) else v
+    for k in PROJECT_KEYS:
+        if _norm(ss.get(k)) != _norm(_saved.get(k)):
+            return True
+    return False
+
+
+@st.dialog("💾 변경사항을 저장할까요?")
+def _unsaved_guard_dialog(_next_action: str):
+    """항목5: 현재 프로젝트에 미저장 변경이 있을 때, 파괴적 동작(새 프로젝트·
+    다른 프로젝트 불러오기) 직전에 저장 여부를 확인한다."""
+    _mode = ss.get("analysis_mode", "unit_cell")
+    _act_label = {"new": "새 프로젝트 만들기",
+                  "load": "다른 프로젝트 불러오기"}.get(_next_action, "계속")
+    st.write(f"현재 프로젝트에 저장하지 않은 변경사항이 있습니다. "
+             f"**{_act_label}** 전에 저장할까요?")
+    _c1, _c2, _c3 = st.columns(3)
+    if _c1.button("💾 저장하고 계속", type="primary", use_container_width=True):
+        _nm = (ss.get("active_project")
+               or (ss.get("proj_name_input") or "").strip())
+        if _nm:
+            save_project(_mode, _nm)
+        ss["_guard_proceed"] = _next_action
+        st.rerun()
+    if _c2.button("저장 안 함", use_container_width=True):
+        ss["_guard_proceed"] = _next_action
+        st.rerun()
+    if _c3.button("취소", use_container_width=True):
+        st.rerun()
+
+
+@st.dialog("🗂️ 프로젝트 열기")
+def _open_project_dialog():
+    """항목4: Windows 파일 탐색기 스타일 '열기' 대화상자에 준하는 브라우저.
+    웹앱(브라우저 샌드박스)에서는 OS 네이티브 파일 탐색기를 띄울 수 없으므로,
+    프로젝트 폴더를 나열·미리보기·선택하는 표준 다이얼로그로 대체한다."""
+    _mode = ss.get("analysis_mode", "unit_cell")
+    _root = _projects_dir(_mode)
+    st.caption(f"📁 위치: `{_root}`")
+    _names = list_project_names(_mode)
+    if not _names:
+        st.info("이 모드에 저장된 프로젝트가 없습니다.")
+        if st.button("닫기", use_container_width=True):
+            st.rerun()
+        return
+    # 파일 목록(수정시각·조건수 미리보기)
+    _rows = []
+    for _n in _names:
+        _pj = _project_dir(_mode, _n) / "project.json"
+        _mt, _cond = "-", "-"
+        try:
+            _mt = datetime.fromtimestamp(_pj.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            _d = json.loads(_pj.read_text())
+            _us = int(_d.get("u_steps", 1) or 1); _as = int(_d.get("a_steps", 1) or 1)
+            _cond = f"{_us}×{_as}"
+        except Exception:
+            pass
+        _rows.append({"프로젝트": _n, "수정": _mt, "조건(U×A)": _cond})
+    st.dataframe(_rows, use_container_width=True, hide_index=True, height=210)
+    _sel = st.selectbox("열 프로젝트 선택", options=_names,
+                        key="_open_dlg_sel")
+    _c1, _c2 = st.columns(2)
+    if _c1.button("📂 열기", type="primary", use_container_width=True):
+        # 미저장 변경이 있으면 가드 후 로드, 없으면 즉시 로드
+        if _project_has_unsaved_changes(_mode):
+            ss["_pending_load_after_guard"] = _sel
+            ss["_guard_from_dialog"] = True
+        else:
+            ss._pending_load_project = _sel
+            ss["_last_synced_proj_name"] = None
+        st.rerun()
+    if _c2.button("취소", use_container_width=True):
+        st.rerun()
+
+
 @st.dialog("🆕 새 프로젝트 만들기")
 def _new_project_dialog():
     """항목1: 프로젝트 이름을 입력받아 폴더를 생성한다. 동일 이름이 이미 있으면
@@ -468,6 +576,19 @@ def _new_project_dialog():
             st.rerun()
         if _c2.button("취소", use_container_width=True):
             st.rerun()
+
+# v13 항목5: 미저장 변경 가드 다이얼로그 결과 처리(위젯 생성 전).
+_gp = ss.pop("_guard_proceed", None)
+if _gp == "new":
+    _new_project_dialog()
+elif _gp == "load":
+    _tgt = ss.pop("_pending_load_after_guard", None) or ss.get("proj_load_sel")
+    if _tgt:
+        ss._pending_load_project = _tgt
+        ss["_last_synced_proj_name"] = None
+# 파일 대화상자에서 미저장 변경이 감지된 경우 → 가드 다이얼로그를 띄운다.
+if ss.pop("_guard_from_dialog", False):
+    _unsaved_guard_dialog("load")
 
 # 위젯 생성 '이전'에 보류된 로드/생성/덮어쓰기/새프로젝트를 적용(세션 상태 안전 변경).
 if ss.get("_pending_load_project"):
@@ -995,31 +1116,98 @@ with st.sidebar:
     st.caption(f"현재 프로젝트: **{_active_proj}**" if _active_proj
                else "현재 프로젝트: _(없음 — 임시 작업)_")
     with st.expander("저장 / 불러오기 / 새로 만들기", expanded=True):
-        _pname = st.text_input("프로젝트 이름", value=(_active_proj or ""),
+        # v13 항목7: 새 프로젝트 생성/불러오기 직후 활성 프로젝트명을 이름 칸에
+        # 표시한다. 위젯 key 가 이미 세션에 있으면 value= 는 무시되므로,
+        # 활성 프로젝트가 바뀌면 위젯 생성 전에 세션 키를 직접 동기화한다.
+        if _active_proj and ss.get("_last_synced_proj_name") != _active_proj:
+            ss["proj_name_input"] = _active_proj
+            ss["_last_synced_proj_name"] = _active_proj
+        _pname = st.text_input("프로젝트 이름",
                                key="proj_name_input",
                                placeholder="예: onemesh2_기본")
-        if st.button("💾 현재 프로젝트 저장", use_container_width=True,
-                     key="proj_save_btn"):
-            _nm = (_pname or "").strip()
+
+        # v13 항목3·8: 저장은 on_click 콜백으로 — 본문 내 st.rerun() 은 스크립트를
+        # 조기 중단시켜 그 아래에서 생성되는 위젯(유속/영각 단계, 표시 방식 등)의
+        # 상태를 Streamlit 이 청소 → 결과 분석 탭 매트릭스·시각화가 기본값으로
+        # 리셋되던 버그(항목8). 콜백은 다음 런 시작 전에 실행되므로 전체 위젯이
+        # 정상 렌더되고 결과·CSV·매트릭스가 그대로 유지된다.
+        def _do_save_project():
+            _nm = (ss.get("proj_name_input") or "").strip()
             if _nm:
                 save_project(mode, _nm)
-                st.success(f"프로젝트 '{_nm}' 저장됨")
-                st.rerun()
+                ss["_save_toast"] = _nm
             else:
-                st.warning("프로젝트 이름을 입력하세요.")
+                ss["_save_toast_warn"] = True
+        st.button("💾 현재 프로젝트 저장", use_container_width=True,
+                  key="proj_save_btn", on_click=_do_save_project)
+        if ss.pop("_save_toast", None):
+            st.success(f"프로젝트 저장됨 · 결과/CSV/매트릭스 유지")
+        if ss.pop("_save_toast_warn", None):
+            st.warning("프로젝트 이름을 입력하세요.")
+
         _projs = list_project_names(mode)
         if _projs:
             st.selectbox("불러올 프로젝트", options=_projs, key="proj_load_sel")
-            if st.button("📂 프로젝트 불러오기", use_container_width=True,
-                         key="proj_load_btn"):
-                # 위젯 생성 전 적용을 위해 보류 플래그로 넘기고 재실행
-                ss._pending_load_project = ss.get("proj_load_sel")
-                st.rerun()
+            # v13 항목2·9: 불러오기도 콜백 — _pending_load_project 로 넘기면
+            # 다음 런 시작 시(위젯 생성 전) _apply_project_load 가 세션 상태를
+            # 갱신하고, active_project 설정으로 매트릭스·CSV·결과가 그 프로젝트
+            # 폴더 기준으로 자동 복원된다.
+            def _do_load_project():
+                # 항목5: 다른 프로젝트로 바꾸기 전 미저장 변경 확인
+                if _project_has_unsaved_changes(mode):
+                    ss["_pending_load_after_guard"] = ss.get("proj_load_sel")
+                    ss["_load_guard_requested"] = True
+                else:
+                    ss._pending_load_project = ss.get("proj_load_sel")
+                    ss["_last_synced_proj_name"] = None   # 이름 칸 재동기 유도
+            st.button("📂 프로젝트 불러오기", use_container_width=True,
+                      key="proj_load_btn", on_click=_do_load_project)
+            # v13 항목4: '파일 탐색기에서 열기' — 웹앱은 브라우저 샌드박스라
+            # OS 네이티브 파일 탐색기를 띄울 수 없으므로, 프로젝트 폴더를
+            # 탐색·선택하는 표준 다이얼로그(브라우저)로 제공한다.
+            if st.button("🗂️ 파일에서 프로젝트 열기…", use_container_width=True,
+                         key="proj_browse_btn"):
+                _open_project_dialog()
         else:
             st.caption("저장된 프로젝트가 없습니다.")
-        if st.button("🆕 새 프로젝트 (이름 입력)", use_container_width=True,
-                     key="proj_new_btn"):
+
+        def _do_new_project():
+            # v13 항목5: 새 프로젝트 진입 전 미저장 변경 감지 → 있으면 확인
+            # 다이얼로그, 없으면 곧바로 새 프로젝트 대화상자.
+            ss["_new_proj_requested"] = True
+        st.button("🆕 새 프로젝트 (이름 입력)", use_container_width=True,
+                  key="proj_new_btn", on_click=_do_new_project)
+    # 새 프로젝트 요청 처리 — 미저장 변경 가드
+    if ss.pop("_new_proj_requested", False):
+        if _project_has_unsaved_changes(mode):
+            _unsaved_guard_dialog("new")
+        else:
             _new_project_dialog()
+    # 불러오기 요청 처리 — 미저장 변경 가드
+    if ss.pop("_load_guard_requested", False):
+        _unsaved_guard_dialog("load")
+
+    # v13 항목1: 새로고침(F5/Ctrl+Shift+R) 가로채기 — 미저장 변경이 있으면
+    # 브라우저 표준 '나가시겠습니까?' 경고를 띄운다. 결과·조건은 프로젝트
+    # 폴더 + .input_state.json 에 저장돼 새로고침 후 자동 복구되지만(위 참조),
+    # 저장 안 한 변경은 이 경고로 사용자에게 알린다. active_project 유무를
+    # 부모 윈도우 플래그로 전달한다.
+    _dirty_flag = "1" if _project_has_unsaved_changes(mode) else "0"
+    import streamlit.components.v1 as _cvbu
+    _cvbu.html(f"""<script>
+(function(){{
+  var W=window.parent;
+  W.__cfdDirty="{_dirty_flag}";
+  if(!W.__cfdBeforeUnload){{
+    W.__cfdBeforeUnload=function(e){{
+      if(W.__cfdDirty==="1"){{
+        e.preventDefault(); e.returnValue=""; return "";
+      }}
+    }};
+    W.addEventListener("beforeunload", W.__cfdBeforeUnload);
+  }}
+}})();
+</script>""", height=0)
     st.divider()
 
     # ─── 공통 물리 조건 ───────────────────────────────────────────────────
@@ -2365,12 +2553,16 @@ with tab_results:
                     key="r1_field")
                 # 항목4: 모든 표시 모드에서 STL 형상을 결과와 함께 렌더링하고,
                 # 그 가시성(불투명도)을 사용자가 조절하도록 STL 투명도 슬라이더 제공.
-                _stl_op = st.slider(
-                    "STL 형상 투명도", min_value=0.0, max_value=1.0,
-                    value=float(ss.get("r1_stl_opacity", 0.15)), step=0.05,
-                    key="r1_stl_opacity",
-                    help="그물망(STL) 형상의 불투명도(0=숨김, 1=불투명). "
-                         "슬라이스·입체·등치면 모든 모드에 적용됩니다.")
+                # v13 항목13: 모든 투명도 슬라이더를 0~100%(0=완전 투명,
+                # 100=완전 불투명)로 통일. 내부 렌더 API 는 0~1 을 쓰므로 /100.
+                _stl_pct = st.slider(
+                    "STL 형상 투명도 [%]", 0, 100,
+                    int(round(float(ss.get("r1_stl_opacity", 0.15)) * 100)),
+                    5, key="r1_stl_opacity_pct",
+                    help="그물망(STL) 형상의 불투명도(0%=숨김, 100%=불투명). "
+                         "모든 모드에 적용됩니다.")
+                _stl_op = _stl_pct / 100.0
+                ss["r1_stl_opacity"] = _stl_op
                 _viz_r1 = CFDVisualizer(selected_case_dir)
 
                 # 카메라 유지: 슬라이스·입체·등치면이 모두 동일 uirevision('flowfield')을
@@ -2412,43 +2604,53 @@ with tab_results:
                     _cap = "💡 드래그: 회전 | 스크롤: 줌 | 차트 하단 슬라이더: 슬라이스 위치"
                 elif _vmode == "볼륨(연속)":
                     # v10 항목1: 슬라이스 사이를 보간한 연속 볼륨(go.Volume).
-                    _op_volc = st.slider(
-                        "볼륨 투명도", min_value=0.02, max_value=0.40,
-                        value=float(ss.get("r1_opacity_volc", 0.12)), step=0.02,
-                        key="r1_opacity_volc",
-                        help="연속 볼륨의 불투명도. 낮을수록 내부 구조가 잘 비칩니다.")
-                    # v12 항목5: XYZ 축별 클리핑 — 최대(100%)=전체, 줄일수록
-                    # 해당 축 +방향부터 절단되어 내부 단면이 실시간 노출.
-                    # 세 축 독립·동시 적용 가능.
+                    # v13 항목13: 투명도 0~100%. 항목14: 100%면 최대색이 범례색과
+                    # 일치(opacityscale 로 실제 불투명해짐).
+                    _volc_pct = st.slider(
+                        "볼륨 투명도 [%]", 0, 100,
+                        int(round(float(ss.get("r1_opacity_volc", 0.30)) * 100)),
+                        5, key="r1_opacity_volc_pct",
+                        help="0%=완전 투명, 100%=완전 불투명(최대색이 범례색과 일치)")
+                    _op_volc = _volc_pct / 100.0
+                    ss["r1_opacity_volc"] = _op_volc
+                    # v13 항목15: XYZ 축별 '대칭' 클리핑(-50%~+50%). 각 축 양방향
+                    # 슬라이더로 음/양 양쪽에서 독립·동시 절단. -50~+50 → [0,1] 위치
+                    # 로 매핑((v+50)/100). 기본 (-50,+50)=전체 표시.
                     _cc1, _cc2, _cc3 = st.columns(3)
                     with _cc1:
                         _clip_x = st.slider(
-                            "X 클리핑 [%]", 0, 100,
-                            int(ss.get("r1_clip_x", 100)), 5, key="r1_clip_x",
-                            help="X축 표시 비율 — 100%=전체, 줄이면 +X쪽부터 절단")
+                            "X 클리핑 [%]", -50, 50,
+                            tuple(ss.get("r1_clip_x", (-50, 50))), 5,
+                            key="r1_clip_x",
+                            help="양끝을 좁히면 −X·+X 양쪽에서 절단(전체=−50~+50)")
                     with _cc2:
                         _clip_y = st.slider(
-                            "Y 클리핑 [%]", 0, 100,
-                            int(ss.get("r1_clip_y", 100)), 5, key="r1_clip_y",
-                            help="Y축 표시 비율")
+                            "Y 클리핑 [%]", -50, 50,
+                            tuple(ss.get("r1_clip_y", (-50, 50))), 5,
+                            key="r1_clip_y", help="−Y·+Y 양방향 절단")
                     with _cc3:
                         _clip_z = st.slider(
-                            "Z 클리핑 [%]", 0, 100,
-                            int(ss.get("r1_clip_z", 100)), 5, key="r1_clip_z",
-                            help="Z축 표시 비율")
+                            "Z 클리핑 [%]", -50, 50,
+                            tuple(ss.get("r1_clip_z", (-50, 50))), 5,
+                            key="r1_clip_z", help="−Z·+Z 양방향 절단")
+                    _clip = tuple(((_lo + 50) / 100.0, (_hi + 50) / 100.0)
+                                  for (_lo, _hi) in (_clip_x, _clip_y, _clip_z))
                     _fig_r1 = _viz_r1.render_field_volume(
                         _r1_field, opacity=_op_volc, init_camera=_init_cam,
                         stl_opacity=_stl_op, tile_nx=_tnx, tile_ny=_tny,
-                        clip=(_clip_x/100.0, _clip_y/100.0, _clip_z/100.0))
-                    _cap = ("💡 드래그: 회전 | 스크롤: 줌 — 연속 볼륨 · "
-                            "XYZ 클리핑 슬라이더로 내부 단면 확인")
+                        clip=_clip)
+                    _cap = ("💡 드래그: 회전 | 스크롤: 줌 — 연속 볼륨 · XYZ 대칭 "
+                            "클리핑(±50%, 파란 평면=절단 위치)으로 내부 단면 확인")
                 elif _vmode == "입체":
                     # 항목4: 입체 모드 투명도 — 등치면 모드와 독립된 세션 키 사용.
-                    _op_vol = st.slider(
-                        "투명도(입체)", min_value=0.05, max_value=1.0,
-                        value=float(ss.get("r1_opacity_vol", 0.55)), step=0.05,
-                        key="r1_opacity_vol",
-                        help="등치면 표면의 불투명도(1.0=불투명). 입체 모드 전용.")
+                    # v13 항목13: 0~100%.
+                    _volp = st.slider(
+                        "투명도(입체) [%]", 0, 100,
+                        int(round(float(ss.get("r1_opacity_vol", 0.55)) * 100)),
+                        5, key="r1_opacity_vol_pct",
+                        help="0%=완전 투명, 100%=완전 불투명. 입체 모드 전용.")
+                    _op_vol = _volp / 100.0
+                    ss["r1_opacity_vol"] = _op_vol
                     _fig_r1 = _viz_r1.render_field_3d(
                         _r1_field, tile_nx=_tnx, tile_ny=_tny,
                         init_camera=_init_cam, opacity=_op_vol,
@@ -2458,11 +2660,14 @@ with tab_results:
                     # 수동 슬라이더 체크박스 제거 — Plotly 내장 슬라이더가 수동·자동 모두 담당.
                     # ▶ 재생: 자동 스윕  |  차트 하단 슬라이더: 수동 위치 선택
                     # 항목4: 등치면(스윕) 투명도 — 입체 모드와 독립된 세션 키 사용.
-                    _op_iso = st.slider(
-                        "투명도(등치면)", min_value=0.05, max_value=1.0,
-                        value=float(ss.get("r1_opacity_iso", 0.55)), step=0.05,
-                        key="r1_opacity_iso",
-                        help="등치면 표면의 불투명도(1.0=불투명). 등치면 모드 전용.")
+                    # v13 항목13: 0~100%.
+                    _isop = st.slider(
+                        "투명도(등치면) [%]", 0, 100,
+                        int(round(float(ss.get("r1_opacity_iso", 0.55)) * 100)),
+                        5, key="r1_opacity_iso_pct",
+                        help="0%=완전 투명, 100%=완전 불투명. 등치면 모드 전용.")
+                    _op_iso = _isop / 100.0
+                    ss["r1_opacity_iso"] = _op_iso
                     _fig_r1 = _viz_r1.render_field_3d(
                         _r1_field, anim="sweep", tile_nx=_tnx, tile_ny=_tny,
                         init_camera=_init_cam, opacity=_op_iso,
@@ -2725,7 +2930,10 @@ with tab_results:
                 _viz_r2   = CFDVisualizer(selected_case_dir)
                 _fig_resid = _viz_r2.plot_residuals_plotly()
                 if _fig_resid:
-                    st.plotly_chart(_fig_resid, use_container_width=True, key="r2_resid")
+                    # v13 항목10: 다운로드 이미지도 2배 해상도(고DPI 화면 대비)
+                    st.plotly_chart(
+                        _fig_resid, use_container_width=True, key="r2_resid",
+                        config={"toImageButtonOptions": {"scale": 2}})
                     st.caption("hover로 각 반복에서의 잔차 값 확인 가능")
                 else:
                     _logs = list(selected_case_dir.glob("*.log")) + list(selected_case_dir.glob("log.*"))

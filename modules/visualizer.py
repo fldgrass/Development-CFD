@@ -818,22 +818,17 @@ class CFDVisualizer:
                 for t in self._stl_traces(go, _offsets, opacity=stl_opacity):
                     fig.add_trace(t)
 
-            # 유선 (Scatter3d 라인) — 단일 프레임 모드에서만
-            if show_streamlines and n_frames <= 1 and PYVISTA_OK and "U" in internal.array_names:
+            # 유선 (Scatter3d 라인) — v13 항목11: 종전엔 n_frames<=1 조건 때문에
+            # 슬라이스(n_frames=33)에서 유선 체크박스를 켜도 절대 그려지지 않았다.
+            # 조건을 제거하고, seed 를 물체(그물) 상류의 격자 평면에 배치해 그물을
+            # 통과하는 유선을 안정적으로 그린다(고정 트레이스 — 슬라이더와 무관).
+            if show_streamlines and PYVISTA_OK and "U" in internal.array_names:
                 try:
-                    seeds = pv.Sphere(radius=(hi-lo)*0.05, center=list(origin))
-                    stream = internal.streamlines_from_source(
-                        seeds, vectors="U", max_steps=500, max_step_length=0.05)
-                    if stream.n_points > 0:
-                        sp = stream.points
-                        fig.add_trace(go.Scatter3d(
-                            x=sp[:,0], y=sp[:,1], z=sp[:,2],
-                            mode='lines',
-                            line=dict(color='black', width=1),
-                            showlegend=False, hoverinfo='skip',
-                        ))
-                except Exception:
-                    pass
+                    _sf = self._streamline_trace(pv, go, internal, bounds)
+                    if _sf is not None:
+                        fig.add_trace(_sf)
+                except Exception as _e:
+                    logger.warning(f"유선 렌더 실패: {_e}")
 
             # v10 항목4: 유동방향 화살표(고정 트레이스 — 프레임 교체와 무관)
             for t in self._flow_arrow_traces(go, bounds):
@@ -1315,6 +1310,59 @@ class CFDVisualizer:
             out.append([float(pos), f"rgba({r},{g},{b},{a:.3f})"])
         return out
 
+    def _streamline_trace(self, pv, go, internal, bounds):
+        """v13 항목11: 물체(그물) 상류 격자 seed → 통과 유선 Scatter3d.
+
+        표시 프레임 유동방향 d(AoA) 기준으로 물체 상류 0.5L 평면에 격자 seed 를
+        깔아 그물을 통과·우회하는 유선을 그린다. seed 를 물체 크기에 맞추므로
+        도메인이 큰 전체구조에서도 유선이 형상 주변에 모인다."""
+        _vc, _vh = self._view_box(bounds)
+        ang = self.angle_deg if self.angle_deg is not None else 90.0
+        aa = math.radians(float(ang))
+        d = np.array([math.sin(aa), -math.cos(aa), 0.0])  # 표시=솔버 근사(축 정렬 도메인)
+        # 솔버 좌표 유동방향(seed 평면 법선) — 실제 U 방향으로 상류를 잡는다
+        Uc = np.asarray(internal.cell_data["U"] if "U" in internal.cell_data
+                        else internal.point_data["U"], float)
+        Um = Uc.mean(axis=0)
+        n = Um / (np.linalg.norm(Um) + 1e-12)
+        # 상류 평면 중심: 물체 중심에서 유동 반대로 0.6L
+        ctr = np.array(_vc) - n * (1.2 * _vh)
+        # 평면 내 두 직교축
+        _t = np.array([0.0, 0.0, 1.0]) if abs(n[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+        e1 = np.cross(n, _t); e1 /= (np.linalg.norm(e1) + 1e-12)
+        e2 = np.cross(n, e1)
+        g = np.linspace(-0.9 * _vh, 0.9 * _vh, 9)
+        seeds_pts = np.array([ctr + a * e1 + b * e2 for a in g for b in g])
+        seeds = pv.PolyData(seeds_pts)
+        stream = internal.streamlines_from_source(
+            seeds, vectors="U",
+            integration_direction="both",
+            max_time=None, max_steps=2000,
+            initial_step_length=0.05, terminal_speed=1e-6)
+        if stream is None or stream.n_points == 0:
+            return None
+        # 라인 세그먼트를 NaN 구분으로 이어붙여 단일 Scatter3d 로 (성능)
+        try:
+            lines = stream.lines
+            pts = np.asarray(stream.points)
+            xs, ys, zs = [], [], []
+            i = 0
+            while i < len(lines):
+                npt = lines[i]
+                idx = lines[i+1:i+1+npt]
+                seg = pts[idx]
+                xs.extend(seg[:, 0].tolist() + [np.nan])
+                ys.extend(seg[:, 1].tolist() + [np.nan])
+                zs.extend(seg[:, 2].tolist() + [np.nan])
+                i += npt + 1
+        except Exception:
+            pts = np.asarray(stream.points)
+            xs, ys, zs = pts[:, 0], pts[:, 1], pts[:, 2]
+        return go.Scatter3d(
+            x=xs, y=ys, z=zs, mode="lines",
+            line=dict(color="#111", width=2),
+            name="유선", showlegend=False, hoverinfo="skip")
+
     def _flow_arrow_traces(self, go, bounds):
         """유동방향 표시기(v10 항목4): 표시 프레임 d(AoA) 3D 화살표 + 라벨.
 
@@ -1398,7 +1446,8 @@ class CFDVisualizer:
                             stl_opacity: float = 0.15,
                             init_camera: bool = True,
                             tile_nx: int = 1, tile_ny: int = 1,
-                            clip: Optional[Tuple[float, float, float]] = None
+                            clip: Optional[Any] = None,
+                            clip_planes: bool = True
                             ) -> Optional[Any]:
         """v10 항목1: 슬라이스 사이를 보간한 **연속 볼륨** 뷰(go.Volume).
 
@@ -1465,40 +1514,60 @@ class CFDVisualizer:
             ax_lin = [np.linspace(lo3[i], hi3[i], dims[i]) for i in range(3)]
             X, Y, Z = np.meshgrid(*ax_lin, indexing="ij")
             value = vals.reshape(dims, order="F").ravel(order="C")
-            # ── v12 항목5: XYZ 축별 클리핑 — clip=(fx,fy,fz), 1.0=전체 표시.
-            # 슬라이더가 최소로 갈수록 +축 쪽부터 절단: 임계 초과 영역의 값을
-            # isomin 아래로 밀어 렌더에서 제외(컬러맵·투명도 전달함수는 보존).
-            # 남은 볼륨의 내부 단면은 볼륨 렌더 특성상 자동으로 노출된다.
+            # ── v13 항목15: XYZ 축별 '대칭' 클리핑 — clip=((lo,hi)×3), 각 값은
+            # [0,1] 정규화 위치(0=축 최소, 1=축 최대). 기본 (0,1)=전체 표시.
+            # UI 의 -50~+50% 양방향 슬라이더가 이 (lo,hi) 로 매핑되어 음/양 양쪽에서
+            # 독립·동시 절단할 수 있다. 임계 밖 값을 isomin 아래로 밀어 렌더 제외
+            # (컬러맵·불투명도 전달함수 보존, 내부 단면 자동 노출).
+            _clip_bounds = None
             if clip is not None:
+                _norm = []
+                for _c in clip:
+                    if isinstance(_c, (tuple, list)):
+                        _lo, _hi = float(_c[0]), float(_c[1])
+                    else:   # 하위호환: 단일값 = 상한만
+                        _lo, _hi = 0.0, float(_c)
+                    _norm.append((min(max(_lo, 0.0), 1.0),
+                                  min(max(_hi, 0.0), 1.0)))
+                _clip_bounds = _norm
                 _hide = lo_disp - max(abs(vmax - lo_disp), 1e-6) * 0.05 - 1e-9
                 _keep = np.ones(value.shape, dtype=bool)
-                for _ci, (_arr3, _f) in enumerate(zip((X, Y, Z), clip)):
-                    _f = min(max(float(_f), 0.0), 1.0)
-                    if _f < 0.9999:
-                        _thr = lo3[_ci] + _f * (hi3[_ci] - lo3[_ci])
-                        _keep &= (_arr3.ravel() <= _thr + 1e-12)
+                for _ci, (_arr3, (_lo, _hi)) in enumerate(zip((X, Y, Z), _norm)):
+                    if _lo > 1e-6 or _hi < 0.9999:
+                        _t0 = lo3[_ci] + _lo * (hi3[_ci] - lo3[_ci])
+                        _t1 = lo3[_ci] + _hi * (hi3[_ci] - lo3[_ci])
+                        _r = _arr3.ravel()
+                        _keep &= (_r >= _t0 - 1e-12) & (_r <= _t1 + 1e-12)
                 value = np.where(_keep, value, _hide)
             cmap = self._PLOTLY_CMAP.get(field, "Jet")
             unit = self._FIELD_UNIT.get(field, "")
+            _a = min(max(float(opacity), 0.0), 1.0)
+            # v13 항목14: 볼륨 opacity 의 의미를 명확히 한다. go.Volume 은 광선이
+            # 통과하는 여러 반투명 층을 누적 블렌딩하므로, 단일 opacity 만으로는
+            # 100% 여도 최대색이 범례(불투명)보다 연하게 보였다(사용자 지적).
+            # opacityscale 로 '값이 높을수록 불투명' 전달함수를 주고, 슬라이더
+            # 값(_a)을 최고값의 알파로 직접 매핑 → opacity 를 올리면 실제로
+            # 불투명해지고(채도만이 아니라), 100% 에서 최대색이 범례색에 도달한다.
+            _opsc = [[0.0, 0.0], [0.35, _a*0.35], [0.7, _a*0.75], [1.0, _a]]
             fig = go.Figure()
             fig.add_trace(go.Volume(
                 x=X.ravel(), y=Y.ravel(), z=Z.ravel(), value=value,
                 isomin=lo_disp, isomax=vmax,
                 cmin=lo_disp, cmax=vmax,
-                opacity=float(opacity), surface_count=int(surface_count),
+                opacity=1.0, opacityscale=_opsc,
+                surface_count=max(int(surface_count), 21),
                 colorscale=cmap,
                 caps=dict(x_show=False, y_show=False, z_show=False),
                 showscale=False,      # 컬러바는 아래 동기 전용 트레이스가 담당
                 hoverinfo="skip"))
-            # v12 항목4: 투명도 동기 컬러바 — 현재 투명도를 알파로 입힌 rgba
-            # 스케일을 쓰는 전용(비가시) 트레이스. 투명도 슬라이더 변경 시
-            # 컬러바 색이 함께 갱신되어 화면 표시와 항상 일치한다.
+            # v12 항목4 / v13 항목14: 투명도 동기 컬러바 — opacityscale 의 최고
+            # 알파(_a)를 컬러바에도 그대로 입혀(rgba) 화면 표시색과 범례를 일치.
             fig.add_trace(go.Scatter3d(
                 x=[lo3[0], lo3[0]], y=[lo3[1], lo3[1]], z=[lo3[2], lo3[2]],
                 mode="markers",
                 marker=dict(size=0.001, opacity=0.0,
                             color=[lo_disp, vmax],
-                            colorscale=self._alpha_colorscale(cmap, opacity),
+                            colorscale=self._alpha_colorscale(cmap, _a),
                             cmin=lo_disp, cmax=vmax, showscale=True,
                             colorbar=dict(
                                 title=dict(text=f"{field} [{unit}]",
@@ -1508,6 +1577,35 @@ class CFDVisualizer:
                                 tickfont=dict(size=10, color="black"),
                                 outlinecolor="#333", outlinewidth=1)),
                 showlegend=False, hoverinfo="skip"))
+            # v13 항목12: 클리핑 경계 미리보기 평면 — 활성(비-전체) 클리핑 축마다
+            # 절단면 위치에 반투명 평면을 그려, 최종 렌더 전에도 어느 부분이
+            # 잘리는지 즉시 보이게 한다(볼륨 리샘플은 캐시라 클리핑은 이미 실시간).
+            if clip_planes and _clip_bounds is not None:
+                _pcol = "#1a4a8a"
+                for _ci, (_lo, _hi) in enumerate(_clip_bounds):
+                    for _fr, _act in ((_lo, _lo > 1e-6), (_hi, _hi < 0.9999)):
+                        if not _act:
+                            continue
+                        _p = lo3[_ci] + _fr * (hi3[_ci] - lo3[_ci])
+                        _u = [(lo3[j], hi3[j]) for j in range(3)]
+                        _u[_ci] = (_p, _p)
+                        _gx, _gy, _gz = (np.array([[_u[0][0], _u[0][1]]]),
+                                         None, None)
+                        # 평면 4모서리
+                        _oth = [j for j in range(3) if j != _ci]
+                        _c0 = np.array([lo3[_oth[0]], hi3[_oth[0]]])
+                        _c1 = np.array([lo3[_oth[1]], hi3[_oth[1]]])
+                        A, Bp = np.meshgrid(_c0, _c1, indexing="ij")
+                        P = np.zeros((2, 2, 3))
+                        P[..., _ci] = _p
+                        P[..., _oth[0]] = A
+                        P[..., _oth[1]] = Bp
+                        fig.add_trace(go.Surface(
+                            x=P[..., 0], y=P[..., 1], z=P[..., 2],
+                            surfacecolor=np.zeros((2, 2)),
+                            colorscale=[[0, _pcol], [1, _pcol]],
+                            showscale=False, opacity=0.18,
+                            hoverinfo="skip", showlegend=False))
             for t in self._boundary_traces(go, [(0.0, 0.0)], opacity=stl_opacity):
                 fig.add_trace(t)
             for t in self._flow_arrow_traces(go, b):
@@ -1902,23 +2000,35 @@ class CFDVisualizer:
                 line=dict(color='red', width=1, dash='dash'),
             ))
 
-        # 범례 글자가 보이지 않던 문제(항목 10) → 전역/범례 폰트 색을 명시한다.
+        # v13 항목10: 텍스트 선명도 개선 — plotly 는 텍스트를 SVG(벡터)로 그리므로
+        # 확대해도 원리상 선명하다. 흐릿하게 보이던 원인은 (1) 작은 폰트, (2) 옅은
+        # 색, (3) 폰트 패밀리 미지정으로 인한 렌더 편차. 시스템 산세리프를 명시하고
+        # 폰트 크기·굵기·대비를 높여 모든 글자가 또렷하게 보이도록 한다.
+        _FAM = "Arial, 'Helvetica Neue', Helvetica, sans-serif"
+        _AXT = dict(family=_FAM, size=14, color="#111")   # 축 제목
+        _TKF = dict(family=_FAM, size=12, color="#111")   # 눈금
         fig.update_layout(
-            font=dict(color="#222"),
-            xaxis=dict(title="Iteration", gridcolor='lightgray', showgrid=True),
-            yaxis=dict(title="Residual", type='log', gridcolor='lightgray',
-                       showgrid=True, exponentformat='e'),
-            title=dict(text="Convergence History", font=dict(size=14, color="#222"), x=0.5),
+            font=dict(family=_FAM, color="#111", size=13),
+            xaxis=dict(title=dict(text="Iteration", font=_AXT),
+                       tickfont=_TKF, gridcolor='#d9d9d9', showgrid=True,
+                       linecolor="#888", ticks="outside", tickcolor="#888"),
+            yaxis=dict(title=dict(text="Residual", font=_AXT), type='log',
+                       tickfont=_TKF, gridcolor='#d9d9d9', showgrid=True,
+                       exponentformat='e', linecolor="#888",
+                       ticks="outside", tickcolor="#888"),
+            title=dict(text="Convergence History",
+                       font=dict(family=_FAM, size=17, color="#111"), x=0.5),
             showlegend=True,
-            legend=dict(font=dict(size=12, color="#222"),
-                        title=dict(text="필드", font=dict(size=12, color="#222")),
-                        bgcolor='rgba(255,255,255,0.9)',
-                        bordercolor='lightgray', borderwidth=1),
+            legend=dict(font=dict(family=_FAM, size=13, color="#111"),
+                        title=dict(text="필드",
+                                   font=dict(family=_FAM, size=13, color="#111")),
+                        bgcolor='rgba(255,255,255,0.95)',
+                        bordercolor='#888', borderwidth=1),
             hovermode='x unified',
-            margin=dict(l=60, r=20, t=50, b=60),
+            margin=dict(l=64, r=20, t=54, b=62),
             height=420,
             paper_bgcolor='white',
-            plot_bgcolor='#fafafa',
+            plot_bgcolor='#ffffff',
         )
         return fig
 
