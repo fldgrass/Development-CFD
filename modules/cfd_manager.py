@@ -506,6 +506,9 @@ class UnitCellCaseBuilder:
         cells_z = max(20, round(2 * depth / base_mm))
 
         bmd = self.case_dir / "system" / "blockMeshDict"
+        # v11 addLayers: 측면 주기 경계가 cyclicAMI(translational)라
+        # separationVector(패치 간 이동벡터 = 셀 크기[m])도 함께 치환한다.
+        _sep = self.cell_size   # m (템플릿 자리표시자 0.02 = 20mm 도메인 기준)
         replace_in_file(bmd, {
             "(-10 -10 -50)": f"({-half_x:.1f} {-half_y:.1f} {-depth:.1f})",
             "( 10 -10 -50)": f"({half_x:.1f} {-half_y:.1f} {-depth:.1f})",
@@ -516,6 +519,14 @@ class UnitCellCaseBuilder:
             "( 10  10  50)": f"({half_x:.1f} {half_y:.1f} {depth:.1f})",
             "(-10  10  50)": f"({-half_x:.1f} {half_y:.1f} {depth:.1f})",
             "(20 20 100)": f"({cells_x} {cells_y} {cells_z})",
+            "separationVector (0.02 0 0);":
+                f"separationVector ({_sep:.6f} 0 0);",
+            "separationVector (-0.02 0 0);":
+                f"separationVector (-{_sep:.6f} 0 0);",
+            "separationVector (0 0.02 0);":
+                f"separationVector (0 {_sep:.6f} 0);",
+            "separationVector (0 -0.02 0);":
+                f"separationVector (0 -{_sep:.6f} 0);",
         })
 
     def _patch_fvSolution(self):

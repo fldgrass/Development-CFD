@@ -58,26 +58,50 @@ boundary
     }
     xMin
     {
-        type    cyclic;
+        // v11 addLayers 업그레이드: cyclic → cyclicAMI.
+        // 그물선이 주기 경계를 관통할 때 레이어 절단이 결합면 순서를 깨는
+        // getFaceOrder FATAL 을 회피(AMI 는 위상 결합이 없어 무관).
+        type            cyclicAMI;
         neighbourPatch  xMax;
+        transform       translational;
+        separationVector (0.02 0 0);
+        lowWeightCorrection 0.2;
         faces   ((0 4 7 3));
     }
     xMax
     {
-        type    cyclic;
+        // v11 addLayers 업그레이드: cyclic → cyclicAMI.
+        // 그물선이 주기 경계를 관통할 때 레이어 절단이 결합면 순서를 깨는
+        // getFaceOrder FATAL 을 회피(AMI 는 위상 결합이 없어 무관).
+        type            cyclicAMI;
         neighbourPatch  xMin;
+        transform       translational;
+        separationVector (-0.02 0 0);
+        lowWeightCorrection 0.2;
         faces   ((1 2 6 5));
     }
     yMin
     {
-        type    cyclic;
+        // v11 addLayers 업그레이드: cyclic → cyclicAMI.
+        // 그물선이 주기 경계를 관통할 때 레이어 절단이 결합면 순서를 깨는
+        // getFaceOrder FATAL 을 회피(AMI 는 위상 결합이 없어 무관).
+        type            cyclicAMI;
         neighbourPatch  yMax;
+        transform       translational;
+        separationVector (0 0.02 0);
+        lowWeightCorrection 0.2;
         faces   ((0 1 5 4));
     }
     yMax
     {
-        type    cyclic;
+        // v11 addLayers 업그레이드: cyclic → cyclicAMI.
+        // 그물선이 주기 경계를 관통할 때 레이어 절단이 결합면 순서를 깨는
+        // getFaceOrder FATAL 을 회피(AMI 는 위상 결합이 없어 무관).
+        type            cyclicAMI;
         neighbourPatch  yMin;
+        transform       translational;
+        separationVector (0 -0.02 0);
+        lowWeightCorrection 0.2;
         faces   ((3 7 6 2));
     }
 );

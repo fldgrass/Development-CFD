@@ -17,10 +17,10 @@ internalField   uniform 0;
 
 boundaryField
 {
-    xMin { type cyclic; }
-    xMax { type cyclic; }
-    yMin { type cyclic; }
-    yMax { type cyclic; }
+    xMin { type cyclicAMI; }
+    xMax { type cyclicAMI; }
+    yMin { type cyclicAMI; }
+    yMax { type cyclicAMI; }
     zMin
     {
         type            calculated;

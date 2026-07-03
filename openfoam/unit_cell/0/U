@@ -27,19 +27,19 @@ boundaryField
     // 그물 단위 셀의 반복 구조를 표현하는 핵심 설정
     xMin
     {
-        type            cyclic;
+        type            cyclicAMI;
     }
     xMax
     {
-        type            cyclic;
+        type            cyclicAMI;
     }
     yMin
     {
-        type            cyclic;
+        type            cyclicAMI;
     }
     yMax
     {
-        type            cyclic;
+        type            cyclicAMI;
     }
     // ─── 유입/유출 경계 (유동 방향) ────────────────────────────────────
     zMin

@@ -23,19 +23,19 @@ boundaryField
 {
     xMin
     {
-        type            cyclic;
+        type            cyclicAMI;
     }
     xMax
     {
-        type            cyclic;
+        type            cyclicAMI;
     }
     yMin
     {
-        type            cyclic;
+        type            cyclicAMI;
     }
     yMax
     {
-        type            cyclic;
+        type            cyclicAMI;
     }
     // v10 항목5 수정: 종전 zMin(p 고정)+zMax(zeroGradient)는 입구 과잉지정·
     // 출구 과소지정(ill-posed) — 그물 항력으로 하류압이 떨어질수록 압력방정식이

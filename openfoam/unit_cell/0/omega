@@ -25,19 +25,19 @@ boundaryField
 {
     xMin
     {
-        type            cyclic;
+        type            cyclicAMI;
     }
     xMax
     {
-        type            cyclic;
+        type            cyclicAMI;
     }
     yMin
     {
-        type            cyclic;
+        type            cyclicAMI;
     }
     yMax
     {
-        type            cyclic;
+        type            cyclicAMI;
     }
     zMin
     {
