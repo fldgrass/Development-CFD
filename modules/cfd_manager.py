@@ -348,6 +348,41 @@ def compute_projected_area(stl_path: Path, flow_dir: Tuple[float, float, float])
     return (total * 0.5) / 1.0e6
 
 
+def is_closed_surface(stl_path: Path) -> bool:
+    """STL 이 닫힌 매니폴드인지 판정한다(모든 에지가 정확히 2개 삼각형에 공유).
+
+    그물실(트와인)은 닫힌 원통 → True. 카이트·돛·판재 같은 열린 단일 곡면 → False.
+    compute_projected_area() 의 ÷2(앞/뒷면 중복 제거)는 닫힌 표면에서만 타당하므로,
+    이 판정이 False 면 그 값은 실제 면적의 절반이 된다(UI 경고 근거).
+    """
+    tris = read_stl_triangles(stl_path)
+    if not tris:
+        return False
+    edges: Dict[Tuple, int] = {}
+    for tri in tris:
+        vs = [tuple(round(c, 4) for c in v) for v in tri]
+        for i in range(3):
+            key = tuple(sorted((vs[i], vs[(i + 1) % 3])))
+            edges[key] = edges.get(key, 0) + 1
+    return all(n == 2 for n in edges.values())
+
+
+def compute_surface_area(stl_path: Path) -> float:
+    """STL 삼각형 면적의 단순 합[m²] — '면 자체의 면적'(투영 아님).
+
+    카이트/돛처럼 열린 곡면의 기준면적으로 쓰인다. STL 좌표 mm 가정.
+    """
+    total = 0.0
+    for p0, p1, p2 in read_stl_triangles(stl_path):
+        e1 = (p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2])
+        e2 = (p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2])
+        cx = e1[1] * e2[2] - e1[2] * e2[1]
+        cy = e1[2] * e2[0] - e1[0] * e2[2]
+        cz = e1[0] * e2[1] - e1[1] * e2[0]
+        total += 0.5 * math.sqrt(cx * cx + cy * cy + cz * cz)
+    return total / 1.0e6
+
+
 def detect_stl_cell_size(stl_path: Path) -> Dict[str, float]:
     """STL 바운딩 박스에서 단위 셀 크기·와이어 직경·고형률 자동 감지.
 
@@ -408,9 +443,13 @@ class UnitCellCaseBuilder:
                  end_time: int = 2000,
                  write_interval: int = 100,
                  refine_level: int = 3,
-                 solidity: float = None):
+                 solidity: float = None,
+                 aref_override: Optional[float] = None):
         self.case_dir         = case_dir
         self.stl_path         = stl_path
+        # 사용자가 UI 에서 직접 지정한 기준면적[m²]. None/0 이하면 자동 계산 사용.
+        self.aref_override    = (float(aref_override)
+                                 if aref_override and float(aref_override) > 0 else None)
         self.speed            = speed
         self.angle_deg        = angle_deg
         self.nx               = max(1, int(nx))
@@ -568,7 +607,13 @@ class UnitCellCaseBuilder:
             logger.warning(f"[UnitCell] 투영면적 계산 실패({_e}) → 근사식 사용")
             _cell_proj = 0.0
 
-        if _cell_proj > 0:
+        if self.aref_override is not None:
+            # 사용자 직접 입력이 자동 계산보다 항상 우선한다.
+            aref = self.aref_override
+            logger.info(
+                f"[UnitCell] Aref=사용자 직접 입력 {aref:.6e} m² "
+                f"(자동 계산값 {_cell_proj:.6e} m² 무시)")
+        elif _cell_proj > 0:
             aref = _cell_proj
             logger.info(
                 f"[UnitCell] Aref=고정 기준면적(그물면 법선 투영, 1셀) "
@@ -625,8 +670,12 @@ class FullStructureCaseBuilder:
                  n_cores: Optional[int] = None,
                  residual_control: float = 1e-4,
                  end_time: int = 3000,
-                 write_interval: int = 100):
+                 write_interval: int = 100,
+                 aref_override: Optional[float] = None):
         self.case_dir         = case_dir
+        # 사용자가 UI 에서 직접 지정한 기준면적[m²]. None/0 이하면 자동 계산 사용.
+        self.aref_override    = (float(aref_override)
+                                 if aref_override and float(aref_override) > 0 else None)
         self.cage_stl         = cage_stl
         self.net_stl          = net_stl
         self.speed            = speed
@@ -911,16 +960,33 @@ mergeTolerance 1e-6;
                 aref = 0.0
             if not (aref and aref > 1e-9):
                 aref = max(self._net_L**2, 1e-6)
+            if self.aref_override is not None:
+                # 사용자 직접 입력이 자동 계산보다 항상 우선한다.
+                logger.info(f"[FullStructure] Aref=사용자 직접 입력 "
+                            f"{self.aref_override:.6e} m² (자동 {aref:.6e} m² 무시)")
+                aref = self.aref_override
+            else:
+                logger.info(f"[FullStructure] Aref=자동(그물면 법선 투영) {aref:.6e} m²")
             lref = self._net_L
             cx, cy, cz = self._net_c
+            # ── CofR(모멘트 기준점) = 형상 중심 ──────────────────────────────
+            # net-only 는 STL 좌표를 그대로 쓰므로 형상이 원점에서 멀리 떨어져 있을
+            # 수 있다(예: 카이트가 x≈0.78 m). 템플릿 기본값 (0 0 0) 을 두면 Cm 이
+            # '원점까지의 지렛대 × 힘'에 지배되어 공력 피칭모멘트가 아니게 된다.
+            # 형상 중심으로 옮겨야 Cm 이 의미를 갖는다. (Cd·Cl 은 CofR 무관.)
+            # 치환은 forceCoeffs·forces 두 함수객체의 CofR 을 함께 갱신한다.
             replace_in_file(ctrl, {
                 "endTimeValue        3000;": f"endTimeValue        {self.end_time};",
                 "writeIntervalValue  100;":  f"writeIntervalValue  {self.write_interval};",
                 "magUInf         1.0;": f"magUInf         {self.speed:.4f};",
                 "lRef            10.0;":  f"lRef            {lref:.6f};",
                 "Aref            50.0;":  f"Aref            {aref:.6e};",
+                "CofR            (0 0 0);":
+                    f"CofR            ({cx:.6f} {cy:.6f} {cz:.6f});",
                 "patches         (cageSurface netSurface);": "patches         (netSurface);",
             })
+            logger.info(f"[FullStructure] CofR=형상 중심 "
+                        f"({cx:.4f} {cy:.4f} {cz:.4f}) m — Cm 기준점")
             # 샘플링 라인을 net 중심 부근으로(도메인 밖이면 무의미하므로)
             replace_in_file(ctrl, {
                 "start       (-30 0 -2.5);": f"start       ({cx-2*self._net_L:.4f} {cy:.4f} {cz:.4f});",
@@ -933,12 +999,16 @@ mergeTolerance 1e-6;
             return
         D, H = self.cage_D, self.cage_H
         aref = D * H
+        if self.aref_override is not None:
+            logger.info(f"[FullStructure] Aref=사용자 직접 입력 "
+                        f"{self.aref_override:.6e} m² (자동 D×H {aref:.4f} m² 무시)")
+            aref = self.aref_override
         replace_in_file(ctrl, {
             "endTimeValue        3000;":       f"endTimeValue        {self.end_time};",
             "writeIntervalValue  100;":        f"writeIntervalValue  {self.write_interval};",
             "magUInf         1.0;": f"magUInf         {self.speed:.4f};",
             "lRef            10.0;":  f"lRef            {D:.4f};",
-            "Aref            50.0;":  f"Aref            {aref:.4f};",
+            "Aref            50.0;":  f"Aref            {aref:.6e};",
         })
         # 샘플링 라인 좌표 교체
         replace_in_file(ctrl, {
@@ -1498,7 +1568,8 @@ class BatchAnalysisManager:
                         **{k: v for k, v in self.params.items()
                            if k in ["cell_size", "n_cores", "nx", "ny",
                                     "residual_control", "end_time",
-                                    "write_interval", "refine_level", "solidity"]}
+                                    "write_interval", "refine_level", "solidity",
+                                    "aref_override"]}
                     )
                 else:
                     builder = FullStructureCaseBuilder(
@@ -1512,7 +1583,8 @@ class BatchAnalysisManager:
                         # 동안 진행바가 99.9%에 고착된다(케이스가 멈춘 것처럼 보임).
                         **{k: v for k, v in self.params.items()
                            if k in ["cage_diameter", "cage_depth", "n_cores",
-                                    "end_time", "residual_control", "write_interval"]}
+                                    "end_time", "residual_control", "write_interval",
+                                    "aref_override"]}
                     )
 
                 builder.build()

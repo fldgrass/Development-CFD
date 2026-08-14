@@ -157,6 +157,10 @@ def init_session():
         "auto_solidity":      None,
         "auto_frontal_area":  None,
         "auto_wire_d_mm":     None,
+        # ── 기준면적 Aref: "자동" = 형상에서 계산, "직접 입력" = 사용자 지정값 사용 ──
+        "aref_mode":          "자동",
+        "aref_manual_m2":     0.0,
+        "show_surface_area":  False,   # STL 미리보기 표면적 영역 녹색 표시 토글
         # ── 계산량 프리셋 ──
         "calc_preset_name":   "보통",
         "end_time_preset":    2000,
@@ -294,6 +298,7 @@ def _persist_input_state():
             "auto_cell_size_mm", "auto_wire_d_mm", "auto_solidity",
             "auto_frontal_area", "cell_size_mm", "solidity_input",
             "unit_nx", "unit_ny",
+            "aref_mode", "aref_manual_m2",
             # v13 항목1: 활성 프로젝트도 저장 → 새로고침 후 자동 로드
             "active_project",
         )}
@@ -326,7 +331,7 @@ def _restore_input_state():
         ss.stl_cage_path = _cage
     for k in ("auto_cell_size_mm", "auto_wire_d_mm", "auto_solidity",
               "auto_frontal_area", "cell_size_mm", "solidity_input",
-              "unit_nx", "unit_ny"):
+              "unit_nx", "unit_ny", "aref_mode", "aref_manual_m2"):
         if data.get(k) is not None:
             ss[k] = data[k]
     # v13 항목1: 활성 프로젝트가 있었으면 새로고침 후 자동으로 다시 로드해
@@ -359,6 +364,8 @@ PROJECT_KEYS = [
     "auto_cell_size_mm", "auto_wire_d_mm", "auto_solidity",
     "auto_frontal_area", "cell_size_mm", "solidity_input",
     "unit_nx", "unit_ny",
+    # 기준면적 Aref(자동/직접 입력)
+    "aref_mode", "aref_manual_m2",
     # 결과 CSV(프로젝트 데이터) + 시각화 설정
     "batch_csv_name",
     "r1_viewmode", "r1_field", "r1_opacity_vol", "r1_opacity_iso",
@@ -368,6 +375,7 @@ PROJECT_DEFAULTS = {
     "u_min": 1.0, "u_max": 1.0, "u_steps": 1,
     "a_min": 0.0, "a_max": 0.0, "a_steps": 1,
     "rho": 1025.0, "nu": 1.19, "ti": 5,
+    "aref_mode": "자동", "aref_manual_m2": 0.0,
     "r1_viewmode": "슬라이스", "r1_field": "U",
     "r1_opacity_vol": 0.55, "r1_opacity_iso": 0.55,
 }
@@ -454,30 +462,45 @@ def _apply_project_new():
     ss.active_project = None
 
 
+def _project_changed_keys(_mode):
+    """저장된 project.json 과 다른 PROJECT_KEYS 를 [(키, 현재값, 저장값)] 로 반환.
+    가드 다이얼로그에 '무엇이 바뀌었는지' 보여주고, 오탐을 진단하는 데 쓴다."""
+    _name = ss.get("active_project")
+    if not _name:
+        return [(k, ss.get(k), v) for k, v in PROJECT_DEFAULTS.items()
+                if k in ss and ss.get(k) != v]
+    _p = _project_dir(_mode, _name) / "project.json"
+    if not _p.exists():
+        return [("(저장본 없음)", _name, None)]
+    try:
+        _saved = json.loads(_p.read_text())
+    except Exception:
+        return [("(저장본 손상)", _name, None)]
+
+    def _norm(v):
+        # Path→str, 그리고 1 과 1.0 처럼 JSON 왕복으로 타입만 달라진 수치는
+        # 같은 값으로 본다(오탐 방지 — 이것 때문에 저장 직후에도 '미저장 변경'
+        # 으로 잡혀 불러오기마다 가드가 떴다).
+        if isinstance(v, Path):
+            return str(v)
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return float(v)
+        return v
+
+    return [(k, ss.get(k), _saved.get(k)) for k in PROJECT_KEYS
+            if _norm(ss.get(k)) != _norm(_saved.get(k))]
+
+
 def _project_has_unsaved_changes(_mode):
     """현재 세션의 프로젝트 설정이 저장된 project.json 과 다른지(항목5).
     활성 프로젝트가 없으면(임시 작업) 변경 여부를 판단할 기준이 없으므로,
     조건/결과가 하나라도 설정돼 있으면 '미저장'으로 본다."""
-    _name = ss.get("active_project")
-    if not _name:
-        # 임시 작업: 기본값과 다른 조건이 하나라도 있으면 미저장으로 간주
-        for k, v in PROJECT_DEFAULTS.items():
-            if k in ss and ss.get(k) != v:
-                return True
-        return bool(ss.get("stl_net_path") or ss.get("stl_cage_path"))
-    _p = _project_dir(_mode, _name) / "project.json"
-    if not _p.exists():
-        return True
-    try:
-        _saved = json.loads(_p.read_text())
-    except Exception:
-        return True
-    def _norm(v):
-        return str(v) if isinstance(v, Path) else v
-    for k in PROJECT_KEYS:
-        if _norm(ss.get(k)) != _norm(_saved.get(k)):
-            return True
-    return False
+    if not ss.get("active_project"):
+        return bool(_project_changed_keys(_mode)
+                    or ss.get("stl_net_path") or ss.get("stl_cage_path"))
+    return bool(_project_changed_keys(_mode))
 
 
 @st.dialog("💾 변경사항을 저장할까요?")
@@ -489,6 +512,11 @@ def _unsaved_guard_dialog(_next_action: str):
                   "load": "다른 프로젝트 불러오기"}.get(_next_action, "계속")
     st.write(f"현재 프로젝트에 저장하지 않은 변경사항이 있습니다. "
              f"**{_act_label}** 전에 저장할까요?")
+    _chg = _project_changed_keys(_mode)
+    if _chg:
+        with st.expander(f"변경된 항목 {len(_chg)}개 보기", expanded=False):
+            for _k, _cur, _sav in _chg[:20]:
+                st.caption(f"· **{_k}**:  저장값 `{_sav}`  →  현재 `{_cur}`")
     _c1, _c2, _c3 = st.columns(3)
     if _c1.button("💾 저장하고 계속", type="primary", use_container_width=True):
         _nm = (ss.get("active_project")
@@ -501,50 +529,6 @@ def _unsaved_guard_dialog(_next_action: str):
         ss["_guard_proceed"] = _next_action
         st.rerun()
     if _c3.button("취소", use_container_width=True):
-        st.rerun()
-
-
-@st.dialog("🗂️ 프로젝트 열기")
-def _open_project_dialog():
-    """항목4: Windows 파일 탐색기 스타일 '열기' 대화상자에 준하는 브라우저.
-    웹앱(브라우저 샌드박스)에서는 OS 네이티브 파일 탐색기를 띄울 수 없으므로,
-    프로젝트 폴더를 나열·미리보기·선택하는 표준 다이얼로그로 대체한다."""
-    _mode = ss.get("analysis_mode", "unit_cell")
-    _root = _projects_dir(_mode)
-    st.caption(f"📁 위치: `{_root}`")
-    _names = list_project_names(_mode)
-    if not _names:
-        st.info("이 모드에 저장된 프로젝트가 없습니다.")
-        if st.button("닫기", use_container_width=True):
-            st.rerun()
-        return
-    # 파일 목록(수정시각·조건수 미리보기)
-    _rows = []
-    for _n in _names:
-        _pj = _project_dir(_mode, _n) / "project.json"
-        _mt, _cond = "-", "-"
-        try:
-            _mt = datetime.fromtimestamp(_pj.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-            _d = json.loads(_pj.read_text())
-            _us = int(_d.get("u_steps", 1) or 1); _as = int(_d.get("a_steps", 1) or 1)
-            _cond = f"{_us}×{_as}"
-        except Exception:
-            pass
-        _rows.append({"프로젝트": _n, "수정": _mt, "조건(U×A)": _cond})
-    st.dataframe(_rows, use_container_width=True, hide_index=True, height=210)
-    _sel = st.selectbox("열 프로젝트 선택", options=_names,
-                        key="_open_dlg_sel")
-    _c1, _c2 = st.columns(2)
-    if _c1.button("📂 열기", type="primary", use_container_width=True):
-        # 미저장 변경이 있으면 가드 후 로드, 없으면 즉시 로드
-        if _project_has_unsaved_changes(_mode):
-            ss["_pending_load_after_guard"] = _sel
-            ss["_guard_from_dialog"] = True
-        else:
-            ss._pending_load_project = _sel
-            ss["_last_synced_proj_name"] = None
-        st.rerun()
-    if _c2.button("취소", use_container_width=True):
         st.rerun()
 
 
@@ -586,9 +570,7 @@ elif _gp == "load":
     if _tgt:
         ss._pending_load_project = _tgt
         ss["_last_synced_proj_name"] = None
-# 파일 대화상자에서 미저장 변경이 감지된 경우 → 가드 다이얼로그를 띄운다.
-if ss.pop("_guard_from_dialog", False):
-    _unsaved_guard_dialog("load")
+        ss["_last_synced_load_sel"] = None
 
 # 위젯 생성 '이전'에 보류된 로드/생성/덮어쓰기/새프로젝트를 적용(세션 상태 안전 변경).
 if ss.get("_pending_load_project"):
@@ -865,6 +847,8 @@ def render_stl_interactive_plotly(
     ny: int = 1,
     cell_size_m: float = 0.02,   # 폴백용 — 실제 타일 간격은 STL bbox에서 자동 계산
     init_camera: bool = True,
+    highlight_surface: bool = False,
+    display_frame: bool = True,
 ):
     """Plotly go.Mesh3d 기반 인터랙티브 3D STL 뷰어. 마우스 드래그로 회전 가능.
 
@@ -934,6 +918,27 @@ def render_stl_interactive_plotly(
 
     pts   = np.vstack(all_pts)
     faces = np.vstack(all_faces)
+
+    # ── 통일 표시 좌표계 변환 (유동장 뷰와 축을 일치시킴) ──────────────────
+    # 유동장은 solver_to_display_rotation(mode, α) 로 회전해 그려진다. 미리보기가
+    # 원좌표를 쓰면 같은 형상이 두 화면에서 다른 축으로 보이므로 동일 변환을 건다.
+    #
+    #   unit_cell      : R = [[0,0,1],[-1,0,0],[0,-1,0]]  (α 무관)
+    #   full_structure : 케이스가 형상을 Y축 α 회전하므로 실제 표시 변환은
+    #                    R(α)·M_y(α) 인데, 이 곱은 α 와 무관하게 위와 같은
+    #                    상수 행렬이 된다(형상은 고정, 유속만 X–Y 평면에서 회전).
+    # 따라서 두 모드 모두 C·(x,y,z) = (z, −x, −y) 하나로 처리된다.
+    def _disp_xyz(xs, ys, zs):
+        """원좌표 리스트 → 표시좌표. None(선분 끊기)은 그대로 통과."""
+        if not display_frame:
+            return xs, ys, zs
+        return ([v for v in zs],
+                [None if v is None else -v for v in xs],
+                [None if v is None else -v for v in ys])
+
+    if display_frame:
+        pts = np.column_stack([pts[:, 2], -pts[:, 0], -pts[:, 1]])
+
     x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
     ii, ji, ki = faces[:, 0], faces[:, 1], faces[:, 2]
 
@@ -946,25 +951,42 @@ def render_stl_interactive_plotly(
                float(z.max()) - float(z.min()))
 
     # ── 유속 방향 화살표 ──────────────────────────────────────────────────
+    # 표시 프레임의 유속 단위벡터 = R·(솔버 유속) = (sinα, −cosα, 0) — 두 모드 공통.
+    # (원좌표 모드에서는 종전대로 X–Z 평면 화살표를 유지한다.)
     theta = math.radians(angle_deg)
     cos_t, sin_t = math.cos(theta), math.sin(theta)
+    if display_frame:
+        fu = (sin_t, -cos_t, 0.0)
+    else:
+        fu = (cos_t, 0.0, sin_t)
     aLen  = span * 0.55
-    ax0, az0 = cx - cos_t * aLen,        cz - sin_t * aLen
-    ax1, az1 = cx + cos_t * aLen * 0.25, cz + sin_t * aLen * 0.25
+    a_s = (cx - fu[0]*aLen,        cy - fu[1]*aLen,        cz - fu[2]*aLen)
+    a_e = (cx + fu[0]*aLen*0.25,   cy + fu[1]*aLen*0.25,   cz + fu[2]*aLen*0.25)
 
     # ── Figure 조립 ───────────────────────────────────────────────────────
     fig = go.Figure()
 
     # STL 메쉬
-    fig.add_trace(go.Mesh3d(
-        x=x, y=y, z=z,
-        i=ii, j=ji, k=ki,
-        color='#5dade2', opacity=0.78, flatshading=True,
+    _mesh_kw = dict(
+        x=x, y=y, z=z, opacity=0.78, flatshading=True,
         lighting=dict(ambient=0.5, diffuse=0.7, specular=0.2, roughness=0.5),
         lightposition=dict(x=1, y=2, z=3),
-        showlegend=False,
-        hoverinfo='skip',
-    ))
+        showlegend=False, hoverinfo='skip',
+    )
+    if highlight_surface:
+        # 시스템이 계산한 표면적(compute_surface_area)에 실제로 포함된 영역만 녹색.
+        # 그 값은 STL 파일 1개분이므로, 타일링(Nx×Ny) 시에도 기준 타일 하나만
+        # 녹색이 되고 복제 타일은 기본색으로 남는다 → '무엇을 센 면적인지'가 보인다.
+        _m_hi = len(base_faces)
+        fig.add_trace(go.Mesh3d(
+            i=ii[:_m_hi], j=ji[:_m_hi], k=ki[:_m_hi],
+            color='#2ecc71', **_mesh_kw))
+        if len(ii) > _m_hi:      # 복제 타일(면적 집계 대상 아님)
+            fig.add_trace(go.Mesh3d(
+                i=ii[_m_hi:], j=ji[_m_hi:], k=ki[_m_hi:],
+                color='#5dade2', **_mesh_kw))
+    else:
+        fig.add_trace(go.Mesh3d(i=ii, j=ji, k=ki, color='#5dade2', **_mesh_kw))
 
     # 단위셀 경계 박스 (타일이 2개 이상일 때)
     if do_tile:
@@ -982,24 +1004,25 @@ def render_stl_interactive_plotly(
             ez = [bz_min]*5 + [None] + [bz_max]*5 + [None,
                   bz_min, bz_max, None, bz_min, bz_max, None,
                   bz_min, bz_max, None, bz_min, bz_max]
+            _ex, _ey, _ez = _disp_xyz(ex, ey, ez)
             fig.add_trace(go.Scatter3d(
-                x=ex, y=ey, z=ez,
+                x=_ex, y=_ey, z=_ez,
                 mode='lines',
                 line=dict(color='#f39c12', width=1),
                 showlegend=False, hoverinfo='skip',
             ))
 
-    # 유속 화살표 shaft
+    # 유속 화살표 shaft (표시 프레임 기준으로 이미 계산된 a_s → a_e)
     fig.add_trace(go.Scatter3d(
-        x=[ax0, ax1], y=[cy, cy], z=[az0, az1],
+        x=[a_s[0], a_e[0]], y=[a_s[1], a_e[1]], z=[a_s[2], a_e[2]],
         mode='lines',
         line=dict(color='#e74c3c', width=6),
         showlegend=False, hoverinfo='skip',
     ))
     # 유속 화살표 cone
     fig.add_trace(go.Cone(
-        x=[ax1], y=[cy], z=[az1],
-        u=[cos_t * aLen * 0.22], v=[0.0], w=[sin_t * aLen * 0.22],
+        x=[a_e[0]], y=[a_e[1]], z=[a_e[2]],
+        u=[fu[0] * aLen * 0.22], v=[fu[1] * aLen * 0.22], w=[fu[2] * aLen * 0.22],
         colorscale=[[0, '#e74c3c'], [1, '#e74c3c']],
         showscale=False,
         sizemode='absolute', sizeref=span * 0.1,
@@ -1012,18 +1035,35 @@ def render_stl_interactive_plotly(
 
     # 첫 렌더에만 camera를 넣고, 이후 위젯 변경 렌더에서는 빼서 uirevision이
     # 사용자의 마우스 카메라를 보존하게 한다(render_field_plotly의 (D) 주석 참고).
+    # 축 제목: 표시 프레임이면 유동장 뷰와 같은 의미를 함께 적는다.
+    # 제목이 길면 3D 씬 가장자리에서 잘리므로 의미는 유지하되 짧게 적는다.
+    _ax_t = (("X [mm] · 법선", "Y [mm] · 유속", "Z [mm] · 수심")
+             if display_frame else ("X [mm]", "Y [mm]", "Z [mm]"))
+    # 축 가독성: 종전엔 연한 하늘색 배경 위에 gridcolor="white" 라 격자가 거의
+    # 안 보였고, 눈금·제목 폰트 색을 지정하지 않아 기본 연회색으로 나왔다.
+    # 배경은 더 밝게, 격자·축선·글자는 진하게 해서 대비를 확보한다.
+    def _axis(title, bg):
+        return dict(
+            title=dict(text=title, font=dict(size=12, color="#0d2d4e")),
+            tickfont=dict(size=11, color="#123a63"),
+            backgroundcolor=bg, showbackground=True,
+            gridcolor="#8fb0cf", gridwidth=1,
+            zeroline=True, zerolinecolor="#456d94", zerolinewidth=2,
+            showline=True, linecolor="#456d94", linewidth=2,
+            tickcolor="#456d94", ticklen=4, ticks="outside",
+        )
+
     _scene = dict(
-        xaxis=dict(title="X [mm]", backgroundcolor="#eaf4fb",
-                   gridcolor="white", showbackground=True),
-        yaxis=dict(title="Y [mm]", backgroundcolor="#eaf4fb",
-                   gridcolor="white", showbackground=True),
-        zaxis=dict(title="Z [mm]", backgroundcolor="#dce9f5",
-                   gridcolor="white", showbackground=True),
+        xaxis=_axis(_ax_t[0], "#f4f9fd"),
+        yaxis=_axis(_ax_t[1], "#f4f9fd"),
+        zaxis=_axis(_ax_t[2], "#e9f1f9"),
         aspectmode='data',
-        bgcolor='rgba(240,248,255,1)',
+        bgcolor='rgba(250,253,255,1)',
     )
     if init_camera:
-        _scene['camera'] = dict(eye=dict(x=1.4, y=1.0, z=0.9))
+        # 종전 (1.4,1.0,0.9) 은 플롯 박스가 씬을 가득 채워 축 제목이 잘렸다.
+        # 시점을 약간 뒤로 물려 가장자리에 제목이 들어갈 여유를 만든다.
+        _scene['camera'] = dict(eye=dict(x=1.62, y=1.16, z=1.04))
 
     fig.update_layout(
         showlegend=False,
@@ -1053,8 +1093,9 @@ def render_stl_interactive_plotly(
         ],
         scene=_scene,
         uirevision='stlpreview',
-        margin=dict(l=0, r=0, t=10, b=0),
-        height=440,
+        # 여백 0 이면 3D 씬 가장자리의 축 제목·눈금이 잘린다.
+        margin=dict(l=12, r=12, t=12, b=12),
+        height=470,
         paper_bgcolor='#f0f8ff',
     )
     return fig
@@ -1138,7 +1179,7 @@ with st.sidebar:
                 ss["_save_toast"] = _nm
             else:
                 ss["_save_toast_warn"] = True
-        st.button("💾 현재 프로젝트 저장", use_container_width=True,
+        st.button("💾 저장", use_container_width=True, type="primary",
                   key="proj_save_btn", on_click=_do_save_project)
         if ss.pop("_save_toast", None):
             st.success(f"프로젝트 저장됨 · 결과/CSV/매트릭스 유지")
@@ -1147,6 +1188,14 @@ with st.sidebar:
 
         _projs = list_project_names(mode)
         if _projs:
+            # 버그: 새 이름으로 저장해도 이 드롭다운은 이전 선택을 그대로 들고 있어,
+            # 저장 직후 '불러오기'를 누르면 엉뚱한 프로젝트가 로드됐다("저장 후
+            # 불러오기가 안 된다"의 실체). 활성 프로젝트가 바뀌면 위젯 생성 '전에'
+            # 선택값을 동기화한다(이름 칸 동기화와 같은 패턴).
+            if (_active_proj in _projs
+                    and ss.get("_last_synced_load_sel") != _active_proj):
+                ss["proj_load_sel"] = _active_proj
+                ss["_last_synced_load_sel"] = _active_proj
             st.selectbox("불러올 프로젝트", options=_projs, key="proj_load_sel")
             # v13 항목2·9: 불러오기도 콜백 — _pending_load_project 로 넘기면
             # 다음 런 시작 시(위젯 생성 전) _apply_project_load 가 세션 상태를
@@ -1160,14 +1209,10 @@ with st.sidebar:
                 else:
                     ss._pending_load_project = ss.get("proj_load_sel")
                     ss["_last_synced_proj_name"] = None   # 이름 칸 재동기 유도
-            st.button("📂 프로젝트 불러오기", use_container_width=True,
+            # 불러오기 버튼은 하나만 둔다(종전의 '파일에서 열기…' 다이얼로그는
+            # 이 드롭다운과 기능이 겹쳐 화면만 산만하게 만들어 제거).
+            st.button("📂 불러오기", use_container_width=True, type="primary",
                       key="proj_load_btn", on_click=_do_load_project)
-            # v13 항목4: '파일 탐색기에서 열기' — 웹앱은 브라우저 샌드박스라
-            # OS 네이티브 파일 탐색기를 띄울 수 없으므로, 프로젝트 폴더를
-            # 탐색·선택하는 표준 다이얼로그(브라우저)로 제공한다.
-            if st.button("🗂️ 파일에서 프로젝트 열기…", use_container_width=True,
-                         key="proj_browse_btn"):
-                _open_project_dialog()
         else:
             st.caption("저장된 프로젝트가 없습니다.")
 
@@ -1175,7 +1220,7 @@ with st.sidebar:
             # v13 항목5: 새 프로젝트 진입 전 미저장 변경 감지 → 있으면 확인
             # 다이얼로그, 없으면 곧바로 새 프로젝트 대화상자.
             ss["_new_proj_requested"] = True
-        st.button("🆕 새 프로젝트 (이름 입력)", use_container_width=True,
+        st.button("🆕 새 프로젝트", use_container_width=True,
                   key="proj_new_btn", on_click=_do_new_project)
     # 새 프로젝트 요청 처리 — 미저장 변경 가드
     if ss.pop("_new_proj_requested", False):
@@ -1403,6 +1448,10 @@ def _start_single_analysis(
 
     stl_net  = ss.stl_net_path
     stl_cage = ss.stl_cage_path
+    # 사용자 지정 Aref 는 스레드 시작 전(메인 스레드)에 값으로 확정해 클로저로 넘긴다.
+    _aref_ovr = _effective_aref()
+    if _aref_ovr > 0:
+        add_log(f"기준면적 Aref = {_aref_ovr:.6e} m² (사용자 직접 입력)")
 
     if mode == "unit_cell" and not stl_net:
         st.error("❌ 그물 STL 파일을 먼저 업로드하세요.")
@@ -1463,6 +1512,7 @@ def _start_single_analysis(
                     write_interval=write_interval,
                     refine_level=refine_level,
                     solidity=solidity,
+                    aref_override=_aref_ovr,
                 )
             else:
                 builder = FullStructureCaseBuilder(
@@ -1476,6 +1526,7 @@ def _start_single_analysis(
                     residual_control=residual_control,
                     end_time=end_time,
                     write_interval=write_interval,
+                    aref_override=_aref_ovr,
                 )
             builder.build()
             add_log("✅ 케이스 빌드 완료")
@@ -1582,9 +1633,23 @@ def _start_batch_analysis(mode, speeds, angles, csv_path, n_cores, rho, ti, nx=1
         "refine_level":     int(ss.get("refine_level_preset", 3)),
         "residual_control": float(ss.get("residual_preset", "1e-4")),
         "write_interval":   int(ss.get("write_interval_preset", 100)),
+        # 사용자 지정 기준면적(0 이면 빌더가 자동 계산)
+        "aref_override":    _effective_aref(),
     }
+    # 가두리 치수: 전달하지 않으면 FullStructureCaseBuilder 기본값(10 m × 5 m)이
+    # 쓰여 UI 입력이 무시된다 → 도메인 크기·lRef·Aref(D×H)가 모두 어긋난다.
+    # 위젯 key("cage_d"/"cage_h")로 세션에서 직접 읽어 배치에도 반영한다.
+    if mode == "full_structure":
+        _bp["cage_diameter"] = float(ss.get("cage_d", 10.0))
+        _bp["cage_depth"]    = float(ss.get("cage_h", 5.0))
+        add_log(f"가두리 치수: 직경 {_bp['cage_diameter']:.2f} m × "
+                f"수심 {_bp['cage_depth']:.2f} m")
     add_log(f"계산 조건: 반복 {_bp['end_time']} · 정밀화 {_bp['refine_level']} · "
             f"수렴 {_bp['residual_control']:.0e} · {n_cores}코어")
+    if _bp["aref_override"] > 0:
+        add_log(f"기준면적 Aref = {_bp['aref_override']:.6e} m² (사용자 직접 입력)")
+    else:
+        add_log("기준면적 Aref = 형상에서 자동 계산")
 
     # 항목1: 동적 ETA 의 초기(진행률<3%) 기준이 될 정적 총 예상시간을 저장.
     _n_cases = max(1, len(speeds) * len(angles))
@@ -1679,6 +1744,53 @@ def _stop_analysis():
     set_status("idle", "사용자에 의해 중지됨")
     add_log("⏹️ 해석 중지됨")
     st.rerun()
+
+def _auto_aref_info(mode: str) -> dict:
+    """케이스 빌더가 '자동'으로 계산할 Aref[m²]와 산출 근거를 UI 표시용으로 반환.
+
+    cfd_manager 의 빌더와 동일한 식을 쓰므로 여기 표시값 = 실제 controlDict 에
+    들어갈 값이다(직접 입력을 켜지 않은 경우).
+    반환 키: value(float|None), basis(str), open_shell(bool|None), surface(float|None)
+    """
+    out = {"value": None, "basis": "", "open_shell": None,
+           "surface": None, "projected": None}
+    if mode == "full_structure" and ss.get("stl_cage_path"):
+        D = float(ss.get("cage_d", 10.0)); H = float(ss.get("cage_h", 5.0))
+        out.update(value=D * H, basis=f"가두리 직경 D({D:.1f} m) × 수심 H({H:.1f} m) — STL 형상 미반영")
+        return out
+    net = ss.get("stl_net_path")
+    if not (net and Path(net).exists()):
+        out["basis"] = "STL 미업로드"
+        return out
+    try:
+        from cfd_manager import (compute_projected_area, compute_surface_area,
+                                 is_closed_surface)
+        closed = is_closed_surface(Path(net))
+        out["value"]      = compute_projected_area(Path(net), (0.0, 0.0, 1.0))
+        out["open_shell"] = not closed
+        out["surface"]    = compute_surface_area(Path(net))
+        # 진짜 투영면적: 닫힌 표면은 ÷2 가 맞으므로 value 그대로,
+        # 열린 곡면은 ÷2 가 과잉이므로 2 배 되돌린 값이 실제 투영면적이다.
+        out["projected"]  = out["value"] if closed else out["value"] * 2.0
+        out["basis"] = ("그물면 법선(Z축) 방향 투영면적 — 닫힌 표면" if closed
+                        else "그물면 법선(Z축) 방향 투영면적 — 열린 곡면")
+    except Exception as _e:
+        out["basis"] = f"계산 실패 ({_e})"
+    return out
+
+
+def _effective_aref() -> float:
+    """해석에 실제로 쓸 Aref[m²]. '직접 입력' 모드이고 값이 양수일 때만 값을 반환,
+    그 외에는 0.0 (= 빌더가 자동 계산)."""
+    if ss.get("aref_mode") == "직접 입력":
+        try:
+            v = float(ss.get("aref_manual_m2") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        if v > 0:
+            return v
+    return 0.0
+
 
 tab_input, tab_results, tab_help = st.tabs([
     "📂 입력 설정",
@@ -1795,6 +1907,94 @@ with tab_input:
                     _parts.append(f"그물 **{Path(ss.stl_net_path).name}**")
                 if _parts:
                     st.success("✅ 이전 업로드 STL 복구됨: " + ", ".join(_parts))
+
+        st.divider()
+
+        # ─── 기준면적 Aref ────────────────────────────────────────────────
+        # Cd = Fx / (0.5·ρ·U²·Aref), Cl = Fz / (0.5·ρ·U²·Aref) 의 분모.
+        # 자동 계산은 '그물면 법선 투영 + 닫힌 표면 가정(÷2)'이라 그물에는 맞지만
+        # 카이트·돛 같은 열린 곡면에는 맞지 않는다 → 직접 입력 경로를 제공한다.
+        st.markdown("### 📐 기준면적 (Aref)")
+        _ai = _auto_aref_info(mode)
+
+        st.radio(
+            "결정 방식", ["자동", "직접 입력"], key="aref_mode", horizontal=True,
+            help="Cd·Cl 의 분모가 되는 기준면적입니다. 자동은 STL 형상에서 계산하고, "
+                 "직접 입력은 여기 적은 값을 그대로 씁니다.",
+        )
+
+        if _ai["value"] is not None:
+            st.caption(f"자동 계산값: **{_ai['value']:.6e} m²** "
+                       f"({_ai['value']*1e4:.4f} cm²) — {_ai['basis']}")
+        else:
+            st.caption(f"자동 계산값: 없음 — {_ai['basis']}")
+
+        # 열린 곡면 경고: 자동값이 실제 면적의 절반이 되므로 직접 입력을 권한다.
+        if _ai["open_shell"] and ss.aref_mode == "자동":
+            st.warning(
+                f"⚠️ 이 STL 은 **열린 곡면**(경계 에지 있음)입니다. 자동 계산은 닫힌 "
+                f"표면을 가정해 ÷2 하므로 **실제 면적의 절반**이 들어갑니다.\n\n"
+                f"- 면 자체 면적(표면적): **{_ai['surface']:.6e} m²**\n"
+                f"- 평면 투영면적: **{_ai['projected']:.6e} m²**\n"
+                f"- 지금 자동으로 들어갈 값: **{_ai['value']:.6e} m²** ← 절반\n\n"
+                f"'직접 입력'으로 바꿔 올바른 값을 지정하세요."
+            )
+
+        # 참고값 채우기 버튼이 예약한 값을 위젯 생성 '전에' 반영한다.
+        # (위젯 인스턴스화 뒤에 ss[key] 를 쓰면 StreamlitAPIException 이 난다)
+        if ss.get("_aref_pending") is not None:
+            ss.aref_manual_m2 = float(ss.pop("_aref_pending"))
+
+        # 입력 UI(왼쪽) 옆에 시스템이 계산한 참고값(오른쪽)을 나란히 표시한다.
+        _in_col, _ref_col = st.columns([1.15, 1], gap="medium")
+
+        with _in_col:
+            if ss.aref_mode == "직접 입력":
+                # 처음 전환 시 자동값(열린 곡면이면 표면적)으로 씨앗값을 채워준다.
+                if not ss.get("aref_manual_m2"):
+                    _seed = (_ai["surface"] if _ai["open_shell"] else _ai["value"]) or 0.0
+                    ss.aref_manual_m2 = float(_seed)
+                st.number_input(
+                    "Aref [m²]", key="aref_manual_m2",
+                    min_value=0.0, step=1e-6, format="%.6e",
+                    help="0 보다 크면 이 값이 controlDict 의 Aref 로 그대로 들어갑니다. "
+                         "0 이면 자동 계산으로 되돌아갑니다.",
+                )
+                _mv = float(ss.get("aref_manual_m2") or 0.0)
+                if _mv > 0:
+                    _cmp = ""
+                    if _ai["value"]:
+                        _cmp = f"  |  자동값 대비 **{_mv/_ai['value']:.3f}배**"
+                    st.success(f"✅ 해석에 쓸 Aref = **{_mv:.6e} m²** "
+                               f"({_mv*1e4:.4f} cm²){_cmp}")
+                else:
+                    st.info("Aref 가 0 이라 자동 계산값을 사용합니다.")
+                _persist_input_state()
+            else:
+                st.metric("해석에 쓸 Aref (자동)",
+                          f"{_ai['value']*1e4:.3f} cm²" if _ai["value"] is not None else "—")
+                st.caption("값을 직접 지정하려면 위에서 '직접 입력'을 선택하세요.")
+
+        with _ref_col:
+            # 시스템이 STL 에서 직접 계산한 참고값 — 어떤 모드에서도 항상 보인다.
+            st.markdown("**📊 시스템 계산 참고값**")
+            if _ai["surface"] is not None:
+                st.metric("표면적 (면 자체)", f"{_ai['surface']*1e4:.3f} cm²",
+                          help=f"{_ai['surface']:.6e} m² — STL 삼각형 면적의 단순 합. "
+                               f"카이트·돛처럼 면 자체 면적을 기준으로 쓸 때의 값입니다.")
+                st.metric("투영면적 (실루엣)", f"{_ai['projected']*1e4:.3f} cm²",
+                          help=f"{_ai['projected']:.6e} m² — 그물면 법선(Z축) 방향 "
+                               f"정면 투영 면적. 그물의 그물발 투영면적이 이 값입니다.")
+                if ss.aref_mode == "직접 입력":
+                    _b1, _b2 = st.columns(2)
+                    if _b1.button("표면적 넣기", use_container_width=True,
+                                  key="aref_fill_surface"):
+                        ss["_aref_pending"] = _ai["surface"]; st.rerun()
+                    if _b2.button("투영면적 넣기", use_container_width=True,
+                                  key="aref_fill_proj"):
+                        ss["_aref_pending"] = _ai["projected"]; st.rerun()
+            else:
+                st.caption("STL 을 업로드하면 표면적·투영면적이 계산됩니다.")
 
         st.divider()
 
@@ -2034,6 +2234,13 @@ with tab_input:
             _ny_v     = int(ss.get("unit_ny", 1))
             _cs_m     = float(ss.get("cell_size_mm", 20.0)) / 1000.0
 
+            # 표면적 집계 영역을 녹색으로 확인하는 토글(기본 꺼짐 — 켤 때만 표시)
+            st.toggle(
+                "🟩 표면적 영역 표시", key="show_surface_area",
+                help="시스템이 계산한 표면적에 실제로 포함된 면을 녹색으로 칠합니다. "
+                     "Nx×Ny 타일링 시에는 면적 집계 대상인 기준 타일 1개만 녹색이 됩니다.",
+            )
+
             # ── 인터랙티브 Plotly 뷰어 (마우스 드래그 회전 가능) ──────────
             # 첫 렌더에만 카메라를 지정하고, 이후 영각·nx·ny 변경 렌더에서는 빼서
             # uirevision이 사용자의 마우스 카메라를 보존하게 한다.
@@ -2041,11 +2248,22 @@ with tab_input:
             _fig3d = render_stl_interactive_plotly(
                 _stl_show, mode, _angle_v, _nx_v, _ny_v, _cs_m,
                 init_camera=_stl_init_cam,
+                highlight_surface=bool(ss.get("show_surface_area", False)),
             )
             if _fig3d is not None:
                 st.plotly_chart(_fig3d, use_container_width=True,
                                 key="stl_3d_preview")
                 ss["_cam_init_stl"] = True
+                if ss.get("show_surface_area"):
+                    # 녹색 영역이 곧 표면적 수치임을 숫자로 함께 확인시켜 준다.
+                    _si = _auto_aref_info(mode)
+                    if _si["surface"] is not None:
+                        st.caption(
+                            f"🟩 녹색 = 표면적 집계 영역  |  "
+                            f"**{_si['surface']:.6e} m²** ({_si['surface']*1e4:.3f} cm²)"
+                            + ("  ·  파란색 복제 타일은 집계 제외"
+                               if (mode == "unit_cell" and (_nx_v > 1 or _ny_v > 1)) else "")
+                        )
                 st.caption(
                     "💡 마우스 드래그: 회전  |  스크롤: 줌  |  오른쪽 드래그: 이동"
                 )
@@ -2098,6 +2316,16 @@ with tab_input:
             "동점성계수":   f"{nu:.2f} × 10⁻⁶ m²/s",
             "난류 강도":    f"{ti}%",
         }
+        # 기준면적 Aref — 자동/직접 입력 어느 쪽이 쓰이는지 항상 명시
+        _ovr = _effective_aref()
+        if _ovr > 0:
+            summary_data["기준면적 Aref"] = (
+                f"{_ovr:.4e} m²  ({_ovr*1e4:.4f} cm²) — 사용자 직접 입력")
+        else:
+            _si = _auto_aref_info(mode)
+            summary_data["기준면적 Aref"] = (
+                f"{_si['value']:.4e} m²  ({_si['value']*1e4:.4f} cm²) — 자동: {_si['basis']}"
+                if _si["value"] is not None else f"자동 — {_si['basis']}")
         if mode == "unit_cell":
             summary_data["단위 셀 크기"] = f"{cell_size*1000:.1f} mm"
             summary_data["고형률 Sn"] = f"{float(solidity):.3f}  (참고용 2d/a 추정)"
@@ -3012,14 +3240,62 @@ with tab_results:
                             f"· Cd/Cl 유효 {_p_cd}행")
 
                     # ── 데이터 테이블 ──────────────────────────────────────
+                    # 주의: CSV 의 Fx/Fy/Fz 는 '솔버 프레임'(유속 +X 고정)이다.
+                    # 유동장·미리보기는 '통일 표시 프레임'(유속이 X–Y 평면에서 회전)
+                    # 으로 그려지므로 축 이름이 서로 다르다. 같은 화면에서 비교할 수
+                    # 있도록 표시 프레임 성분(F_항력/F_양력/F_측력)을 함께 계산해 붙인다.
+                    _df_show = df.copy()
+                    if {"Fx_N", "Fy_N", "Fz_N", "angle_deg"}.issubset(df.columns):
+                        try:
+                            from cfd_manager import (solver_to_display_rotation,
+                                                     apply_rotation)
+                            _Rs = [solver_to_display_rotation(mode, float(r.angle_deg))
+                                   for r in df.itertuples()]
+                            _fd = [apply_rotation(_R, (float(r.Fx_N), float(r.Fy_N),
+                                                       float(r.Fz_N)))
+                                   for _R, r in zip(_Rs, df.itertuples())]
+                            # 표시 프레임의 힘 성분 — 화면 축과 그대로 대응한다.
+                            _df_show["FX_표시 [N]"] = [f[0] for f in _fd]
+                            _df_show["FY_표시 [N]"] = [f[1] for f in _fd]
+                            _df_show["FZ_표시 [N]"] = [f[2] for f in _fd]
+                            # 항력축(=유동방향)은 표시 프레임에서 α 에 따라 X–Y 평면을
+                            # 회전한다(α=0 → −Y, α=90 → +X). 고정 라벨을 붙이면 틀리므로
+                            # 각 행의 실제 방향을 함께 적는다.
+                            _df_show["유동방향_표시"] = [
+                                "({:+.2f}, {:+.2f}, {:+.2f})".format(
+                                    *apply_rotation(_R, (1.0, 0.0, 0.0)))
+                                for _R in _Rs]
+                        except Exception:
+                            pass
+
+                    # 힘 열은 값이 숫자만 나오므로 단위를 '열 제목'에만 붙인다.
+                    # (CSV 파일 자체는 하위 C++ 모델 호환을 위해 원래 열명을 유지 —
+                    #  여기서 바꾸는 건 화면 표시용 _df_show 뿐이다.)
+                    _df_show = _df_show.rename(columns={
+                        "Fx_N": "Fx [N]", "Fy_N": "Fy [N]", "Fz_N": "Fz [N]",
+                    })
+
                     st.markdown(f"**{csv_target.name}** — {len(df)} 행, {len(df.columns)} 열")
                     st.dataframe(
-                        df.style.format({
-                            col: "{:.5f}" for col in df.select_dtypes("float").columns
+                        _df_show.style.format({
+                            col: "{:.5f}" for col in _df_show.select_dtypes("float").columns
                         }),
                         use_container_width=True,
                         height=250,
                     )
+                    if "FX_표시 [N]" in _df_show.columns:
+                        st.caption(
+                            "⚠️ **Fx/Fy/Fz [N] 은 솔버 프레임**(유속을 항상 +X 로 고정)"
+                            " 이라 유동장·미리보기 화면의 축 이름과 다릅니다. "
+                            "화면과 같은 축의 성분이 **FX·FY·FZ_표시 [N]** 입니다.\n\n"
+                            "· **항력 = Fx [N]**(유동방향 성분), **양력 = Fz [N]**(유동에 수직) "
+                            "— 이 둘은 프레임과 무관한 값이라 Cd·Cl 과 항상 대응합니다.\n"
+                            "· 화면에서 유동방향은 영각에 따라 X–Y 평면을 회전합니다"
+                            "(α=0° → −Y축, α=90° → +X축). 행별 실제 방향은 "
+                            "**유동방향_표시** 열을 보세요.\n"
+                            "· 다운로드되는 CSV 원본 열명(`Fx_N` 등)은 하위 C++ 모델 "
+                            "호환을 위해 그대로 유지됩니다."
+                        )
 
                     # ── 영각 / 유속 필터 ──────────────────────────────────
                     _has_filter_cols = "angle_deg" in df.columns and "speed_m_s" in df.columns
@@ -3118,6 +3394,25 @@ with tab_results:
                             mime="text/csv",
                             key="r4_download",
                         )
+                    # 단위 포함본 — 화면 표에 붙인 단위를 파일에도 그대로 반영한다.
+                    # (위 호환 포맷은 하위 C++ 모델이 열명을 그대로 파싱하므로 건드리지
+                    #  않고, 사람이 읽는 용도로 별도 파일을 제공한다.)
+                    _UNIT_COLS = {
+                        "speed_m_s": "speed [m/s]", "angle_deg": "angle [deg]",
+                        "Fx_N": "Fx [N]", "Fy_N": "Fy [N]", "Fz_N": "Fz [N]",
+                        "rho_kg_m3": "rho [kg/m3]",
+                    }
+                    _df_unit = _df_show.rename(columns={
+                        k: v for k, v in _UNIT_COLS.items() if k in _df_show.columns})
+                    st.download_button(
+                        "⬇️ CSV 다운로드 (단위 표기 포함 · 사람이 읽는 용)",
+                        data=_df_unit.to_csv(index=False).encode("utf-8-sig"),
+                        file_name=csv_target.stem + "_units.csv",
+                        mime="text/csv",
+                        key="r4_download_units",
+                        help="열 제목에 단위를 붙이고 표시 프레임 힘 성분까지 포함합니다. "
+                             "Cd·Cl·Cm 은 무차원이라 단위가 없습니다.",
+                    )
 
                 except Exception as e:
                     st.error(f"CSV 읽기 오류: {e}")
