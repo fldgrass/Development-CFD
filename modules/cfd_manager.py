@@ -1073,7 +1073,7 @@ class FullStructureCaseBuilder:
         # 격자 옵션(보완④: DDES 등에서 격자 민감도를 확인하기 위한 노브).
         # 기본값 refine_level=3 / n_layers=0 은 종전 하드코딩 값과 완전히 동일한
         # snappyHexMeshDict 를 만든다(회귀 방지).
-        self.refine_level     = max(1, min(6, int(refine_level)))
+        self.refine_level     = max(1, min(7, int(refine_level)))
         self.n_layers         = max(0, min(10, int(n_layers)))
         self.auto_refine      = bool(auto_refine)
         self.case_dir         = case_dir
@@ -1237,16 +1237,16 @@ class FullStructureCaseBuilder:
                     f"{_tr['required_level']} 이상으로 올려야 합니다. "
                     f"(자동 보정이 꺼져 있어 레벨 {self.refine_level} 로 진행)")
                 return
-            _new = min(6, _tr["required_level"])
+            _new = min(7, _tr["required_level"])
             if _new > self.refine_level:
                 logger.warning(
                     _msg + f" ⚠️ 목표 미만 → 정밀화 레벨 자동 상향 "
                     f"{self.refine_level} → {_new} (셀 수·계산시간 증가)")
                 self.refine_level = _new
-                if _tr["required_level"] > 6:
+                if _tr["required_level"] > 7:
                     logger.warning(
                         f"[FullStructure] 목표 달성에는 레벨 {_tr['required_level']} 이 "
-                        f"필요하지만 상한 6 으로 제한했습니다. 결과에 격자 오차가 "
+                        f"필요하지만 상한 7 로 제한했습니다. 결과에 격자 오차가 "
                         f"남습니다.")
         except Exception as _e:
             logger.debug(f"[FullStructure] 정밀화 자동 산정 건너뜀: {_e}")

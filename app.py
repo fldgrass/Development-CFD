@@ -2321,7 +2321,7 @@ with tab_input:
             with _pc2:
                 refine_level = st.number_input(
                     "격자 정밀화 레벨",
-                    min_value=1, max_value=6, step=1,
+                    min_value=1, max_value=7, step=1,
                     key="refine_level_preset",
                     help="snappyHexMesh 표면 최대 정밀화 레벨 (min = 레벨-1). "
                          "레벨 3: ~50만 셀(권장), 레벨 4: ~200만 셀(정밀). "
