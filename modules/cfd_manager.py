@@ -20,7 +20,7 @@ import time
 import logging
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, List, Tuple, Callable
+from typing import Optional, Dict, List, Tuple, Callable, Any
 
 # ─── 로깅 설정 ─────────────────────────────────────────────────────────────
 logger = logging.getLogger("cfd_manager")
@@ -420,6 +420,294 @@ def detect_stl_cell_size(stl_path: Path) -> Dict[str, float]:
         "solidity":         round(solidity, 4),
         "frontal_area_m2":  frontal_area_m2,
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 비정상(transient) 해석 — pimpleFoam 지원
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 설계 원칙(지시서 §2·§19): 기존 steady 케이스 생성 로직을 일절 건드리지 않는다.
+# 빌더가 평소대로 케이스를 만든 '뒤에' apply_transient_settings() 로 사후 패치만
+# 한다. 따라서 Solver=Steady 경로는 바이트 단위로 종전과 동일하다.
+#
+# OpenFOAM v2312 기준으로 확인한 필수 사항:
+#  - fvSolution 의 solvers 에 p / "(U|k|omega)" 만 있어 PIMPLE 이 요구하는
+#    pFinal·UFinal 등을 못 찾고 실행 실패한다 → 정규식을 Final 포함으로 넓힌다.
+#  - fvSchemes 의 ddtSchemes 포맷이 모드마다 다르다(1줄 vs 여러 줄) → 정규식 처리.
+#  - SIMPLE 블록을 PIMPLE 로 교체하고 완화계수를 transient 용으로 바꾼다.
+
+TRANSIENT_DEFAULTS: Dict[str, Any] = {
+    "end_time":        30.0,     # 물리시간 [s]
+    "delta_t":         1.0e-3,   # 초기 시간간격 [s]
+    "max_co":          0.8,      # 보완⑤: 원본 1.0 → 0.8 (nOuterCorrectors=1 은 PISO)
+    "max_delta_t":     0.01,
+    "write_interval":  0.5,      # adjustableRunTime [s]
+    "n_outer":         1,
+    "n_correctors":    2,
+    "n_non_orth":      0,
+    "turbulence":      "kOmegaSST",
+    "ddt_scheme":      "backward",
+}
+
+# 지시서 보완②: URANS 가 비정상성을 억제할 때 넘어갈 대안. v2312 설치본에서
+# 라이브러리에 등록되어 있음을 확인한 모델만 노출한다.
+TRANSIENT_TURBULENCE_MODELS: Dict[str, str] = {
+    "kOmegaSST":           "RAS",   # 기본값 — 기존 steady 와 동일
+    "kOmegaSSTDDES":       "LES",
+    "kOmegaSSTDES":        "LES",
+    "SpalartAllmarasDDES": "LES",
+}
+
+
+def _sub_once(text: str, pattern: str, repl: str, flags=0) -> Tuple[str, bool]:
+    """정규식 치환 + 실제로 바뀌었는지 여부를 함께 반환(조용한 실패 방지)."""
+    new, n = re.subn(pattern, repl, text, count=1, flags=flags)
+    return new, bool(n)
+
+
+def apply_transient_settings(case_dir: Path, **kw) -> Dict[str, Any]:
+    """이미 생성된 steady 케이스를 pimpleFoam(비정상) 케이스로 전환한다.
+
+    반환: 실제 적용된 설정 dict(로그·보고용). 치환에 실패한 항목이 있으면
+    'warnings' 키에 담아 돌려준다(무음 실패 금지).
+    """
+    p = dict(TRANSIENT_DEFAULTS)
+    p.update({k: v for k, v in kw.items() if v is not None})
+    warn: List[str] = []
+
+    # ── 1) controlDict ────────────────────────────────────────────────────
+    ctrl = case_dir / "system" / "controlDict"
+    t = ctrl.read_text()
+    for pat, rep, name in [
+        (r"application\s+simpleFoam;", "application     pimpleFoam;", "application"),
+        (r"^endTimeValue\s+[0-9.eE+-]+;", f"endTimeValue        {p['end_time']:g};", "endTime"),
+        (r"^writeIntervalValue\s+[0-9.eE+-]+;",
+         f"writeIntervalValue  {p['write_interval']:g};", "writeInterval"),
+        (r"deltaT\s+[0-9.eE+-]+;", f"deltaT          {p['delta_t']:g};", "deltaT"),
+        (r"writeControl\s+timeStep;", "writeControl    adjustableRunTime;", "writeControl"),
+    ]:
+        t, ok = _sub_once(t, pat, rep, re.M)
+        if not ok:
+            warn.append(f"controlDict:{name} 치환 실패")
+    # 적응 시간간격 제어는 원본에 없는 항목이라 새로 삽입한다.
+    if "adjustTimeStep" not in t:
+        t, ok = _sub_once(
+            t, r"(purgeWrite\s+\d+;)",
+            r"\1\n\n"
+            f"adjustTimeStep  yes;\nmaxCo           {p['max_co']:g};\n"
+            f"maxDeltaT       {p['max_delta_t']:g};")
+        if not ok:
+            warn.append("controlDict:adjustTimeStep 삽입 실패")
+    ctrl.write_text(t)
+
+    # ── 2) fvSchemes — 시간항 ─────────────────────────────────────────────
+    sch = case_dir / "system" / "fvSchemes"
+    s = sch.read_text()
+    # 1줄 포맷과 여러 줄 포맷을 모두 처리
+    s, ok = _sub_once(s, r"ddtSchemes\s*\{[^}]*\}",
+                      f"ddtSchemes      {{ default {p['ddt_scheme']}; }}", re.S)
+    if not ok:
+        warn.append("fvSchemes:ddtSchemes 치환 실패")
+    sch.write_text(s)
+
+    # ── 3) fvSolution — solvers 확장 + SIMPLE→PIMPLE ──────────────────────
+    fvs = case_dir / "system" / "fvSolution"
+    f = fvs.read_text()
+    # PIMPLE 은 pFinal·UFinal·kFinal·omegaFinal 을 별도로 찾는다. 기존 키를
+    # 정규식으로 넓혀 Final 변형까지 같은 설정을 쓰게 한다.
+    f, ok1 = _sub_once(f, r"^(\s*)p\s*$", r'\1"p.*"', re.M)
+    f, ok2 = _sub_once(f, r'"\(U\|k\|omega\)"', '"(U|k|omega).*"')
+    if not (ok1 and ok2):
+        warn.append("fvSolution:solvers Final 정규식 확장 실패")
+    # SIMPLE 블록 → PIMPLE 블록
+    f, ok = _sub_once(
+        f, r"SIMPLE\s*\{.*?\n\}",
+        ("PIMPLE\n{\n"
+         f"    nOuterCorrectors {p['n_outer']};\n"
+         f"    nCorrectors {p['n_correctors']};\n"
+         f"    nNonOrthogonalCorrectors {p['n_non_orth']};\n"
+         "}"), re.S)
+    if not ok:
+        warn.append("fvSolution:SIMPLE→PIMPLE 치환 실패")
+    # nOuterCorrectors=1(=PISO 모드)에서는 완화를 걸지 않는 것이 표준이다.
+    f, ok = _sub_once(
+        f, r"relaxationFactors\s*\{.*?\n\}",
+        ("relaxationFactors\n{\n"
+         + ("    equations { \".*\" 1; }\n" if int(p["n_outer"]) <= 1 else
+            "    fields    { p 0.3; }\n    equations { \".*\" 0.7; }\n")
+         + "}"), re.S)
+    if not ok:
+        warn.append("fvSolution:relaxationFactors 치환 실패")
+    fvs.write_text(f)
+
+    # ── 4) turbulenceProperties — 보완②의 DDES 전환 ───────────────────────
+    model = str(p["turbulence"])
+    family = TRANSIENT_TURBULENCE_MODELS.get(model, "RAS")
+    if family == "LES":
+        tp = case_dir / "constant" / "turbulenceProperties"
+        tp.write_text(
+            "FoamFile\n{\n    version 2.0;\n    format ascii;\n"
+            "    class dictionary;\n    object turbulenceProperties;\n}\n\n"
+            "simulationType  LES;\n\n"
+            "LES\n{\n"
+            f"    LESModel        {model};\n"
+            "    turbulence      on;\n"
+            "    printCoeffs     on;\n"
+            "    delta           cubeRootVol;\n"
+            "    cubeRootVolCoeffs { deltaCoeff 1; }\n"
+            "}\n")
+        logger.info(f"[Transient] 난류모델 → LES/{model} (보완②: URANS 비정상성 미포착 대비)")
+
+    # ── 5) force 함수객체 샘플링 간격 ────────────────────────────────────
+    # steady 는 writeInterval 10 스텝이면 충분하지만, transient 는 CD(t) 곡선과
+    # 통계(평균·RMS)의 해상도가 필요하므로 매 스텝 기록으로 바꾼다.
+    t = ctrl.read_text()
+    t2, n = re.subn(r"(type\s+force(?:Coeffs)?;(?:[^}]*?))writeInterval\s+\d+;",
+                    r"\g<1>writeInterval   1;", t, flags=re.S)
+    if n:
+        ctrl.write_text(t2)
+    else:
+        warn.append("controlDict:force 함수객체 writeInterval 조정 실패")
+
+    p["warnings"] = warn
+    logger.info(
+        f"[Transient] pimpleFoam 전환 완료: endTime={p['end_time']}s "
+        f"deltaT={p['delta_t']} maxCo={p['max_co']} "
+        f"PIMPLE({p['n_outer']},{p['n_correctors']},{p['n_non_orth']}) model={model}"
+        + (f" ⚠️ 경고 {len(warn)}건" if warn else ""))
+    for w in warn:
+        logger.warning(f"[Transient] {w}")
+    return p
+
+
+def read_force_history(case_dir: Path) -> Dict[str, List[float]]:
+    """postProcessing 의 시간이력을 읽어 {time, Cd, Cl, Fx, Fy, Fz, Ftotal} 로 반환.
+
+    forceCoeffs* / coefficient.dat  → Cd, Cl   (v2312 열: Time Cd Cd(f) Cd(r) Cl ...)
+    forces*      / force.dat        → Fx,Fy,Fz (Time  total(x y z)  pressure...  viscous...)
+    두 파일의 시간축이 다를 수 있으므로 각각 그대로 담고, 통계는 공통 구간에서 낸다.
+    """
+    out: Dict[str, List[float]] = {k: [] for k in
+                                   ("time", "Cd", "Cl", "ftime", "Fx", "Fy", "Fz", "Ftotal")}
+    pp = case_dir / "postProcessing"
+    if not pp.exists():
+        return out
+
+    def _rows(path: Path) -> List[List[float]]:
+        rows = []
+        for ln in path.read_text().splitlines():
+            if ln.startswith("#") or not ln.strip():
+                continue
+            try:
+                rows.append([float(v) for v in
+                             ln.replace("(", " ").replace(")", " ").split()])
+            except ValueError:
+                pass
+        return rows
+
+    for d in sorted(pp.glob("forceCoeffs*")):
+        for t_dir in sorted(d.iterdir(), key=lambda x: _safe_float(x.name)):
+            f = t_dir / "coefficient.dat"
+            if not f.exists():
+                continue
+            for r in _rows(f):
+                if len(r) >= 5:
+                    out["time"].append(r[0]); out["Cd"].append(r[1]); out["Cl"].append(r[4])
+
+    for d in sorted(pp.glob("forces*")):
+        for t_dir in sorted(d.iterdir(), key=lambda x: _safe_float(x.name)):
+            f = t_dir / "force.dat"
+            if not f.exists():
+                continue
+            for r in _rows(f):
+                if len(r) >= 4:
+                    out["ftime"].append(r[0])
+                    out["Fx"].append(r[1]); out["Fy"].append(r[2]); out["Fz"].append(r[3])
+                    out["Ftotal"].append(math.sqrt(r[1]**2 + r[2]**2 + r[3]**2))
+    return out
+
+
+def _safe_float(s: str) -> float:
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def compute_transient_stats(case_dir: Path,
+                            t_avg_start: Optional[float] = None,
+                            t_start: float = 0.0) -> Dict[str, Any]:
+    """평균구간([t_avg_start, 끝])의 시간평균·RMS·표준편차를 계산한다(지시서 §10).
+
+    t_avg_start 가 None 이면 (t_start + 전체구간의 50%) 를 자동 사용한다.
+    반환에는 보완②의 판정용 지표 unsteadiness = std/|mean| 도 포함한다.
+    """
+    hist = read_force_history(case_dir)
+    res: Dict[str, Any] = {"t_avg_start": t_avg_start, "n_samples": 0,
+                           "unsteadiness_Cd": None, "is_unsteady": None}
+    if not hist["time"] and not hist["ftime"]:
+        res["error"] = "시간이력 없음"
+        return res
+
+    # simpleFoam 수렴해에서 이어받은 경우, 같은 파일 앞부분에 '반복 횟수' 기반
+    # 이력이 남아 있다. 이를 물리시간으로 착각해 평균에 넣으면 수렴 드리프트가
+    # 비정상성으로 잘못 집계된다 → transient 시작 시각 이전은 전부 잘라낸다.
+    meta = case_dir / "transient_meta.json"
+    if meta.exists():
+        try:
+            t_start = float(json.loads(meta.read_text()).get("t_start", t_start))
+        except Exception:
+            pass
+    if t_start > 0:
+        for _tk, _keys in (("time", ("Cd", "Cl")),
+                           ("ftime", ("Fx", "Fy", "Fz", "Ftotal"))):
+            _keep = [i for i, t in enumerate(hist[_tk]) if t >= t_start]
+            hist[_tk] = [hist[_tk][i] for i in _keep]
+            for _k in _keys:
+                hist[_k] = [hist[_k][i] for i in _keep]
+    res["t_start"] = t_start
+
+    if not hist["time"] and not hist["ftime"]:
+        res["error"] = "transient 구간 이력 없음"
+        return res
+
+    t_end = max(hist["time"] or hist["ftime"])
+    if t_avg_start is None:
+        t_avg_start = t_start + (t_end - t_start) * 0.5
+    elif t_avg_start < t_start:
+        # 사용자가 넣은 TavgStart 는 'transient 시작 기준 상대시간'으로 해석한다.
+        # (이어받기면 절대시각이 466s 처럼 커서, 5.0 같은 값은 상대값이 자명하다)
+        t_avg_start = t_start + t_avg_start
+    res["t_avg_start"] = t_avg_start
+    res["t_end"] = t_end
+
+    def _stats(times: List[float], vals: List[float], name: str):
+        sel = [v for t, v in zip(times, vals) if t >= t_avg_start]
+        if not sel:
+            return
+        n = len(sel)
+        mean = sum(sel) / n
+        var = sum((v - mean) ** 2 for v in sel) / n
+        std = math.sqrt(var)
+        res[f"mean_{name}"] = mean
+        res[f"std_{name}"] = std
+        res[f"rms_{name}"] = math.sqrt(sum(v * v for v in sel) / n)
+        res[f"min_{name}"] = min(sel)
+        res[f"max_{name}"] = max(sel)
+        res["n_samples"] = max(res["n_samples"], n)
+
+    for nm in ("Cd", "Cl"):
+        _stats(hist["time"], hist[nm], nm)
+    for nm in ("Fx", "Fy", "Fz", "Ftotal"):
+        _stats(hist["ftime"], hist[nm], nm)
+
+    # 보완②: 비정상성이 실제로 포착됐는지 판정. 변동이 평균의 1% 미만이면
+    # 'URANS 가 비정상성을 억제한 것'으로 보고 DDES 재검증을 권고해야 한다.
+    m, s = res.get("mean_Cd"), res.get("std_Cd")
+    if m is not None and s is not None and abs(m) > 1e-12:
+        res["unsteadiness_Cd"] = s / abs(m)
+        res["is_unsteady"] = bool(res["unsteadiness_Cd"] >= 0.01)
+    return res
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1112,23 +1400,139 @@ class OpenFOAMRunner:
     def run_decomposePar(self) -> bool:
         return self._run_step("decomposePar -force", "도메인 분할 (decomposePar)")
 
-    def run_solver(self, end_time: int = 2000) -> bool:
-        """병렬 simpleFoam 실행 + 실시간 잔차 모니터링"""
-        cmd = f"mpirun --oversubscribe -np {self.n_cores} simpleFoam -parallel"
+    def run_solver(self, end_time: int = 2000, solver: str = "simpleFoam") -> bool:
+        """병렬 솔버 실행 + 실시간 잔차 모니터링.
+
+        solver 기본값은 simpleFoam 이라 기존 호출부(인자 없이 호출)는 종전과
+        완전히 동일하게 동작한다. transient 는 solver="pimpleFoam" 으로 전달한다.
+        end_time 은 simpleFoam 이면 반복 횟수, pimpleFoam 이면 물리시간[s] 이며
+        진행률 계산은 양쪽 모두 step/end_time 비율로 동일하게 처리된다.
+        """
+        solver = solver if solver in ("simpleFoam", "pimpleFoam") else "simpleFoam"
+        cmd = f"mpirun --oversubscribe -np {self.n_cores} {solver} -parallel"
         # snappyHexMesh 를 직렬로 돌리므로(위 참조) 여기서 분할한다. 직렬 snappy 가
         # 이미 netSurface 등 패치를 만든 메시를 기준으로 decomposePar 하므로 processor
         # 필드에 패치 항목이 보존된다.
         pre = "decomposePar -force"
-        return self._run_step(cmd, "CFD 해석 (simpleFoam)", parallel=True,
+        return self._run_step(cmd, f"CFD 해석 ({solver})", parallel=True,
                               pre_cmd=pre,
                               monitor_residuals=True, end_time=end_time)
 
     def run_reconstructPar(self) -> bool:
         return self._run_step("reconstructPar -latestTime", "결과 재조합 (reconstructPar)")
 
+    # ─── 비정상(transient) 실행 ───────────────────────────────────────────
+
+    def _perturb_initial_field(self, magnitude: float = 0.01) -> None:
+        """0/U 의 내부장에 미소 비대칭 성분을 넣어 대칭을 깬다(보완③).
+
+        구·원기둥처럼 완전 대칭인 형상은 대칭 초기장에서 출발하면 대칭을 깨뜨릴
+        요인이 없어 와류 방출이 시작되지 않을 수 있다. 자유류의 magnitude 배(기본
+        1%)만큼 횡방향 성분을 더해 초기 대칭만 깬다. 경계조건은 건드리지 않는다
+        (지시서 §2: BC 생성 로직 불변).
+        """
+        u_file = self.case_dir / "0" / "U"
+        if not u_file.exists():
+            self._emit_log("⚠️ 교란 주입 건너뜀 — 0/U 없음")
+            return
+        txt = u_file.read_text()
+        m = re.search(r"internalField\s+uniform\s+\(([^)]*)\)", txt)
+        if not m:
+            self._emit_log("⚠️ 교란 주입 건너뜀 — internalField 패턴 불일치")
+            return
+        try:
+            ux, uy, uz = [float(v) for v in m.group(1).split()]
+        except ValueError:
+            self._emit_log("⚠️ 교란 주입 건너뜀 — 속도 파싱 실패")
+            return
+        mag = math.sqrt(ux * ux + uy * uy + uz * uz) or 1.0
+        d = mag * float(magnitude)
+        new = f"internalField   uniform ({ux:.6f} {uy + d:.6f} {uz + d * 0.5:.6f})"
+        u_file.write_text(txt[:m.start()] + new + txt[m.end():])
+        self._emit_log(f"🌀 대칭 교란 주입: 자유류의 {magnitude*100:.1f}% "
+                       f"(Uy +{d:.4f}, Uz +{d*0.5:.4f} m/s)")
+
+    def _run_transient(self, duration: float, cfg: Dict[str, Any]) -> bool:
+        """pimpleFoam 실행. 필요 시 simpleFoam 선행 수렴을 초기조건으로 쓴다."""
+        init = bool(cfg.get("init_from_steady", True))
+        t0 = 0.0
+
+        if init:
+            steady_iters = int(cfg.get("steady_end_time", 1000))
+            self._emit_log(f"1단계: simpleFoam 선행 수렴 ({steady_iters}회) — "
+                           "pimpleFoam 초기조건 생성")
+            if not self.run_solver(steady_iters, solver="simpleFoam"):
+                return False
+            if self._stop_flag.is_set():
+                return False
+            # 병렬 결과는 processor*/ 에 남아 있다. 재분할하면 이 결과가 날아가므로
+            # 최신 시간을 그대로 이어받는다(startFrom latestTime).
+            t0 = self._latest_processor_time()
+            self._emit_log(f"선행 수렴 완료 — t={t0:g} 에서 비정상 해석 이어받기")
+        else:
+            if bool(cfg.get("perturb", False)):
+                self._perturb_initial_field(float(cfg.get("perturb_magnitude", 0.01)))
+
+        # 케이스를 transient 로 전환
+        end_abs = t0 + float(duration)
+        tcfg = {k: v for k, v in cfg.items()
+                if k in ("delta_t", "max_co", "max_delta_t", "write_interval",
+                         "n_outer", "n_correctors", "n_non_orth", "turbulence",
+                         "ddt_scheme")}
+        applied = apply_transient_settings(self.case_dir, end_time=end_abs, **tcfg)
+        if applied.get("warnings"):
+            for w in applied["warnings"]:
+                self._emit_log(f"⚠️ transient 설정: {w}")
+        # 이어받기면 latestTime 에서 시작
+        ctrl = self.case_dir / "system" / "controlDict"
+        c = ctrl.read_text()
+        c = re.sub(r"startFrom\s+\w+;",
+                   f"startFrom       {'latestTime' if init else 'startTime'};", c)
+        ctrl.write_text(c)
+        self._transient_start_time = t0
+        # 이어받기면 forceCoeffs/forces 파일에 simpleFoam 반복 이력(t=0..t0)과
+        # pimpleFoam 물리시간 이력(t0..)이 같이 쌓인다. 통계에서 앞부분을 반드시
+        # 잘라내야 하므로 시작 시각을 케이스에 남긴다.
+        try:
+            (self.case_dir / "transient_meta.json").write_text(json.dumps(
+                {"t_start": t0, "solver": "pimpleFoam",
+                 "init_from_steady": init, "end_time": end_abs},
+                ensure_ascii=False, indent=2))
+        except Exception as _e:
+            self._emit_log(f"⚠️ transient_meta.json 저장 실패: {_e}")
+
+        self._emit_log(f"2단계: pimpleFoam 비정상 해석 (t={t0:g} → {end_abs:g} s)")
+        # 이어받기면 이미 분할된 processor 결과를 써야 하므로 재분할 금지
+        cmd = f"mpirun --oversubscribe -np {self.n_cores} pimpleFoam -parallel"
+        return self._run_step(cmd, "CFD 해석 (pimpleFoam)", parallel=True,
+                              pre_cmd=None if init else "decomposePar -force",
+                              monitor_residuals=True, end_time=end_abs,
+                              start_time=t0)
+
+    def _latest_processor_time(self) -> float:
+        """processor0/ 의 최신 시간 디렉토리 값(없으면 0)."""
+        p0 = self.case_dir / "processor0"
+        if not p0.exists():
+            return 0.0
+        times = []
+        for d in p0.iterdir():
+            if d.is_dir():
+                try:
+                    times.append(float(d.name))
+                except ValueError:
+                    pass
+        return max(times) if times else 0.0
+
     # ─── 전체 워크플로우 실행 ─────────────────────────────────────────────
 
-    def run_full_workflow(self, end_time: int = 2000) -> bool:
+    def run_full_workflow(self, end_time: int = 2000,
+                          transient: Optional[Dict[str, Any]] = None) -> bool:
+        """전체 파이프라인. transient=None 이면 종전과 100% 동일한 steady 경로.
+
+        transient(dict) 가 주어지면 pimpleFoam 경로로 분기한다:
+          init_from_steady=True  → simpleFoam 선행 수렴 후 그 장을 초기조건으로 사용
+          perturb=True           → 대칭 형상의 와류 유발을 위한 미소 비대칭 교란(보완③)
+        """
         # 필수 단계(여기 실패하면 해석 자체 실패)
         essential = [
             self.run_blockMesh,
@@ -1143,7 +1547,10 @@ class OpenFOAMRunner:
         # 솔버 (Cd/Cl·필드 생성)
         if self._stop_flag.is_set():
             return False
-        if not self.run_solver(end_time):
+        if transient:
+            if not self._run_transient(end_time, transient):
+                return False
+        elif not self.run_solver(end_time):
             return False
         # reconstructPar는 '시각화용 편의' 단계 — 실패해도 forceCoeffs(Cd/Cl)는
         # postProcessing에 이미 있으므로 결과 추출에는 지장 없음. best-effort 처리.
@@ -1174,7 +1581,8 @@ class OpenFOAMRunner:
                   parallel: bool = False,
                   pre_cmd: Optional[str] = None,
                   monitor_residuals: bool = False,
-                  end_time: int = 2000) -> bool:
+                  end_time: int = 2000,
+                  start_time: float = 0.0) -> bool:
         if self._stop_flag.is_set():
             return False
 
@@ -1210,16 +1618,36 @@ class OpenFOAMRunner:
 
                     if monitor_residuals:
                         self._parse_residuals(line, step, end_time)
-                        m = re.match(r"^Time = (\d+)", line)
+                        # 보완①: 종전 패턴은 r"^Time = (\d+)" 로 '정수'만 매치했다.
+                        # simpleFoam 은 반복 횟수(정수)를 찍지만 pimpleFoam 은
+                        # 'Time = 0.0025' 처럼 부동소수 물리시간을 찍으므로 매치에
+                        # 실패해 진행률이 0% 에 고착되고 ETA 가 무력화됐다.
+                        # 부동소수·지수표기를 모두 받도록 확장한다. simpleFoam 은
+                        # 정수가 그대로 float 로 파싱되어 동작이 종전과 동일하다.
+                        m = re.match(r"^Time = ([0-9.eE+-]+)", line)
                         if m:
-                            step = int(m.group(1))
-                            pct = round(min(step / end_time * 100, 99.9), 1)
+                            try:
+                                step = float(m.group(1))
+                            except ValueError:
+                                step = 0.0
+                            # 이어받기(simpleFoam 수렴해에서 pimpleFoam 계속)면
+                            # 시작 시각이 0 이 아니다. start_time 을 빼지 않으면
+                            # 시작하자마자 진행률이 97% 로 보인다.
+                            _span = max(float(end_time) - float(start_time), 1e-12)
+                            pct = round(min(max((step - float(start_time)) / _span, 0.0)
+                                            * 100, 99.9), 1)
                             residual_info = ""
                             if self.last_residuals:
                                 max_r = max(self.last_residuals.values())
                                 residual_info = f"잔차 {max_r:.2e}"
+                            # 정수면 종전 표기(반복 횟수), 소수면 물리시간 표기.
+                            _is_int = (float(step).is_integer()
+                                       and float(end_time).is_integer()
+                                       and float(start_time) == 0.0)
+                            _cur = f"{int(step)}" if _is_int else f"{step:g}s"
+                            _tot = f"{int(end_time)}" if _is_int else f"{float(end_time):g}s"
                             self._emit_step(label, "running", pct,
-                                            f"Time={step}/{end_time}  {residual_info}")
+                                            f"Time={_cur}/{_tot}  {residual_info}")
                             if self.progress_cb:
                                 self.progress_cb(pct, step, end_time)
 
@@ -1443,10 +1871,53 @@ class ResultExtractor:
                 }
         return None
 
-    def save_csv(self, output_path: Path) -> Path:
-        """결과를 CSV 파일로 저장 (질량-스프링 모델 호환 포맷)"""
+    def is_transient_case(self) -> bool:
+        """이 케이스가 pimpleFoam 으로 돌았는지(controlDict 의 application 기준)."""
+        try:
+            txt = (self.case_dir / "system" / "controlDict").read_text()
+            m = re.search(r"application\s+(\w+);", txt)
+            return bool(m and m.group(1) == "pimpleFoam")
+        except Exception:
+            return False
+
+    def save_csv(self, output_path: Path,
+                 t_avg_start: Optional[float] = None) -> Path:
+        """결과를 CSV 파일로 저장 (질량-스프링 모델 호환 포맷).
+
+        지시서 §22 방침: CSV 의 열 구성·열 이름은 절대 바꾸지 않는다(하위 C++ 모델
+        호환). 다만 transient 케이스는 Cd/Cl/Fx/Fy/Fz 에 '마지막 값'이 아니라
+        '평균구간 시간평균값'을 넣어, steady 결과와 같은 방식으로 소비되게 한다.
+        시간이력·RMS·평균구간 등 부가 정보는 transient_stats.json 에 따로 저장한다.
+        """
         coeffs = self.extract_force_coeffs() or {}
         forces = self.extract_forces() or {}
+
+        if self.is_transient_case():
+            stats = compute_transient_stats(self.case_dir, t_avg_start=t_avg_start)
+            if stats.get("n_samples"):
+                # 시간평균값으로 치환(없는 항목은 기존 마지막 값 유지)
+                for _k, _sk in (("Cd", "mean_Cd"), ("Cl", "mean_Cl")):
+                    if _sk in stats:
+                        coeffs[_k] = stats[_sk]
+                for _k, _sk in (("Fx_N", "mean_Fx"), ("Fy_N", "mean_Fy"),
+                                ("Fz_N", "mean_Fz")):
+                    if _sk in stats:
+                        forces[_k] = stats[_sk]
+                stats["solver"] = "pimpleFoam"
+                stats["speed_m_s"] = self.speed
+                stats["angle_deg"] = self.angle_deg
+                try:
+                    (self.case_dir / "transient_stats.json").write_text(
+                        json.dumps(stats, ensure_ascii=False, indent=2, default=str))
+                except Exception as _e:
+                    logger.warning(f"transient_stats.json 저장 실패: {_e}")
+                logger.info(
+                    f"[Transient] CSV 에 시간평균 기록: Cd={coeffs.get('Cd')} "
+                    f"(평균구간 {stats.get('t_avg_start')}~{stats.get('t_end')}s, "
+                    f"샘플 {stats.get('n_samples')}개, "
+                    f"변동/평균 {stats.get('unsteadiness_Cd')})")
+            else:
+                logger.warning("[Transient] 시간이력이 없어 마지막 값으로 기록")
 
         row = {
             "speed_m_s":  self.speed,
@@ -1618,8 +2089,15 @@ class BatchAnalysisManager:
                     log_cb=self.log_cb,
                     step_cb=_batch_step_cb,
                 )
-                _et = int(self.params.get("end_time", 2000))
-                ok = runner.run_full_workflow(end_time=_et)
+                # Solver 분기: transient 가 없으면 종전과 동일한 steady 경로.
+                # transient 면 end_time 은 '물리시간[s]' 이라 int 로 깎으면 안 된다.
+                _tr = self.params.get("transient")
+                if _tr:
+                    _et = float(_tr.get("end_time", 30.0))
+                    ok = runner.run_full_workflow(end_time=_et, transient=_tr)
+                else:
+                    _et = int(self.params.get("end_time", 2000))
+                    ok = runner.run_full_workflow(end_time=_et)
 
                 # 워크플로우 반환값과 무관하게 forceCoeffs(Cd/Cl)가 있으면 추출한다.
                 # (reconstructPar나 솔버의 비치명적 비정상 종료로 ok=False여도 결과가
@@ -1636,9 +2114,25 @@ class BatchAnalysisManager:
                         final_dir = done_dir
                     except Exception as _re:
                         self._log(f"⚠️ 완료 rename 실패({_re}) — '해석중_' 유지")
-                    ResultExtractor(final_dir, speed, angle).save_csv(self.output_csv)
+                    # transient 면 UI 에서 지정한 TavgStart 를 넘겨 시간평균으로 기록.
+                    _avg0 = (self.params.get("transient") or {}).get("avg_start")
+                    _ex = ResultExtractor(final_dir, speed, angle)
+                    _ex.save_csv(self.output_csv, t_avg_start=_avg0)
                     self.n_success += 1
-                    self._log(f"✅ 케이스 완료 [{final_dir.name}] — Cd={_cdv:.4f}")
+                    if _ex.is_transient_case():
+                        _st = compute_transient_stats(final_dir, t_avg_start=_avg0)
+                        _u = _st.get("unsteadiness_Cd")
+                        self._log(
+                            f"✅ 케이스 완료 [{final_dir.name}] — "
+                            f"평균 Cd={_st.get('mean_Cd', float('nan')):.4f} "
+                            f"(샘플 {_st.get('n_samples', 0)}개)"
+                            + (f" · 변동/평균 {_u*100:.2f}%" if _u is not None else ""))
+                        if _u is not None and not _st.get("is_unsteady"):
+                            self._log("⚠️ 비정상성 미포착(<1%) — 이 결과를 '정상해석으로 "
+                                      "충분하다'는 근거로 쓰지 마세요. 난류모델을 "
+                                      "kOmegaSSTDDES 로 바꿔 재검증 권장(보완②)")
+                    else:
+                        self._log(f"✅ 케이스 완료 [{final_dir.name}] — Cd={_cdv:.4f}")
                 else:
                     self.n_failed += 1
                     self._log(f"❌ 케이스 결과 없음 [{running_name}] "

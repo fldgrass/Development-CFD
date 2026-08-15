@@ -8,6 +8,7 @@ Streamlit + PyVista 통합 GUI
 """
 
 import os
+import re
 import sys
 import time
 import json
@@ -41,7 +42,8 @@ sys.path.insert(0, str(APP_DIR / "modules"))
 from cfd_manager import (
     UnitCellCaseBuilder, FullStructureCaseBuilder,
     OpenFOAMRunner, ResultExtractor, BatchAnalysisManager,
-    get_cpu_count, RESULTS_DIR, STL_UPLOAD_DIR, LOGS_DIR, BASE_DIR
+    get_cpu_count, RESULTS_DIR, STL_UPLOAD_DIR, LOGS_DIR, BASE_DIR,
+    TRANSIENT_TURBULENCE_MODELS, compute_transient_stats, read_force_history,
 )
 from visualizer import CFDVisualizer, AutoRefreshVisualizer, OpenFOAMResultReader
 
@@ -161,6 +163,22 @@ def init_session():
         "aref_mode":          "자동",
         "aref_manual_m2":     0.0,
         "show_surface_area":  False,   # STL 미리보기 표면적 영역 녹색 표시 토글
+        # ── Solver 선택 (기본값은 반드시 Steady = 기존 동작 100% 유지) ──
+        "solver_mode":        "Steady (simpleFoam)",
+        "tr_end_time":        30.0,    # 물리시간 [s]
+        "tr_delta_t":         0.001,
+        "tr_max_co":          0.8,     # 보완⑤: 원본 1.0 → 0.8
+        "tr_max_delta_t":     0.01,
+        "tr_write_interval":  0.5,
+        "tr_n_outer":         1,
+        "tr_n_corr":          2,
+        "tr_n_non_orth":      0,
+        "tr_turbulence":      "kOmegaSST",
+        "tr_init_steady":     True,    # simpleFoam 선행 수렴을 초기조건으로
+        "tr_steady_iters":    1000,
+        "tr_perturb":         False,   # 보완③: 대칭 교란
+        "tr_perturb_mag":     0.01,
+        "tr_avg_start":       0.0,     # 0 이면 자동(구간의 50%)
         # ── 계산량 프리셋 ──
         "calc_preset_name":   "보통",
         "end_time_preset":    2000,
@@ -366,6 +384,11 @@ PROJECT_KEYS = [
     "unit_nx", "unit_ny",
     # 기준면적 Aref(자동/직접 입력)
     "aref_mode", "aref_manual_m2",
+    # Solver 선택 및 비정상 해석 설정
+    "solver_mode", "tr_end_time", "tr_delta_t", "tr_max_co", "tr_max_delta_t",
+    "tr_write_interval", "tr_n_outer", "tr_n_corr", "tr_n_non_orth",
+    "tr_turbulence", "tr_init_steady", "tr_steady_iters", "tr_perturb",
+    "tr_perturb_mag", "tr_avg_start",
     # 결과 CSV(프로젝트 데이터) + 시각화 설정
     "batch_csv_name",
     "r1_viewmode", "r1_field", "r1_opacity_vol", "r1_opacity_iso",
@@ -1644,6 +1667,20 @@ def _start_batch_analysis(mode, speeds, angles, csv_path, n_cores, rho, ti, nx=1
         _bp["cage_depth"]    = float(ss.get("cage_h", 5.0))
         add_log(f"가두리 치수: 직경 {_bp['cage_diameter']:.2f} m × "
                 f"수심 {_bp['cage_depth']:.2f} m")
+
+    # ── Solver 분기 (지시서 §4) — Steady 면 transient=None 으로 종전 경로 ──
+    _tr_cfg = _transient_config()
+    if _tr_cfg:
+        _bp["transient"] = _tr_cfg
+        add_log(f"⏱️ 비정상 해석(pimpleFoam): 물리시간 {_tr_cfg['end_time']:g}s · "
+                f"deltaT {_tr_cfg['delta_t']:g} · maxCo {_tr_cfg['max_co']:g} · "
+                f"PIMPLE({_tr_cfg['n_outer']},{_tr_cfg['n_correctors']},"
+                f"{_tr_cfg['n_non_orth']}) · {_tr_cfg['turbulence']}")
+        add_log("초기조건: " + ("simpleFoam 선행 수렴 "
+                f"({_tr_cfg['steady_end_time']}회)" if _tr_cfg["init_from_steady"]
+                else ("균일장 + 대칭 교란" if _tr_cfg.get("perturb") else "균일장")))
+    else:
+        add_log("해석 방식: 정상상태 (simpleFoam)")
     add_log(f"계산 조건: 반복 {_bp['end_time']} · 정밀화 {_bp['refine_level']} · "
             f"수렴 {_bp['residual_control']:.0e} · {n_cores}코어")
     if _bp["aref_override"] > 0:
@@ -1777,6 +1814,31 @@ def _auto_aref_info(mode: str) -> dict:
     except Exception as _e:
         out["basis"] = f"계산 실패 ({_e})"
     return out
+
+
+def _transient_config() -> Optional[dict]:
+    """Solver=Transient 일 때 pimpleFoam 설정 dict, Steady 면 None.
+
+    None 을 반환하면 실행 경로가 종전 simpleFoam 과 완전히 동일해진다(회귀 방지).
+    """
+    if not str(ss.get("solver_mode", "")).startswith("Transient"):
+        return None
+    return {
+        "end_time":         float(ss.get("tr_end_time", 30.0)),
+        "delta_t":          float(ss.get("tr_delta_t", 1e-3)),
+        "max_co":           float(ss.get("tr_max_co", 0.8)),
+        "max_delta_t":      float(ss.get("tr_max_delta_t", 0.01)),
+        "write_interval":   float(ss.get("tr_write_interval", 0.5)),
+        "n_outer":          int(ss.get("tr_n_outer", 1)),
+        "n_correctors":     int(ss.get("tr_n_corr", 2)),
+        "n_non_orth":       int(ss.get("tr_n_non_orth", 0)),
+        "turbulence":       str(ss.get("tr_turbulence", "kOmegaSST")),
+        "init_from_steady": bool(ss.get("tr_init_steady", True)),
+        "steady_end_time":  int(ss.get("tr_steady_iters", 1000)),
+        "perturb":          bool(ss.get("tr_perturb", False)),
+        "perturb_magnitude": float(ss.get("tr_perturb_mag", 0.01)),
+        "avg_start":        float(ss.get("tr_avg_start", 0.0)) or None,
+    }
 
 
 def _effective_aref() -> float:
@@ -1995,6 +2057,98 @@ with tab_input:
                         ss["_aref_pending"] = _ai["projected"]; st.rerun()
             else:
                 st.caption("STL 을 업로드하면 표면적·투영면적이 계산됩니다.")
+
+        st.divider()
+
+        # ─── Solver 선택 (지시서 §4) ──────────────────────────────────────
+        # 기본값은 반드시 Steady. 아무것도 바꾸지 않고 실행하면 기존과 완전히
+        # 동일하게 simpleFoam 이 돈다.
+        st.markdown("### 🧮 Solver")
+        st.radio(
+            "해석 방식", ["Steady (simpleFoam)", "Transient (pimpleFoam)"],
+            key="solver_mode", horizontal=True,
+            help="Steady = 정상상태(기존 동작). Transient = 비정상 해석 후 시간평균. "
+                 "구·원기둥처럼 후류가 비정상인 형상의 검증용입니다.",
+        )
+        _is_tr = ss.solver_mode.startswith("Transient")
+
+        if _is_tr:
+            st.warning(
+                "⚠️ 비정상 해석은 정상 해석보다 **수십 배** 오래 걸립니다. "
+                "지시서 §21에 따라 **단일 검증 케이스 전용**입니다 — "
+                "유속·영각을 여러 개로 두지 마세요."
+            )
+            # Streamlit 은 '렌더되지 않은 위젯'의 key 를 세션에서 제거한다. 이 패널은
+            # Solver=Transient 일 때만 렌더되므로, 위젯 key 를 그대로 저장소로 쓰면
+            # Steady 로 갔다 오는 순간 값이 사라지고 min_value 로 초기화된다.
+            # → 위젯 key(_w_*)와 저장 key(tr_*)를 분리하고 결과를 되써 넣는다.
+            def _num(label, skey, **kw):
+                ss[skey] = st.number_input(label, value=ss.get(skey), key=f"_w_{skey}", **kw)
+
+            def _chk(label, skey, **kw):
+                ss[skey] = st.checkbox(label, value=bool(ss.get(skey)),
+                                       key=f"_w_{skey}", **kw)
+
+            _t1, _t2 = st.columns(2)
+            with _t1:
+                st.markdown("**⏱️ 시간 제어**")
+                _num("종료 물리시간 [s]", "tr_end_time",
+                     min_value=0.001, step=1.0, format="%.3f")
+                _num("초기 시간간격 deltaT [s]", "tr_delta_t",
+                     min_value=1e-9, step=1e-4, format="%.6f")
+                _num("최대 Courant 수 (maxCo)", "tr_max_co",
+                     min_value=0.05, max_value=5.0, step=0.1,
+                     help="nOuterCorrectors=1 이면 PIMPLE 이 PISO 로 축약돼 "
+                          "Co<1 이 필요합니다. 0.8 권장(보완⑤).")
+                _num("최대 시간간격 maxDeltaT [s]", "tr_max_delta_t",
+                     min_value=1e-6, step=0.001, format="%.4f")
+                _num("결과 저장 간격 [s]", "tr_write_interval",
+                     min_value=0.001, step=0.1, format="%.3f")
+            with _t2:
+                st.markdown("**🔁 PIMPLE 제어**")
+                _num("nOuterCorrectors", "tr_n_outer", min_value=1, max_value=20, step=1)
+                _num("nCorrectors", "tr_n_corr", min_value=1, max_value=10, step=1)
+                _num("nNonOrthogonalCorrectors", "tr_n_non_orth",
+                     min_value=0, max_value=10, step=1)
+                st.markdown("**🌀 난류 모델**")
+                _tm = list(TRANSIENT_TURBULENCE_MODELS.keys())
+                ss["tr_turbulence"] = st.selectbox(
+                    "모델", _tm,
+                    index=_tm.index(ss.get("tr_turbulence", "kOmegaSST"))
+                    if ss.get("tr_turbulence") in _tm else 0,
+                    key="_w_tr_turbulence",
+                    help="기본 kOmegaSST(URANS)는 구·원기둥의 와류 방출을 억제해 "
+                         "정상해와 거의 같은 값을 낼 수 있습니다(보완②). 그럴 때 "
+                         "DDES 로 바꿔 재검증하세요.")
+                if TRANSIENT_TURBULENCE_MODELS.get(ss.tr_turbulence) == "LES":
+                    st.caption("⚠️ DES/LES 는 URANS 보다 격자 요건이 훨씬 엄격합니다 "
+                               "(후류 등방 정밀화 필요).")
+
+            st.markdown("**▶️ 초기화 · 평균 구간**")
+            _t3, _t4 = st.columns(2)
+            with _t3:
+                _chk("simpleFoam 수렴해를 초기조건으로 사용", "tr_init_steady",
+                     help="초기 과도구간을 줄입니다. 다만 구처럼 완전 대칭인 "
+                          "형상은 대칭해에서 출발하면 와류가 안 생길 수 있습니다(보완③).")
+                if ss.tr_init_steady:
+                    _num("선행 simpleFoam 반복 횟수", "tr_steady_iters",
+                         min_value=100, max_value=20000, step=100)
+                else:
+                    _chk("대칭 교란 주입 (보완③)", "tr_perturb",
+                         help="초기 속도장에 자유류의 일정 비율만큼 횡방향 성분을 "
+                              "더해 대칭을 깹니다. 구·원기둥에 권장.")
+                    if ss.tr_perturb:
+                        _num("교란 크기 (자유류 대비 비율)", "tr_perturb_mag",
+                             min_value=0.0001, max_value=0.2, step=0.005, format="%.4f")
+            with _t4:
+                _num("평균 시작 시각 TavgStart [s]  (0 = 자동)", "tr_avg_start",
+                     min_value=0.0, step=1.0,
+                     help="이 시각 이후 데이터만 시간평균합니다. 0 이면 "
+                          "전체 구간의 50% 지점을 자동 사용합니다.")
+                _L = float(ss.get("cell_size_mm", 20.0)) / 1000.0
+                _U = max(float(ss.get("u_min", 1.0)), 1e-6)
+                st.caption(f"권장 TavgStart ≳ 10·L/U ≈ {10*_L/_U:.2f} s "
+                           f"(L=대표길이, U=유속 기준)")
 
         st.divider()
 
@@ -2731,9 +2885,164 @@ with tab_results:
             pass
 
         # ─── 시각화 탭 ────────────────────────────────────────────────────
-        r_tab1, r_tab2, r_tab3, r_tab4 = st.tabs([
-            "🌊 유동장", "📉 수렴 이력", "📊 유속 감쇠", "💾 CSV 데이터"
+        r_tab1, r_tab2, r_tab3, r_tab5, r_tab4 = st.tabs([
+            "🌊 유동장", "📉 수렴 이력", "📊 유속 감쇠",
+            "⏱️ 시간이력 (비정상)", "💾 CSV 데이터"
         ])
+
+        # ─── 비정상 해석 결과: 시간이력 · 통계 · steady 비교 (지시서 §15·§16) ──
+        with r_tab5:
+            if selected_case_dir is None:
+                st.info("케이스를 먼저 선택하세요 (위 매트릭스에서 셀 클릭).")
+            else:
+                # 이 케이스가 실제로 pimpleFoam 으로 돌았는지 판별한다.
+                # simpleFoam 의 이력은 '반복 횟수'라 물리시간이 아니며, 그 변동은
+                # 수렴 드리프트일 뿐 물리적 비정상성이 아니다. 구분하지 않으면
+                # 정상해석 결과를 비정상 결과로 오독하게 된다.
+                _app = ""
+                try:
+                    _ctrl_txt = (Path(selected_case_dir) / "system" / "controlDict").read_text()
+                    _mapp = re.search(r"application\s+(\w+);", _ctrl_txt)
+                    _app = _mapp.group(1) if _mapp else ""
+                except Exception:
+                    pass
+                _is_transient_case = (_app == "pimpleFoam")
+
+                _hist = read_force_history(Path(selected_case_dir))
+                if len(_hist["time"]) < 3:
+                    st.info(
+                        "이 케이스에는 시간이력이 없습니다.\n\n"
+                        "**입력 설정 → Solver → Transient (pimpleFoam)** 으로 "
+                        "해석해야 이 탭이 채워집니다.")
+                elif not _is_transient_case:
+                    st.warning(
+                        f"⚠️ 이 케이스는 **정상상태 해석**입니다 (application = "
+                        f"`{_app or '알 수 없음'}`).\n\n"
+                        "아래 이력의 가로축은 물리시간이 아니라 **반복 횟수**이고, "
+                        "그 변동은 물리적 비정상성이 아니라 **수렴 과정의 드리프트**입니다. "
+                        "시간평균·RMS·비정상성 판정은 의미가 없으므로 표시하지 않습니다.")
+                    try:
+                        import plotly.graph_objects as _go
+                        _f0 = _go.Figure()
+                        for _nm, _col in (("Cd", "#c0392b"), ("Cl", "#2471a3")):
+                            _f0.add_trace(_go.Scatter(x=_hist["time"], y=_hist[_nm],
+                                                      mode="lines", name=_nm,
+                                                      line=dict(color=_col, width=1.5)))
+                        _f0.update_layout(height=320, xaxis_title="반복 횟수 [-]",
+                                          yaxis_title="계수",
+                                          margin=dict(l=50, r=30, t=20, b=40))
+                        st.plotly_chart(_f0, use_container_width=True, key="r5_steady_hist")
+                        st.caption("참고용 수렴 이력 — 마지막 값이 곧 정상해입니다.")
+                    except Exception:
+                        pass
+                else:
+                    _t_end = max(_hist["time"])
+                    _t_min = min(_hist["time"])
+                    _dflt = float(ss.get("tr_avg_start", 0.0)) or (_t_min + (_t_end - _t_min) * 0.5)
+                    _avg_start = st.slider(
+                        "평균 시작 시각 TavgStart", min_value=float(_t_min),
+                        max_value=float(_t_end), value=float(min(max(_dflt, _t_min), _t_end)),
+                        key="r5_avg_start",
+                        help="이 시각 이후 구간만 시간평균합니다(초기 과도구간 제외).")
+                    _stats = compute_transient_stats(Path(selected_case_dir),
+                                                     t_avg_start=_avg_start)
+
+                    # ── 시간이력 그래프 (평균구간 음영 + 평균선) ──
+                    try:
+                        import plotly.graph_objects as _go
+                        from plotly.subplots import make_subplots as _msp
+                        _fig = _msp(rows=2, cols=1, shared_xaxes=True,
+                                    subplot_titles=("Cd vs Time", "Cl vs Time"),
+                                    vertical_spacing=0.12)
+                        for _i, (_nm, _col) in enumerate([("Cd", "#c0392b"), ("Cl", "#2471a3")], 1):
+                            _fig.add_trace(_go.Scatter(
+                                x=_hist["time"], y=_hist[_nm], mode="lines",
+                                name=_nm, line=dict(color=_col, width=1.5)), row=_i, col=1)
+                            _m = _stats.get(f"mean_{_nm}")
+                            if _m is not None:
+                                _fig.add_hline(y=_m, line=dict(color=_col, dash="dash", width=1),
+                                               row=_i, col=1,
+                                               annotation_text=f"mean {_m:.4f}",
+                                               annotation_position="right")
+                            # 평균 구간 음영
+                            _fig.add_vrect(x0=_avg_start, x1=_t_end,
+                                           fillcolor="#f1c40f", opacity=0.12,
+                                           line_width=0, row=_i, col=1)
+                        _fig.update_xaxes(title_text="Time [s]", row=2, col=1)
+                        _fig.update_layout(height=520, showlegend=False,
+                                           margin=dict(l=50, r=30, t=50, b=40))
+                        st.plotly_chart(_fig, use_container_width=True, key="r5_hist")
+                        st.caption("🟨 음영 = 시간평균 구간 · ⌐ 파선 = 평균값")
+                    except Exception as _e:
+                        st.warning(f"그래프 생성 실패: {_e}")
+
+                    # ── 통계 ──
+                    st.markdown("#### 📊 평균구간 통계")
+                    _c = st.columns(4)
+                    for _i, _nm in enumerate(("Cd", "Cl")):
+                        if f"mean_{_nm}" in _stats:
+                            _c[_i * 2].metric(f"평균 {_nm}", f"{_stats[f'mean_{_nm}']:.5f}")
+                            _c[_i * 2 + 1].metric(f"RMS {_nm}", f"{_stats[f'rms_{_nm}']:.5f}",
+                                                  delta=f"±{_stats[f'std_{_nm}']:.5f} (표준편차)",
+                                                  delta_color="off")
+                    _rows_st = []
+                    for _nm in ("Cd", "Cl", "Fx", "Fy", "Fz", "Ftotal"):
+                        if f"mean_{_nm}" in _stats:
+                            _u = " [N]" if _nm.startswith("F") else ""
+                            _rows_st.append({
+                                "항목": _nm + _u,
+                                "평균": f"{_stats[f'mean_{_nm}']:.6g}",
+                                "표준편차": f"{_stats[f'std_{_nm}']:.6g}",
+                                "RMS": f"{_stats[f'rms_{_nm}']:.6g}",
+                                "최소": f"{_stats[f'min_{_nm}']:.6g}",
+                                "최대": f"{_stats[f'max_{_nm}']:.6g}",
+                            })
+                    if _rows_st:
+                        st.dataframe(_rows_st, use_container_width=True, hide_index=True)
+                    st.caption(f"평균구간 {_avg_start:.4g} ~ {_stats.get('t_end', _t_end):.4g} s · "
+                               f"샘플 {_stats.get('n_samples', 0)}개")
+
+                    # ── 보완②: 비정상성 포착 판정 ──
+                    _uns = _stats.get("unsteadiness_Cd")
+                    if _uns is not None:
+                        if _stats.get("is_unsteady"):
+                            st.success(
+                                f"✅ 비정상성 포착됨 — Cd 변동/평균 = **{_uns*100:.2f}%** (≥1%). "
+                                "시간평균값을 정상해와 비교할 수 있습니다.")
+                        else:
+                            st.error(
+                                f"⚠️ **비정상성 미포착** — Cd 변동/평균 = {_uns*100:.2f}% (<1%).\n\n"
+                                "이 결과를 '정상해석으로 충분하다'는 근거로 쓰면 안 됩니다. "
+                                "표준 kOmegaSST URANS 가 와류 방출을 감쇠시킨 것일 수 있습니다. "
+                                "**난류모델을 kOmegaSSTDDES 로 바꿔 재검증**하세요(지시서 보완②).")
+
+                    # ── 지시서 §16: steady ↔ transient 비교 ──
+                    st.markdown("#### ⚖️ 정상 ↔ 비정상 비교")
+                    _cd_steady = None
+                    try:
+                        import pandas as _pdc
+                        for _csv in sorted(Path(_results_root(mode)).glob("*.csv")):
+                            _dfc = _pdc.read_csv(_csv)
+                            if {"speed_m_s", "angle_deg", "Cd"}.issubset(_dfc.columns) \
+                                    and _sel_s is not None:
+                                _hit = _dfc[(_dfc.speed_m_s.round(2) == round(_sel_s, 2))
+                                            & (_dfc.angle_deg.round(1) == round(_sel_a, 1))]
+                                if not _hit.empty:
+                                    _cd_steady = float(_hit.iloc[-1]["Cd"])
+                                    break
+                    except Exception:
+                        pass
+                    _cd_tr = _stats.get("mean_Cd")
+                    if _cd_steady is not None and _cd_tr is not None:
+                        _diff = (_cd_tr - _cd_steady) / _cd_steady * 100
+                        _k1, _k2, _k3 = st.columns(3)
+                        _k1.metric("SimpleFoam CD", f"{_cd_steady:.5f}")
+                        _k2.metric("PimpleFoam Mean CD", f"{_cd_tr:.5f}")
+                        _k3.metric("Difference", f"{_diff:+.1f} %",
+                                   help="(mean_CD_pimple − CD_simple) / CD_simple × 100")
+                    else:
+                        st.caption("같은 조건의 정상상태 Cd 를 CSV 에서 찾지 못해 "
+                                   "비교를 생략했습니다.")
 
         with r_tab1:
             if _sel_s is not None:
