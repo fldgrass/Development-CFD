@@ -166,6 +166,8 @@ def init_session():
         "aref_manual_m2":     0.0,
         "show_surface_area":  False,   # STL 미리보기 표면적 영역 녹색 표시 토글
         # ── Solver 선택 (기본값은 반드시 Steady = 기존 동작 100% 유지) ──
+        # 형상의 가장 가는 치수 기준으로 정밀화 레벨을 자동 상향(STL 종류 무관)
+        "auto_refine":        True,
         "solver_mode":        "Steady (simpleFoam)",
         "tr_end_time":        30.0,    # 물리시간 [s]
         "tr_delta_t":         0.001,
@@ -386,7 +388,8 @@ PROJECT_KEYS = [
     "unit_nx", "unit_ny",
     # 기준면적 Aref(자동/직접 입력)
     "aref_mode", "aref_manual_m2",
-    # Solver 선택 및 비정상 해석 설정
+    # 격자 자동 보정 / Solver 선택 및 비정상 해석 설정
+    "auto_refine",
     "solver_mode", "tr_end_time", "tr_delta_t", "tr_max_co", "tr_max_delta_t",
     "tr_write_interval", "tr_n_outer", "tr_n_corr", "tr_n_non_orth",
     "tr_turbulence", "tr_init_steady", "tr_steady_iters", "tr_perturb",
@@ -1667,6 +1670,9 @@ def _start_batch_analysis(mode, speeds, angles, csv_path, n_cores, rho, ti, nx=1
     if mode == "full_structure":
         _bp["cage_diameter"] = float(ss.get("cage_d", 10.0))
         _bp["cage_depth"]    = float(ss.get("cage_h", 5.0))
+        _bp["auto_refine"]   = bool(ss.get("auto_refine", True))
+        if _bp["auto_refine"]:
+            add_log("격자 자동 보정: 형상 최소두께 기준으로 정밀화 레벨을 상향합니다")
         add_log(f"가두리 치수: 직경 {_bp['cage_diameter']:.2f} m × "
                 f"수심 {_bp['cage_depth']:.2f} m")
 
@@ -2238,6 +2244,23 @@ with tab_input:
         # ─── 해석 파라미터 ────────────────────────────────────────────────
         st.markdown("### 🎛️ 해석 파라미터")
 
+        # 격자 자동 보정 — 두 모드 공통. 배경격자는 형상 전체 크기 기준으로
+        # 정해지므로, 그물처럼 큰 영역에 가는 요소가 흩어진 형상은 기본 레벨에서
+        # 실 지름당 1~2 셀밖에 안 걸린다(3by3 실측: 레벨3 1.5셀 → Cd 43% 과대).
+        st.checkbox(
+            "🔧 형상 최소두께 기준으로 정밀화 레벨 자동 보정 (권장)",
+            key="auto_refine",
+            help="STL 의 가장 가는 치수(그물실 지름·판재 두께)를 읽어 셀이 "
+                 "10개 이상 걸리도록 정밀화 레벨을 자동으로 올립니다. "
+                 "STL 종류와 무관하게 동작하며, 굵은 형상(구·카이트)처럼 이미 "
+                 "충분하면 레벨을 올리지 않습니다. 계산시간이 크게 늘 수 있습니다.")
+        if ss.get("auto_refine"):
+            st.caption("적용 예 — 그물 3by3(실 3mm): 레벨 3 → **6** 자동 상향 · "
+                       "카이트(두께 78mm)·구(300mm): 레벨 3 유지")
+        else:
+            st.caption("⚠️ 꺼져 있습니다. 가는 그물실은 격자가 부족해 Cd 가 "
+                       "과대평가될 수 있습니다(로그에 경고가 남습니다).")
+
         if mode == "unit_cell":
             # ── 유속·영각 범위 (단계수 1×1 = 단일 해석) ──────────────────
             # 단일/배치 해석을 하나의 인터페이스로 통합한다. 단계수를 모두 1로
@@ -2318,13 +2341,14 @@ with tab_input:
                             f"(목표 {TWINE_CELLS_TARGET:.0f} 이상)")
                     else:
                         st.warning(
-                            f"⚠️ 그물실 해상도 **{_trw['cells_per_d']:.1f} 셀/지름** "
+                            f"⚠️ 그물실 해상도 **{_trw['cells_per_d']:.1f} 셀/지름** "  # noqa: E501
                             f"— 목표 {TWINE_CELLS_TARGET:.0f} 셀 미만입니다.\n\n"
                             f"실 지름 {_wd:.2f} mm 에 최소 셀이 "
                             f"{_trw['finest_mm']:.3f} mm 라 원통 표면의 경계층·박리를 "
                             f"풀지 못합니다. Cd 가 부정확할 수 있습니다.\n\n"
                             f"**정밀화 레벨을 {_trw['required_level']} 이상**으로 "
                             f"올리세요 (레벨 1 상승마다 표면 근처 셀이 약 8배).")
+
                 end_time = st.number_input(
                     "최대 반복 횟수",
                     min_value=100, max_value=10000, step=100,

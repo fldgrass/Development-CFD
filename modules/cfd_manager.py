@@ -1068,12 +1068,14 @@ class FullStructureCaseBuilder:
                  write_interval: int = 100,
                  aref_override: Optional[float] = None,
                  refine_level: int = 3,
-                 n_layers: int = 0):
+                 n_layers: int = 0,
+                 auto_refine: bool = False):
         # 격자 옵션(보완④: DDES 등에서 격자 민감도를 확인하기 위한 노브).
         # 기본값 refine_level=3 / n_layers=0 은 종전 하드코딩 값과 완전히 동일한
         # snappyHexMeshDict 를 만든다(회귀 방지).
         self.refine_level     = max(1, min(6, int(refine_level)))
         self.n_layers         = max(0, min(10, int(n_layers)))
+        self.auto_refine      = bool(auto_refine)
         self.case_dir         = case_dir
         # 사용자가 UI 에서 직접 지정한 기준면적[m²]. None/0 이하면 자동 계산 사용.
         self.aref_override    = (float(aref_override)
@@ -1116,6 +1118,7 @@ class FullStructureCaseBuilder:
 
         if self._net_only:
             self._compute_net_domain()   # 회전된 netSurface.stl 기준
+            self._auto_tune_refine_level()
 
         self._patch_velocity_fields()
         self._patch_turbulence_fields()
@@ -1198,10 +1201,77 @@ class FullStructureCaseBuilder:
         self._dom_min = (cx-3*L, cy-3*L, cz-3*L)
         self._dom_max = (cx+7*L, cy+3*L, cz+3*L)
         # 정밀화 박스: net + 근접 후류
-        self._box_min = (bxmin-0.5*L, bymin-0.5*L, bzmin-0.5*L)
-        self._box_max = (bxmax+1.5*L, bymax+0.5*L, bzmax+0.5*L)
+        # 정밀화 박스: 체적을 통째로 세분하므로 필요 최소로 잡는다.
+        # 후류(유동 +x 하류)는 넉넉히 두되, 상류·측면 여유는 좁힌다.
+        # 종전 0.5L 균등 → 상류·측면 0.15L. 하류는 1.5L 유지(후류 해상 필요).
+        _m = 0.15 * L
+        self._box_min = (bxmin-_m, bymin-_m, bzmin-_m)
+        self._box_max = (bxmax+1.5*L, bymax+_m, bzmax+_m)
         # 기준점: net 상류(연결된 유체 영역 어디든 가능, net 표면만 피하면 됨)
         self._loc = (cx-2.5*L, cy, cz)
+
+    def _auto_tune_refine_level(self):
+        """형상의 '가장 가는 치수'를 기준으로 정밀화 레벨을 자동 산정한다.
+
+        배경격자는 형상 전체 크기(L/8)로 정해지므로, 그물처럼 큰 영역에 가는
+        요소가 흩어진 형상은 기본 레벨 3 에서 실 지름당 1~2 셀밖에 안 걸린다.
+        (3by3 패널 실측: 레벨 3 → 1.5 셀, Cd 가 레벨 6 대비 43% 과대평가)
+        STL 종류와 무관하게 '최소 두께 / 최소셀' 이 목표치를 넘도록 레벨을 올린다.
+
+        auto_refine=False 면 진단만 로그로 남기고 레벨은 바꾸지 않는다.
+        """
+        try:
+            _thin = self._thin_dimension_mm()
+            if _thin <= 0:
+                return
+            _base_mm = self._base_cell_mm()
+            _tr = twine_resolution(_base_mm, _thin, self.refine_level)
+            _msg = (f"[FullStructure] 형상 최소두께 {_thin:.2f} mm / 최소셀 "
+                    f"{_tr['finest_mm']:.3f} mm = {_tr['cells_per_d']:.1f} 셀")
+            if _tr["ok"]:
+                logger.info(_msg + " ✅")
+                return
+            if not self.auto_refine:
+                logger.warning(
+                    _msg + f" ⚠️ 목표 {_tr['target']:.0f} 셀 미만 — 정밀화 레벨을 "
+                    f"{_tr['required_level']} 이상으로 올려야 합니다. "
+                    f"(자동 보정이 꺼져 있어 레벨 {self.refine_level} 로 진행)")
+                return
+            _new = min(6, _tr["required_level"])
+            if _new > self.refine_level:
+                logger.warning(
+                    _msg + f" ⚠️ 목표 미만 → 정밀화 레벨 자동 상향 "
+                    f"{self.refine_level} → {_new} (셀 수·계산시간 증가)")
+                self.refine_level = _new
+                if _tr["required_level"] > 6:
+                    logger.warning(
+                        f"[FullStructure] 목표 달성에는 레벨 {_tr['required_level']} 이 "
+                        f"필요하지만 상한 6 으로 제한했습니다. 결과에 격자 오차가 "
+                        f"남습니다.")
+        except Exception as _e:
+            logger.debug(f"[FullStructure] 정밀화 자동 산정 건너뜀: {_e}")
+
+    def _base_cell_mm(self) -> float:
+        """_patch_blockMesh 와 동일한 배경격자 크기[mm] 산정(자동 산정용)."""
+        L = self._net_L
+        x0, y0, z0 = self._dom_min
+        x1, y1, z1 = self._dom_max
+        _cell = max(L / 8.0, 1e-4)
+        nx = max(40, min(120, int((x1 - x0) / _cell)))
+        return (x1 - x0) / max(nx, 1) * 1000.0
+
+    def _thin_dimension_mm(self) -> float:
+        """형상에서 격자가 반드시 해상해야 할 '가장 가는 치수'[mm].
+
+        그물이면 그물실 지름, 카이트·판재면 두께에 해당한다. 회전 전 원본 STL 의
+        바운딩박스 최소변을 쓴다(STL 종류와 무관하게 동작).
+        """
+        tris = read_stl_triangles(self.net_stl)
+        if not tris:
+            return 0.0
+        pts = [v for t in tris for v in t]
+        spans = [max(p[i] for p in pts) - min(p[i] for p in pts) for i in range(3)]
+        return min(s for s in spans if s > 0) if any(s > 0 for s in spans) else 0.0
 
     def _patch_blockMesh(self):
         """도메인 크기 자동 계산. net-only 면 net 크기 기준, 아니면 가두리 크기 기준."""
@@ -2181,7 +2251,8 @@ class BatchAnalysisManager:
                         **{k: v for k, v in self.params.items()
                            if k in ["cage_diameter", "cage_depth", "n_cores",
                                     "end_time", "residual_control", "write_interval",
-                                    "aref_override", "refine_level", "n_layers"]}
+                                    "aref_override", "refine_level", "n_layers",
+                                    "auto_refine"]}
                     )
 
                 builder.build()
