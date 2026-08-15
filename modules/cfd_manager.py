@@ -348,6 +348,81 @@ def compute_projected_area(stl_path: Path, flow_dir: Tuple[float, float, float])
     return (total * 0.5) / 1.0e6
 
 
+# ── 그물실 격자 해상도 ────────────────────────────────────────────────────
+# 배경격자는 '셀 개수'가 아니라 형상 크기 기준으로 정해지므로, 망목(a)이 커지면
+# 그물실(지름 d) 대비 격자가 조용히 거칠어진다. 예: 단위셀 base=a/16 이면
+#   a=20mm  → 최소셀 0.25mm → 실 지름당 12셀 (양호)
+#   a=124mm → 최소셀 0.97mm → 실 지름당  3셀 (부족)
+# 원통 표면의 경계층·박리를 풀려면 통상 지름당 10셀 이상이 필요하다.
+TWINE_CELLS_TARGET = 10.0
+
+
+def twine_resolution(base_mm: float, wire_d_mm: float,
+                     refine_level: int,
+                     target: float = TWINE_CELLS_TARGET) -> Dict[str, Any]:
+    """배경격자 크기와 그물실 지름으로 표면 격자 해상도를 평가한다.
+
+    반환: finest_mm(최소 셀), cells_per_d(실 지름당 셀 수),
+          required_level(target 을 만족하는 최소 정밀화 레벨), ok(bool)
+    """
+    base_mm = max(float(base_mm), 1e-9)
+    lvl = max(0, int(refine_level))
+    finest = base_mm / (2 ** lvl)
+    cpd = (float(wire_d_mm) / finest) if finest > 0 else 0.0
+    req = lvl
+    if wire_d_mm > 0:
+        # base/2^L <= d/target  →  2^L >= base*target/d
+        need = base_mm * float(target) / float(wire_d_mm)
+        req = max(lvl, int(math.ceil(math.log2(need))) if need > 1 else 0)
+    return {"base_mm": base_mm, "finest_mm": finest, "cells_per_d": cpd,
+            "required_level": req, "ok": cpd >= target, "target": target}
+
+
+def validate_unit_cell_stl(stl_path: Path) -> Dict[str, Any]:
+    """단위셀 모드가 요구하는 STL 조건을 검사한다.
+
+    단위셀 도메인은 '원점 중심, 한 변 a=max(x범위,y범위)인 정사각'으로 생성된다.
+    STL 이 원점 중심이 아니거나 정사각이 아니면 형상 일부가 도메인 밖으로 나가
+    snappyHexMesh 가 아무것도 잡지 못하고, 그 결과 Cd=0 이 조용히 기록된다.
+    (실제로 net2_onemesh.stl 이 y=102mm 까지 뻗어 도메인 ±61mm 를 벗어났다.)
+
+    반환: ok(bool), a_mm, issues(list[str]), bbox
+    """
+    out: Dict[str, Any] = {"ok": False, "issues": [], "a_mm": 0.0, "bbox": None}
+    tris = read_stl_triangles(stl_path)
+    if not tris:
+        out["issues"].append("STL 을 읽지 못했습니다.")
+        return out
+    pts = [v for t in tris for v in t]
+    bx = (min(p[0] for p in pts), max(p[0] for p in pts))
+    by = (min(p[1] for p in pts), max(p[1] for p in pts))
+    bz = (min(p[2] for p in pts), max(p[2] for p in pts))
+    out["bbox"] = {"x": bx, "y": by, "z": bz}
+    sx, sy = bx[1] - bx[0], by[1] - by[0]
+    a = max(sx, sy)
+    out["a_mm"] = a
+    if a <= 0:
+        out["issues"].append("XY 범위가 0 입니다.")
+        return out
+    tol = 0.05 * a
+    if abs(bx[0] + bx[1]) > tol or abs(by[0] + by[1]) > tol:
+        out["issues"].append(
+            f"원점 중심이 아닙니다 (중심 x={(bx[0]+bx[1])/2:.1f}, "
+            f"y={(by[0]+by[1])/2:.1f} mm). 도메인은 원점 중심 ±{a/2:.1f} mm 로 "
+            f"만들어지므로 형상 일부가 도메인 밖으로 나갑니다.")
+    if abs(sx - sy) > tol:
+        out["issues"].append(
+            f"정사각이 아닙니다 (x범위 {sx:.1f} mm, y범위 {sy:.1f} mm). "
+            f"단위셀은 정사각 망목을 가정합니다.")
+    out["ok"] = not out["issues"]
+    return out
+
+
+def unit_cell_base_mm(cell_size_m: float) -> float:
+    """UnitCellCaseBuilder._patch_blockMesh 와 동일한 배경격자 산정식."""
+    return max(2.0, float(cell_size_m) * 1000.0 / 16.0)
+
+
 def is_closed_surface(stl_path: Path) -> bool:
     """STL 이 닫힌 매니폴드인지 판정한다(모든 에지가 정확히 2개 삼각형에 공유).
 
@@ -746,7 +821,9 @@ class UnitCellCaseBuilder:
         self.residual_control = max(1e-5, min(1e-3, float(residual_control)))
         self.end_time         = max(100, int(end_time))
         self.write_interval   = max(10, int(write_interval))
-        self.refine_level     = max(1, min(4, int(refine_level)))
+        # 상한 6: 그물실이 가늘면(망목/실지름 비가 크면) 레벨 5~6 이 필요하다.
+        # 종전 상한 4 는 UI 에서 더 올려도 조용히 무시되는 원인이었다.
+        self.refine_level     = max(1, min(6, int(refine_level)))
 
         # cell_size / solidity: 미지정 시 STL에서 자동 감지
         stl_info = detect_stl_cell_size(stl_path)
@@ -831,6 +908,36 @@ class UnitCellCaseBuilder:
         cells_x = max(8,  round(self.cell_size * 1000 / base_mm))
         cells_y = max(8,  round(self.cell_size * 1000 / base_mm))
         cells_z = max(20, round(2 * depth / base_mm))
+
+        # 단위셀 STL 적합성 점검 — 도메인을 벗어나면 snappy 가 아무것도 못 잡아
+        # Cd=0 이 조용히 기록된다. 반드시 눈에 띄게 경고한다.
+        try:
+            _v = validate_unit_cell_stl(self.stl_path)
+            if not _v["ok"]:
+                for _iss in _v["issues"]:
+                    logger.warning(f"[UnitCell] ⚠️ STL 부적합: {_iss}")
+                logger.warning("[UnitCell] ⚠️ 이대로 실행하면 격자가 형상을 잡지 "
+                               "못해 Cd=0 이 나올 수 있습니다.")
+        except Exception as _e:
+            logger.debug(f"[UnitCell] STL 적합성 점검 건너뜀: {_e}")
+
+        # 그물실 격자 해상도 점검 — 망목이 커지면 실 대비 격자가 조용히 거칠어진다.
+        # 부족하면 로그로 분명히 알린다(결과를 그대로 믿지 않도록).
+        try:
+            _wd = detect_stl_cell_size(self.stl_path).get("wire_diameter_mm", 0.0)
+            if _wd > 0:
+                _tr = twine_resolution(base_mm, _wd, self.refine_level)
+                _msg = (f"[UnitCell] 그물실 해상도: 지름 {_wd:.2f} mm / 최소셀 "
+                        f"{_tr['finest_mm']:.3f} mm = {_tr['cells_per_d']:.1f} 셀")
+                if _tr["ok"]:
+                    logger.info(_msg + " ✅")
+                else:
+                    logger.warning(
+                        _msg + f" ⚠️ 목표 {_tr['target']:.0f} 셀 미만 — "
+                        f"경계층·박리가 풀리지 않아 Cd 가 부정확할 수 있습니다. "
+                        f"정밀화 레벨을 {_tr['required_level']} 이상으로 올리세요.")
+        except Exception as _e:
+            logger.debug(f"[UnitCell] 해상도 점검 건너뜀: {_e}")
 
         bmd = self.case_dir / "system" / "blockMeshDict"
         # v11 addLayers: 측면 주기 경계가 cyclicAMI(translational)라

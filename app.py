@@ -44,6 +44,8 @@ from cfd_manager import (
     OpenFOAMRunner, ResultExtractor, BatchAnalysisManager,
     get_cpu_count, RESULTS_DIR, STL_UPLOAD_DIR, LOGS_DIR, BASE_DIR,
     TRANSIENT_TURBULENCE_MODELS, compute_transient_stats, read_force_history,
+    twine_resolution, unit_cell_base_mm, TWINE_CELLS_TARGET,
+    validate_unit_cell_stl,
 )
 from visualizer import CFDVisualizer, AutoRefreshVisualizer, OpenFOAMResultReader
 
@@ -1898,6 +1900,20 @@ with tab_input:
                 ss._input_restored = False
                 _persist_input_state()        # 새로고침 복구용 디스크 기록
 
+                # 단위셀 도메인은 원점 중심 정사각이라, 형상이 어긋나면 격자가
+                # 형상을 못 잡고 Cd=0 이 조용히 나온다. 업로드 즉시 알린다.
+                _uv = validate_unit_cell_stl(Path(ss.stl_net_path))
+                if not _uv["ok"]:
+                    _bb = _uv["bbox"]
+                    st.error(
+                        "❌ **이 STL 은 단위 셀 모드에 쓸 수 없습니다.**\n\n"
+                        + "\n".join(f"- {i}" for i in _uv["issues"])
+                        + f"\n\n현재 bbox: x {_bb['x'][0]:.1f}~{_bb['x'][1]:.1f}, "
+                          f"y {_bb['y'][0]:.1f}~{_bb['y'][1]:.1f} mm\n\n"
+                          "그대로 실행하면 격자가 형상을 잡지 못해 **Cd = 0** 이 "
+                          "기록됩니다. 라이노에서 **원점 중심의 정사각 한 칸**으로 "
+                          "다시 내보내거나, 전체 구조 모드를 사용하세요.")
+
                 st.info(
                     f"🔍 **STL 자동 감지** — "
                     f"단위 셀 **{_info['cell_size_mm']:.1f} mm**, "
@@ -2282,11 +2298,33 @@ with tab_input:
             with _pc2:
                 refine_level = st.number_input(
                     "격자 정밀화 레벨",
-                    min_value=1, max_value=4, step=1,
+                    min_value=1, max_value=6, step=1,
                     key="refine_level_preset",
                     help="snappyHexMesh 표면 최대 정밀화 레벨 (min = 레벨-1). "
-                         "레벨 3: ~50만 셀(권장), 레벨 4: ~200만 셀(정밀)",
+                         "레벨 3: ~50만 셀(권장), 레벨 4: ~200만 셀(정밀). "
+                         "그물실이 가늘면 레벨을 더 올려야 합니다(아래 경고 참조).",
                 )
+                # ── 그물실 해상도 경고 ──────────────────────────────────
+                # 배경격자가 망목 크기에 비례해 정해지므로, 망목이 커지면 실 대비
+                # 격자가 사용자 모르게 거칠어진다. 항상 숫자로 보여주고 부족하면
+                # 필요한 레벨을 알려준다.
+                _wd = float(ss.get("auto_wire_d_mm") or 0.0)
+                if _wd > 0:
+                    _trw = twine_resolution(unit_cell_base_mm(cell_size), _wd,
+                                            int(refine_level))
+                    if _trw["ok"]:
+                        st.success(
+                            f"✅ 그물실 해상도 **{_trw['cells_per_d']:.1f} 셀/지름** "
+                            f"(목표 {TWINE_CELLS_TARGET:.0f} 이상)")
+                    else:
+                        st.warning(
+                            f"⚠️ 그물실 해상도 **{_trw['cells_per_d']:.1f} 셀/지름** "
+                            f"— 목표 {TWINE_CELLS_TARGET:.0f} 셀 미만입니다.\n\n"
+                            f"실 지름 {_wd:.2f} mm 에 최소 셀이 "
+                            f"{_trw['finest_mm']:.3f} mm 라 원통 표면의 경계층·박리를 "
+                            f"풀지 못합니다. Cd 가 부정확할 수 있습니다.\n\n"
+                            f"**정밀화 레벨을 {_trw['required_level']} 이상**으로 "
+                            f"올리세요 (레벨 1 상승마다 표면 근처 셀이 약 8배).")
                 end_time = st.number_input(
                     "최대 반복 횟수",
                     min_value=100, max_value=10000, step=100,
@@ -2499,6 +2537,17 @@ with tab_input:
                 except Exception:
                     pass
             summary_data["정밀화 레벨"] = f"{int(refine_level)} (min {max(1,int(refine_level)-1)} / max {int(refine_level)})"
+            # 그물실 격자 해상도 — 망목이 커지면 실 대비 격자가 조용히 거칠어지므로
+            # 항상 숫자로 보여준다(모르는 사이에 무너지지 않도록).
+            _wd_mm = float(ss.get("auto_wire_d_mm") or 0.0)
+            if _wd_mm > 0:
+                _tr = twine_resolution(unit_cell_base_mm(cell_size), _wd_mm,
+                                       int(refine_level))
+                summary_data["그물실 해상도"] = (
+                    f"{_tr['cells_per_d']:.1f} 셀/지름 "
+                    f"(실 {_wd_mm:.2f} mm ÷ 최소셀 {_tr['finest_mm']:.3f} mm)"
+                    + ("  ✅" if _tr["ok"]
+                       else f"  ⚠️ 목표 {_tr['target']:.0f} 셀 미만"))
         else:
             summary_data["가두리 직경"] = f"{cage_d:.1f} m"
             summary_data["가두리 수심"] = f"{cage_h:.1f} m"
