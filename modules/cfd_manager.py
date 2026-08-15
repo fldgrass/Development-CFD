@@ -1072,7 +1072,7 @@ class FullStructureCaseBuilder:
         # 격자 옵션(보완④: DDES 등에서 격자 민감도를 확인하기 위한 노브).
         # 기본값 refine_level=3 / n_layers=0 은 종전 하드코딩 값과 완전히 동일한
         # snappyHexMeshDict 를 만든다(회귀 방지).
-        self.refine_level     = max(1, min(5, int(refine_level)))
+        self.refine_level     = max(1, min(6, int(refine_level)))
         self.n_layers         = max(0, min(10, int(n_layers)))
         self.case_dir         = case_dir
         # 사용자가 UI 에서 직접 지정한 기준면적[m²]. None/0 이하면 자동 계산 사용.
@@ -1262,6 +1262,10 @@ class FullStructureCaseBuilder:
         # refine_level=3 → (2 3) 로 종전과 동일. n_layers=0 → addLayers false.
         _lmax = int(self.refine_level)
         _lmin = max(1, _lmax - 1)
+        # 정밀화 박스(refineBox)는 '체적'을 통째로 세분하므로 표면 레벨을 그대로
+        # 따라가면 셀이 폭발한다. 그물처럼 가는 형상은 표면만 깊게 파고 박스는
+        # 얕게 둬야 한다(레벨 3 까지는 종전대로 _lmin 을 써서 회귀 없음).
+        _lbox = _lmin if _lmax <= 3 else min(_lmin, 2)
         _add  = "true" if self.n_layers > 0 else "false"
         # n_layers=0 이면 종전 출력('layers {}')과 바이트까지 동일해야 하므로
         # 공백을 넣지 않는다.
@@ -1313,7 +1317,7 @@ castellatedMeshControls
 
     refinementRegions
     {{
-        refineBox {{ mode inside; levels ((1e10 {_lmin})); }}
+        refineBox {{ mode inside; levels ((1e10 {_lbox})); }}
     }}
 
     resolveFeatureAngle 30;
