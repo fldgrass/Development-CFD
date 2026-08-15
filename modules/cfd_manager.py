@@ -959,7 +959,14 @@ class FullStructureCaseBuilder:
                  residual_control: float = 1e-4,
                  end_time: int = 3000,
                  write_interval: int = 100,
-                 aref_override: Optional[float] = None):
+                 aref_override: Optional[float] = None,
+                 refine_level: int = 3,
+                 n_layers: int = 0):
+        # 격자 옵션(보완④: DDES 등에서 격자 민감도를 확인하기 위한 노브).
+        # 기본값 refine_level=3 / n_layers=0 은 종전 하드코딩 값과 완전히 동일한
+        # snappyHexMeshDict 를 만든다(회귀 방지).
+        self.refine_level     = max(1, min(5, int(refine_level)))
+        self.n_layers         = max(0, min(10, int(n_layers)))
         self.case_dir         = case_dir
         # 사용자가 UI 에서 직접 지정한 기준면적[m²]. None/0 이하면 자동 계산 사용.
         self.aref_override    = (float(aref_override)
@@ -1145,6 +1152,14 @@ class FullStructureCaseBuilder:
         bx0, by0, bz0 = self._box_min
         bx1, by1, bz1 = self._box_max
         lx, ly, lz = self._loc
+        # refine_level=3 → (2 3) 로 종전과 동일. n_layers=0 → addLayers false.
+        _lmax = int(self.refine_level)
+        _lmin = max(1, _lmax - 1)
+        _add  = "true" if self.n_layers > 0 else "false"
+        # n_layers=0 이면 종전 출력('layers {}')과 바이트까지 동일해야 하므로
+        # 공백을 넣지 않는다.
+        _lay  = (f" netSurface {{ nSurfaceLayers {self.n_layers}; }} "
+                 if self.n_layers > 0 else "")
         content = f"""FoamFile
 {{
     version 2.0; format ascii; class dictionary; object snappyHexMeshDict;
@@ -1152,7 +1167,7 @@ class FullStructureCaseBuilder:
 
 castellatedMesh true;
 snap            true;
-addLayers       false;
+addLayers       {_add};
 
 geometry
 {{
@@ -1178,20 +1193,20 @@ castellatedMeshControls
     maxLoadUnbalance    -1;
     nCellsBetweenLevels 3;
 
-    features ( {{ file "netSurface.eMesh"; level 2; }} );
+    features ( {{ file "netSurface.eMesh"; level {_lmin}; }} );
 
     refinementSurfaces
     {{
         netSurface
         {{
-            level (2 3);
+            level ({_lmin} {_lmax});
             patchInfo {{ type wall; inGroups (wall); }}
         }}
     }}
 
     refinementRegions
     {{
-        refineBox {{ mode inside; levels ((1e10 2)); }}
+        refineBox {{ mode inside; levels ((1e10 {_lmin})); }}
     }}
 
     resolveFeatureAngle 30;
@@ -1209,7 +1224,7 @@ snapControls
 addLayersControls
 {{
     relativeSizes true;
-    layers {{}}
+    layers {{{_lay}}}
     expansionRatio 1.2; finalLayerThickness 0.3; minThickness 0.1;
     nGrow 0; featureAngle 60; nRelaxIter 3; nSmoothSurfaceNormals 1;
     nSmoothNormals 3; nSmoothThickness 10; maxFaceThicknessRatio 0.5;
@@ -2055,7 +2070,7 @@ class BatchAnalysisManager:
                         **{k: v for k, v in self.params.items()
                            if k in ["cage_diameter", "cage_depth", "n_cores",
                                     "end_time", "residual_control", "write_interval",
-                                    "aref_override"]}
+                                    "aref_override", "refine_level", "n_layers"]}
                     )
 
                 builder.build()
