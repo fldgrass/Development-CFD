@@ -566,8 +566,9 @@ def apply_transient_settings(case_dir: Path, **kw) -> Dict[str, Any]:
             warn.append(f"controlDict:{name} 치환 실패")
     # 적응 시간간격 제어는 원본에 없는 항목이라 새로 삽입한다.
     if "adjustTimeStep" not in t:
+        # 주석까지 함께 잡아야 삽입한 줄에 원래 주석이 딸려붙지 않는다.
         t, ok = _sub_once(
-            t, r"(purgeWrite\s+\d+;)",
+            t, r"(purgeWrite\s+\d+;[^\n]*)",
             r"\1\n\n"
             f"adjustTimeStep  yes;\nmaxCo           {p['max_co']:g};\n"
             f"maxDeltaT       {p['max_delta_t']:g};")
@@ -823,7 +824,7 @@ class UnitCellCaseBuilder:
         self.write_interval   = max(10, int(write_interval))
         # 상한 6: 그물실이 가늘면(망목/실지름 비가 크면) 레벨 5~6 이 필요하다.
         # 종전 상한 4 는 UI 에서 더 올려도 조용히 무시되는 원인이었다.
-        self.refine_level     = max(1, min(6, int(refine_level)))
+        self.refine_level     = max(1, min(7, int(refine_level)))
 
         # cell_size / solidity: 미지정 시 STL에서 자동 감지
         stl_info = detect_stl_cell_size(stl_path)
@@ -1662,9 +1663,19 @@ class OpenFOAMRunner:
             if self._stop_flag.is_set():
                 return False
             # 병렬 결과는 processor*/ 에 남아 있다. 재분할하면 이 결과가 날아가므로
-            # 최신 시간을 그대로 이어받는다(startFrom latestTime).
-            t0 = self._latest_processor_time()
-            self._emit_log(f"선행 수렴 완료 — t={t0:g} 에서 비정상 해석 이어받기")
+            # 그대로 이어받되, '시간'을 0 으로 되돌린다.
+            #
+            # [중요] simpleFoam 은 반복 횟수를 시간으로 쓰므로 선행 수렴 후 t=400
+            # 같은 값이 된다. 여기서 물리 시간간격(예 1e-5 s)으로 이어가면
+            # 400.00001 을 표현해야 하는데 timePrecision 6 으로는 불가능해
+            # 시간이 전진하지 못하고 'Starting time loop → End' 로 즉시 끝난다.
+            # → 수렴장을 0 시간 디렉토리로 옮겨 물리시간 0 부터 다시 시작한다.
+            _latest = self._latest_processor_time()
+            if _latest > 0:
+                self._reset_processor_time_to_zero(_latest)
+            t0 = 0.0
+            self._emit_log(f"선행 수렴 완료(t={_latest:g}) — 수렴장을 t=0 으로 옮겨 "
+                           f"비정상 해석 시작")
         else:
             if bool(cfg.get("perturb", False)):
                 self._perturb_initial_field(float(cfg.get("perturb_magnitude", 0.01)))
@@ -1679,11 +1690,11 @@ class OpenFOAMRunner:
         if applied.get("warnings"):
             for w in applied["warnings"]:
                 self._emit_log(f"⚠️ transient 설정: {w}")
-        # 이어받기면 latestTime 에서 시작
+        # 이어받기든 아니든 t=0 에서 시작한다(위에서 수렴장을 0 으로 옮겼다).
         ctrl = self.case_dir / "system" / "controlDict"
         c = ctrl.read_text()
-        c = re.sub(r"startFrom\s+\w+;",
-                   f"startFrom       {'latestTime' if init else 'startTime'};", c)
+        c = re.sub(r"startFrom\s+\w+;", "startFrom       startTime;", c)
+        c = re.sub(r"startTime\s+[0-9.eE+-]+;", "startTime       0;", c)
         ctrl.write_text(c)
         self._transient_start_time = t0
         # 이어받기면 forceCoeffs/forces 파일에 simpleFoam 반복 이력(t=0..t0)과
@@ -1704,6 +1715,49 @@ class OpenFOAMRunner:
                               pre_cmd=None if init else "decomposePar -force",
                               monitor_residuals=True, end_time=end_abs,
                               start_time=t0)
+
+    def _reset_processor_time_to_zero(self, latest: float) -> None:
+        """각 processorN/ 의 최신 시간 디렉토리를 0 으로 옮긴다.
+
+        simpleFoam 수렴장을 pimpleFoam 의 초기조건(t=0)으로 삼기 위한 것.
+        기존 0/ 은 초기 균일장이라 버려도 된다(수렴장이 더 좋은 초기조건).
+        forceCoeffs/forces 이력도 반복 기반이라 함께 지워 통계 오염을 막는다.
+        """
+        moved = 0
+        for pdir in sorted(self.case_dir.glob("processor*")):
+            src = None
+            for d in pdir.iterdir():
+                if not d.is_dir():
+                    continue
+                try:
+                    if abs(float(d.name) - latest) < 1e-9:
+                        src = d
+                        break
+                except ValueError:
+                    continue
+            if src is None:
+                continue
+            dst = pdir / "0"
+            try:
+                if dst.exists():
+                    shutil.rmtree(dst)
+                src.rename(dst)
+                # [중요] <time>/uniform/time 에는 이전 시간값(예 300)과 simpleFoam
+                # 의 deltaT(=1초)가 들어 있고, 이것이 controlDict 의 startTime·
+                # deltaT 를 덮어쓴다. 그대로 두면 Courant 수가 1e4 대로 치솟고
+                # 'endTime < 현재시간' 이 되어 시간 루프가 즉시 종료된다.
+                # 지우면 OpenFOAM 이 controlDict 값을 그대로 쓴다.
+                shutil.rmtree(dst / "uniform", ignore_errors=True)
+                moved += 1
+            except Exception as _e:
+                self._emit_log(f"⚠️ {pdir.name} 시간 재설정 실패: {_e}")
+        # 반복 기반 force 이력 제거(물리시간 이력과 섞이면 통계가 오염된다)
+        pp = self.case_dir / "postProcessing"
+        if pp.exists():
+            for sub in list(pp.glob("force*")):
+                shutil.rmtree(sub, ignore_errors=True)
+        self._emit_log(f"수렴장을 t=0 으로 이동 ({moved}개 processor) · "
+                       f"반복 기반 force 이력 제거")
 
     def _latest_processor_time(self) -> float:
         """processor0/ 의 최신 시간 디렉토리 값(없으면 0)."""
