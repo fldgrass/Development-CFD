@@ -378,6 +378,141 @@ def twine_resolution(base_mm: float, wire_d_mm: float,
             "required_level": req, "ok": cpd >= target, "target": target}
 
 
+# ── 임계 최소 치수와 격자 적정성 ──────────────────────────────────────────
+# 격자가 반드시 해상해야 하는 치수는 '형상 전체 크기'가 아니라 '가장 가는 부분'
+# 이다(그물실 지름, 판재 두께). 이 값을 기준으로 두 가지를 따로 판정해야 한다.
+#   ① 표면 정밀화 : 경계층·박리를 풀려면 임계치수당 10셀 이상
+#   ② 후류 박스   : DES/LES 가 LES 모드로 전환하려면 후류 셀이 임계치수보다
+#                   충분히 작아야 한다(임계치수당 5셀 이상 권장)
+# 실측 사례: 3by3 그물(실 3mm)에서 표면은 12.4셀로 충분했지만 후류 박스가
+# 레벨 2(셀 3.88mm > 실 3mm)라 DDES 가 RANS 로 동작해 비정상성을 못 잡았다.
+SURF_CELLS_TARGET = 10.0     # 표면(경계층) 목표
+WAKE_CELLS_TARGET = 5.0      # 후류(DES/LES) 목표
+
+
+def critical_dimension(stl_path: Path) -> Dict[str, Any]:
+    """STL 에서 '격자가 반드시 해상해야 할 임계 최소 치수'[mm] 를 자동 산정한다.
+
+    반환: value(권장값), bbox_min(바운딩박스 최소변), thickness(닫힌 형상의
+          체적/표면적 기반 두께 추정), closed, spans
+    """
+    out: Dict[str, Any] = {"value": 0.0, "bbox_min": 0.0, "thickness": None,
+                           "closed": None, "spans": None, "basis": ""}
+    tris = read_stl_triangles(stl_path)
+    if not tris:
+        out["basis"] = "STL 을 읽지 못했습니다"
+        return out
+    pts = [v for t in tris for v in t]
+    spans = [max(p[i] for p in pts) - min(p[i] for p in pts) for i in range(3)]
+    out["spans"] = spans
+    pos = [s for s in spans if s > 0]
+    out["bbox_min"] = min(pos) if pos else 0.0
+
+    # 닫힌 형상이면 체적/표면적으로 대표 두께를 함께 추정한다(참고용).
+    try:
+        closed = is_closed_surface(stl_path)
+        out["closed"] = closed
+        if closed:
+            vol = 0.0
+            for p0, p1, p2 in tris:
+                vol += (p0[0]*(p1[1]*p2[2]-p1[2]*p2[1])
+                        - p0[1]*(p1[0]*p2[2]-p1[2]*p2[0])
+                        + p0[2]*(p1[0]*p2[1]-p1[1]*p2[0])) / 6.0
+            area_mm2 = compute_surface_area(stl_path) * 1.0e6
+            if area_mm2 > 0:
+                out["thickness"] = abs(vol) * 6.0 / area_mm2   # 6V/A ≈ 원통 지름
+    except Exception:
+        pass
+
+    out["value"] = out["bbox_min"]
+    out["basis"] = "바운딩박스 최소변"
+    return out
+
+
+def mesh_adequacy(critical_mm: float, base_mm: float,
+                  surface_level: int, box_level: int,
+                  model_family: str = "RAS") -> Dict[str, Any]:
+    """임계 치수 대비 표면·후류 격자의 적정성을 판정하고 권고 레벨을 낸다."""
+    base_mm = max(float(base_mm), 1e-9)
+    crit = max(float(critical_mm), 1e-9)
+
+    def _cells(level):
+        return crit / (base_mm / (2 ** max(0, int(level))))
+
+    def _need(target):
+        # base/2^L <= crit/target  →  2^L >= base*target/crit
+        r = base_mm * target / crit
+        return max(0, int(math.ceil(math.log2(r)))) if r > 1 else 0
+
+    surf_cells = _cells(surface_level)
+    wake_cells = _cells(box_level)
+    is_les = str(model_family).upper() in ("LES", "DES")
+    out = {
+        "critical_mm": crit, "base_mm": base_mm,
+        "surface_level": int(surface_level), "box_level": int(box_level),
+        "surface_cell_mm": base_mm / (2 ** max(0, int(surface_level))),
+        "wake_cell_mm": base_mm / (2 ** max(0, int(box_level))),
+        "surface_cells": surf_cells, "wake_cells": wake_cells,
+        "surface_ok": surf_cells >= SURF_CELLS_TARGET,
+        "wake_ok": (wake_cells >= WAKE_CELLS_TARGET) if is_les else True,
+        "surface_required": _need(SURF_CELLS_TARGET),
+        "wake_required": _need(WAKE_CELLS_TARGET) if is_les else int(box_level),
+        "model_family": "LES/DES" if is_les else "RANS",
+        "needs_wake": is_les,
+    }
+    out["ok"] = out["surface_ok"] and out["wake_ok"]
+    return out
+
+
+def mesh_adequacy_table(critical_mm: float, base_mm: float,
+                        levels=(2, 3, 4, 5, 6, 7),
+                        model_family: str = "RAS") -> List[Dict[str, Any]]:
+    """레벨별 셀 크기와 판정을 표로 만들어 UI 에 그대로 보여주기 위한 헬퍼."""
+    rows = []
+    for lv in levels:
+        cell = base_mm / (2 ** lv)
+        rows.append({
+            "level": lv,
+            "cell_mm": cell,
+            "cells": critical_mm / cell if cell > 0 else 0.0,
+            "surface_ok": (critical_mm / cell) >= SURF_CELLS_TARGET if cell > 0 else False,
+            "wake_ok": (critical_mm / cell) >= WAKE_CELLS_TARGET if cell > 0 else False,
+        })
+    return rows
+
+
+def tighten_mesh_quality(snappy_path: Path) -> Dict[str, Any]:
+    """snappyHexMeshDict 의 meshQualityControls 를 조여 슬리버 셀을 억제한다.
+
+    체적은 정상인데 한 방향으로만 극단적으로 얇은 셀(슬리버)이 하나만 있어도
+    비정상 해석의 시간간격이 붕괴한다(실측: Courant 297 → deltaT 2.7e-8 →
+    743만 스텝, 실행 불가). 이런 셀은 체적이나 종횡비로는 잡히지 않으므로
+    snappyHexMesh 가 애초에 만들지 않도록 품질 기준을 높인다.
+
+    대가로 형상 스냅 품질(모서리 재현)이 다소 떨어질 수 있다.
+    """
+    if not snappy_path.exists():
+        return {"ok": False, "changed": []}
+    txt = snappy_path.read_text()
+    # (키, 기존값 정규식, 새 값) — 첫 번째(주 meshQualityControls)만 바꾸고
+    # addLayers 용 완화 블록(relaxed)은 건드리지 않는다.
+    rules = [
+        ("minTetQuality", r"minTetQuality\s+[0-9.eE+-]+;", "minTetQuality           1e-09;"),
+        ("minDeterminant", r"minDeterminant\s+[0-9.eE+-]+;", "minDeterminant          0.01;"),
+        ("minVolRatio",    r"minVolRatio\s+[0-9.eE+-]+;",    "minVolRatio             0.05;"),
+        ("minTwist",       r"minTwist\s+[0-9.eE+-]+;",       "minTwist                0.05;"),
+        ("minFaceWeight",  r"minFaceWeight\s+[0-9.eE+-]+;",  "minFaceWeight           0.10;"),
+    ]
+    changed = []
+    for name, pat, rep in rules:
+        txt, n = re.subn(pat, rep, txt, count=1)
+        if n:
+            changed.append(name)
+    snappy_path.write_text(txt)
+    logger.info(f"[Mesh] 격자 품질 기준 강화 — {', '.join(changed) or '변경 없음'}")
+    return {"ok": bool(changed), "changed": changed}
+
+
 def validate_unit_cell_stl(stl_path: Path) -> Dict[str, Any]:
     """단위셀 모드가 요구하는 STL 조건을 검사한다.
 
@@ -808,7 +943,11 @@ class UnitCellCaseBuilder:
                  write_interval: int = 100,
                  refine_level: int = 3,
                  solidity: float = None,
-                 aref_override: Optional[float] = None):
+                 aref_override: Optional[float] = None,
+                 strict_mesh_quality: bool = False):
+        # 슬리버 셀 억제(비정상 해석의 시간간격 붕괴 방지). 기본 False 라
+        # 기존 호출부는 종전과 동일한 격자를 만든다.
+        self.strict_mesh_quality = bool(strict_mesh_quality)
         self.case_dir         = case_dir
         self.stl_path         = stl_path
         # 사용자가 UI 에서 직접 지정한 기준면적[m²]. None/0 이하면 자동 계산 사용.
@@ -824,7 +963,7 @@ class UnitCellCaseBuilder:
         self.write_interval   = max(10, int(write_interval))
         # 상한 6: 그물실이 가늘면(망목/실지름 비가 크면) 레벨 5~6 이 필요하다.
         # 종전 상한 4 는 UI 에서 더 올려도 조용히 무시되는 원인이었다.
-        self.refine_level     = max(1, min(7, int(refine_level)))
+        self.refine_level     = max(1, min(8, int(refine_level)))
 
         # cell_size / solidity: 미지정 시 STL에서 자동 감지
         stl_info = detect_stl_cell_size(stl_path)
@@ -980,6 +1119,8 @@ class UnitCellCaseBuilder:
             "refineLevelMin  2;": f"refineLevelMin  {level_min};",
             "refineLevelMax  3;": f"refineLevelMax  {level_max};",
         })
+        if self.strict_mesh_quality:
+            tighten_mesh_quality(snappy)
 
     def _patch_controlDict(self):
         """forceCoeffs 기준값 + endTime/writeInterval 주입"""
@@ -1070,13 +1211,21 @@ class FullStructureCaseBuilder:
                  aref_override: Optional[float] = None,
                  refine_level: int = 3,
                  n_layers: int = 0,
-                 auto_refine: bool = False):
+                 auto_refine: bool = False,
+                 net_grid_redesign: bool = False,
+                 net_grid_target_cells: float = 75.0,
+                 net_grid_max_base_cells: int = 3_000_000):
         # 격자 옵션(보완④: DDES 등에서 격자 민감도를 확인하기 위한 노브).
         # 기본값 refine_level=3 / n_layers=0 은 종전 하드코딩 값과 완전히 동일한
         # snappyHexMeshDict 를 만든다(회귀 방지).
-        self.refine_level     = max(1, min(7, int(refine_level)))
+        self.refine_level     = max(1, min(8, int(refine_level)))
         self.n_layers         = max(0, min(10, int(n_layers)))
         self.auto_refine      = bool(auto_refine)
+        # 배경격자 재설계(그물처럼 가는 요소가 있는 형상용). 기본 False 라
+        # 기존 호출부는 종전과 동일한 격자를 만든다.
+        self.net_grid_redesign = bool(net_grid_redesign)
+        self.net_grid_target_cells = float(net_grid_target_cells)
+        self.net_grid_max_base_cells = int(net_grid_max_base_cells)
         self.case_dir         = case_dir
         # 사용자가 UI 에서 직접 지정한 기준면적[m²]. None/0 이하면 자동 계산 사용.
         self.aref_override    = (float(aref_override)
@@ -1198,9 +1347,17 @@ class FullStructureCaseBuilder:
         cx = (bxmin+bxmax)/2; cy = (bymin+bymax)/2; cz = (bzmin+bzmax)/2
         L = max(bxmax-bxmin, bymax-bymin, bzmax-bzmin, 1e-3)
         self._net_L = L; self._net_c = (cx, cy, cz)
-        # 도메인: 상류 3L, 하류 7L, 횡·수직 ±3L (net 이 충분히 도메인 안에 들도록)
-        self._dom_min = (cx-3*L, cy-3*L, cz-3*L)
-        self._dom_max = (cx+7*L, cy+3*L, cz+3*L)
+        # ── 도메인 ────────────────────────────────────────────────────────
+        # 종전: 상류 3L, 하류 7L, 횡·수직 ±3L
+        # 재설계(net_grid_redesign): 상류 2L, 하류 5L, 횡·수직 ±2L 로 축소.
+        # 배경격자를 '실 지름' 기준으로 잡으면 셀 수가 도메인 부피에 비례해
+        # 폭증하므로, 넉넉하던 도메인을 필요 최소로 줄인다(부피 1/2.7).
+        if getattr(self, "net_grid_redesign", False):
+            _u, _d, _s = 2.0, 5.0, 2.0
+        else:
+            _u, _d, _s = 3.0, 7.0, 3.0
+        self._dom_min = (cx-_u*L, cy-_s*L, cz-_s*L)
+        self._dom_max = (cx+_d*L, cy+_s*L, cz+_s*L)
         # 정밀화 박스: net + 근접 후류
         # 정밀화 박스: 체적을 통째로 세분하므로 필요 최소로 잡는다.
         # 후류(유동 +x 하류)는 넉넉히 두되, 상류·측면 여유는 좁힌다.
@@ -1208,8 +1365,15 @@ class FullStructureCaseBuilder:
         _m = 0.15 * L
         self._box_min = (bxmin-_m, bymin-_m, bzmin-_m)
         self._box_max = (bxmax+1.5*L, bymax+_m, bzmax+_m)
-        # 기준점: net 상류(연결된 유체 영역 어디든 가능, net 표면만 피하면 됨)
-        self._loc = (cx-2.5*L, cy, cz)
+        # 기준점: net 상류(연결된 유체 영역 어디든 가능, net 표면만 피하면 됨).
+        # 도메인 상류 여유가 재설계에서 3L→2L 로 줄었으므로 고정 2.5L 을 쓰면
+        # 도메인 밖으로 나간다(snappy FATAL: not inside the mesh).
+        # 입구면과 형상 앞면의 중간점으로 잡아 어떤 도메인 설정에도 안전하게 한다.
+        # 또한 y=cy, z=cz 를 그대로 쓰면 대칭 도메인에서 정확히 '셀 경계면 위'에
+        # 놓여 snappy 가 거부한다(FATAL: not inside the mesh or on a face or edge).
+        # 격자선과 겹치지 않도록 L 의 소수 비율만큼 어긋나게 둔다.
+        self._loc = ((self._dom_min[0] + bxmin) / 2.0,
+                     cy + 0.0137 * L, cz + 0.0219 * L)
 
     def _auto_tune_refine_level(self):
         """형상의 '가장 가는 치수'를 기준으로 정밀화 레벨을 자동 산정한다.
@@ -1238,16 +1402,16 @@ class FullStructureCaseBuilder:
                     f"{_tr['required_level']} 이상으로 올려야 합니다. "
                     f"(자동 보정이 꺼져 있어 레벨 {self.refine_level} 로 진행)")
                 return
-            _new = min(7, _tr["required_level"])
+            _new = min(8, _tr["required_level"])
             if _new > self.refine_level:
                 logger.warning(
                     _msg + f" ⚠️ 목표 미만 → 정밀화 레벨 자동 상향 "
                     f"{self.refine_level} → {_new} (셀 수·계산시간 증가)")
                 self.refine_level = _new
-                if _tr["required_level"] > 7:
+                if _tr["required_level"] > 8:
                     logger.warning(
                         f"[FullStructure] 목표 달성에는 레벨 {_tr['required_level']} 이 "
-                        f"필요하지만 상한 7 로 제한했습니다. 결과에 격자 오차가 "
+                        f"필요하지만 상한 8 로 제한했습니다. 결과에 격자 오차가 "
                         f"남습니다.")
         except Exception as _e:
             logger.debug(f"[FullStructure] 정밀화 자동 산정 건너뜀: {_e}")
@@ -1280,11 +1444,55 @@ class FullStructureCaseBuilder:
             x_min, y_min, z_min = self._dom_min
             x_max, y_max, z_max = self._dom_max
             L = self._net_L
-            # 기저 셀 ~ L/8, 도메인 비율에 맞춰 분할 수 산정(40~120 클램프)
-            _cell = max(L/8.0, 1e-4)
-            nx = max(40, min(120, int((x_max-x_min)/_cell)))
-            ny = max(30, min(100, int((y_max-y_min)/_cell)))
-            nz = max(30, min(100, int((z_max-z_min)/_cell)))
+            if getattr(self, "net_grid_redesign", False):
+                # ── 배경격자 재설계 ──────────────────────────────────────
+                # 종전 L/8 은 '형상 전체 크기' 기준이라, 그물처럼 가는 요소가
+                # 흩어진 형상은 실 지름당 셀이 1~2 개밖에 안 걸린다(3by3 실측
+                # 레벨 3 → 1.5셀). 문헌값에 수렴하려면 70셀 이상이 필요한데,
+                # L/8 기준으로는 레벨 9~10 이 필요해 실행 불가였다.
+                #
+                # 재설계: '임계 치수(실 지름)'를 기준으로 base 를 잡는다.
+                #   base = crit × 2^level / TARGET
+                # 이러면 지정한 레벨에서 곧바로 TARGET 셀/지름이 나온다.
+                # 배경 셀 총수가 폭증하지 않도록 상한을 두고, 넘으면 base 를
+                # 키운다(그만큼 해상도가 떨어지므로 로그로 알린다).
+                _crit_mm = self._thin_dimension_mm() or (L * 1000 / 8)
+                _target = float(getattr(self, "net_grid_target_cells", 75.0))
+                _lvl = int(self.refine_level)
+                _cell = (_crit_mm / 1000.0) * (2 ** _lvl) / _target
+                # [필수 제약] 배경 셀이 임계 치수보다 크면 snappyHexMesh 가 표면을
+                # 애초에 찾지 못해 정밀화가 시작조차 안 된다(실측: 배경 9.6mm /
+                # 실 3mm 에서 레벨 2에 중단 → 실 지름당 1.25셀). 배경 셀을 임계
+                # 치수 이하로 강제한다. (실측: 배경/임계 = 1.6배는 정상 작동,
+                #  3.2배는 실패 → 1.0배를 안전 기준으로 둔다.)
+                _cap_cell = (_crit_mm / 1000.0)
+                if _cell > _cap_cell:
+                    logger.info(
+                        f"[FullStructure] 배경셀 {_cell*1000:.3f}mm 가 임계치수 "
+                        f"{_crit_mm:.2f}mm 의 1/2 를 초과 → {_cap_cell*1000:.3f}mm 로 제한 "
+                        f"(그렇지 않으면 표면 정밀화가 시작되지 않음)")
+                    _cell = _cap_cell
+                _cap = int(getattr(self, "net_grid_max_base_cells", 3_000_000))
+                for _ in range(12):
+                    _n = ((x_max-x_min)/_cell) * ((y_max-y_min)/_cell) * ((z_max-z_min)/_cell)
+                    if _n <= _cap:
+                        break
+                    _cell *= 1.26          # 셀 수 2배씩 줄이며 완화
+                _got = _crit_mm / (_cell * 1000 / (2 ** _lvl))
+                logger.info(
+                    f"[FullStructure] 배경격자 재설계: 임계치수 {_crit_mm:.2f}mm, "
+                    f"레벨 {_lvl} → 배경셀 {_cell*1000:.3f}mm, "
+                    f"최소셀 {_cell*1000/(2**_lvl):.4f}mm = {_got:.1f} 셀/지름 "
+                    f"(목표 {_target:.0f})")
+                nx = max(20, int((x_max-x_min)/_cell))
+                ny = max(20, int((y_max-y_min)/_cell))
+                nz = max(20, int((z_max-z_min)/_cell))
+            else:
+                # 기저 셀 ~ L/8, 도메인 비율에 맞춰 분할 수 산정(40~120 클램프)
+                _cell = max(L/8.0, 1e-4)
+                nx = max(40, min(120, int((x_max-x_min)/_cell)))
+                ny = max(30, min(100, int((y_max-y_min)/_cell)))
+                nz = max(30, min(100, int((z_max-z_min)/_cell)))
         else:
             D, H = self.cage_D, self.cage_H
             # 도메인: 상류 3D, 하류 7D, 횡방향 3D, 수심 H
@@ -1297,14 +1505,14 @@ class FullStructureCaseBuilder:
 
         bmd = self.case_dir / "system" / "blockMeshDict"
         replace_in_file(bmd, {
-            "(-30  -30  -5)": f"({x_min:.1f}  {y_min:.1f}  {z_min:.1f})",
-            "( 70  -30  -5)": f"({x_max:.1f}  {y_min:.1f}  {z_min:.1f})",
-            "( 70   30  -5)": f"({x_max:.1f}  {y_max:.1f}  {z_min:.1f})",
-            "(-30   30  -5)": f"({x_min:.1f}  {y_max:.1f}  {z_min:.1f})",
-            "(-30  -30   0)": f"({x_min:.1f}  {y_min:.1f}  {z_max:.1f})",
-            "( 70  -30   0)": f"({x_max:.1f}  {y_min:.1f}  {z_max:.1f})",
-            "( 70   30   0)": f"({x_max:.1f}  {y_max:.1f}  {z_max:.1f})",
-            "(-30   30   0)": f"({x_min:.1f}  {y_max:.1f}  {z_max:.1f})",
+            "(-30  -30  -5)": f"({x_min:.6g}  {y_min:.6g}  {z_min:.6g})",
+            "( 70  -30  -5)": f"({x_max:.6g}  {y_min:.6g}  {z_min:.6g})",
+            "( 70   30  -5)": f"({x_max:.6g}  {y_max:.6g}  {z_min:.6g})",
+            "(-30   30  -5)": f"({x_min:.6g}  {y_max:.6g}  {z_min:.6g})",
+            "(-30  -30   0)": f"({x_min:.6g}  {y_min:.6g}  {z_max:.6g})",
+            "( 70  -30   0)": f"({x_max:.6g}  {y_min:.6g}  {z_max:.6g})",
+            "( 70   30   0)": f"({x_max:.6g}  {y_max:.6g}  {z_max:.6g})",
+            "(-30   30   0)": f"({x_min:.6g}  {y_max:.6g}  {z_max:.6g})",
             "(100 60 20)": f"({nx} {ny} {nz})",
         })
 
@@ -1708,6 +1916,35 @@ class OpenFOAMRunner:
         except Exception as _e:
             self._emit_log(f"⚠️ transient_meta.json 저장 실패: {_e}")
 
+        # ── 사전 진단(프로브) — 본 실행 전에 실제 deltaT 를 재본다 ──────────
+        # 이게 없으면 시간간격이 붕괴한 케이스에서 수 시간을 쓰고 결과 없이 끝난다.
+        _max_steps = int(cfg.get("max_steps", 200000))
+        _pr = self.probe_transient_timestep(
+            float(applied.get("delta_t", 1e-3)), float(applied.get("max_co", 0.8)),
+            float(duration))
+        if _pr["ok"]:
+            _h = _pr["steps"] * 0.4 / 3600.0   # 스텝당 0.4초 가정(대략치)
+            self._emit_log(
+                f"🔎 사전 진단: Co_max={_pr['co_max']:.3g} → 실제 deltaT "
+                f"{_pr['delta_t']:.3g}s → 필요 스텝 {_pr['steps']:,.0f}개 "
+                f"(대략 {_h:.1f}시간)")
+            if _pr["steps"] > _max_steps:
+                self._emit_log(
+                    f"❌ 실행 중단 — 필요 스텝 {_pr['steps']:,.0f}개가 한계 "
+                    f"{_max_steps:,}개를 초과합니다.\n"
+                    f"   원인: 격자에 매우 얇은 셀이 있거나 초기장이 불안정해 "
+                    f"Courant 수가 {_pr['co_max']:.3g} 까지 올라갑니다.\n"
+                    f"   해결 방법:\n"
+                    f"   · 정밀화 레벨을 한 단계 낮추기 (가장 확실, 정확도 일부 손실)\n"
+                    f"   · 격자 품질 기준 강화 옵션(strict_mesh_quality) 켜기\n"
+                    f"   · 물리시간을 {duration*_max_steps/_pr['steps']:.4g}s 이하로 "
+                    f"줄여 경향만 확인\n"
+                    f"   · nOuterCorrectors 를 올리고 maxCo 를 높여 Co>1 허용"
+                    f"(이 경우 스텝당 비용이 배수로 증가)")
+                return False
+        else:
+            self._emit_log(f"⚠️ 사전 진단 건너뜀 ({_pr['reason']}) — 그대로 진행합니다")
+
         self._emit_log(f"2단계: pimpleFoam 비정상 해석 (t={t0:g} → {end_abs:g} s)")
         # 이어받기면 이미 분할된 processor 결과를 써야 하므로 재분할 금지
         cmd = f"mpirun --oversubscribe -np {self.n_cores} pimpleFoam -parallel"
@@ -1715,6 +1952,67 @@ class OpenFOAMRunner:
                               pre_cmd=None if init else "decomposePar -force",
                               monitor_residuals=True, end_time=end_abs,
                               start_time=t0)
+
+    def probe_transient_timestep(self, delta_t: float, max_co: float,
+                                 duration: float) -> Dict[str, Any]:
+        """본 실행 전에 실제 가능한 deltaT 를 측정한다(수 초 소요).
+
+        pimpleFoam 은 시간 루프에 들어가기 '전에' 초기 Courant 수를 출력한다.
+        endTime 을 startTime 과 같게 두면 루프를 돌지 않고 그 값만 찍고 끝나므로,
+        수 초 만에 다음을 알 수 있다.
+
+            deltaT_실제 = deltaT_설정 × maxCo / Co_max
+            필요 스텝   = duration / deltaT_실제
+
+        격자 슬리버든 초기장 이상이든 원인과 무관하게 잡히는 것이 장점이다.
+        (실측 사례: 레벨 6 단위셀에서 Co_max=297.5 → deltaT 2.7e-8 → 743만 스텝.
+         이 진단이 없어 14.7분을 쓰고 결과 없이 끝났다.)
+        """
+        out: Dict[str, Any] = {"ok": False, "co_max": None, "delta_t": None,
+                               "steps": None, "reason": ""}
+        ctrl = self.case_dir / "system" / "controlDict"
+        if not ctrl.exists():
+            out["reason"] = "controlDict 없음"
+            return out
+        backup = ctrl.read_text()
+        try:
+            # endTime 을 startTime(=0) 과 같게 → 시간 루프 진입 즉시 종료
+            probe = re.sub(r"^endTimeValue\s+[0-9.eE+-]+;", "endTimeValue        0;",
+                           backup, count=1, flags=re.M)
+            ctrl.write_text(probe)
+            cmd = (f"mpirun --oversubscribe -np {self.n_cores} pimpleFoam -parallel")
+            bashrc = self.find_openfoam_bashrc()
+            full = f"bash -c 'source {bashrc} && cd {self.case_dir} && {cmd}'" if bashrc \
+                else f"bash -c 'cd {self.case_dir} && {cmd}'"
+            res = subprocess.run(full, shell=True, capture_output=True,
+                                 text=True, timeout=300)
+            txt = (res.stdout or "") + (res.stderr or "")
+            m = None
+            for m2 in re.finditer(r"Courant Number mean:\s*([0-9.eE+-]+)\s+max:\s*([0-9.eE+-]+)", txt):
+                m = m2
+                break     # 첫 번째(= 설정 deltaT 기준) 값만 쓴다
+            if not m:
+                out["reason"] = "Courant 수를 읽지 못했습니다"
+                return out
+            co_max = float(m.group(2))
+            out["co_max"] = co_max
+            if co_max <= 0:
+                out["reason"] = "Courant 수가 0"
+                return out
+            dt = float(delta_t) * float(max_co) / co_max
+            dt = min(dt, float(delta_t))      # 설정값보다 커지지는 않게
+            out["delta_t"] = dt
+            out["steps"] = duration / dt if dt > 0 else float("inf")
+            out["ok"] = True
+            return out
+        except subprocess.TimeoutExpired:
+            out["reason"] = "프로브 실행 시간 초과"
+            return out
+        except Exception as _e:
+            out["reason"] = f"프로브 실패: {_e}"
+            return out
+        finally:
+            ctrl.write_text(backup)
 
     def _reset_processor_time_to_zero(self, latest: float) -> None:
         """각 processorN/ 의 최신 시간 디렉토리를 0 으로 옮긴다.
@@ -2306,7 +2604,8 @@ class BatchAnalysisManager:
                            if k in ["cage_diameter", "cage_depth", "n_cores",
                                     "end_time", "residual_control", "write_interval",
                                     "aref_override", "refine_level", "n_layers",
-                                    "auto_refine"]}
+                                    "auto_refine", "net_grid_redesign",
+                                    "net_grid_target_cells"]}
                     )
 
                 builder.build()

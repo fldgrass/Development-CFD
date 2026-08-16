@@ -45,7 +45,8 @@ from cfd_manager import (
     get_cpu_count, RESULTS_DIR, STL_UPLOAD_DIR, LOGS_DIR, BASE_DIR,
     TRANSIENT_TURBULENCE_MODELS, compute_transient_stats, read_force_history,
     twine_resolution, unit_cell_base_mm, TWINE_CELLS_TARGET,
-    validate_unit_cell_stl,
+    validate_unit_cell_stl, critical_dimension, mesh_adequacy,
+    mesh_adequacy_table, SURF_CELLS_TARGET, WAKE_CELLS_TARGET,
 )
 from visualizer import CFDVisualizer, AutoRefreshVisualizer, OpenFOAMResultReader
 
@@ -168,6 +169,9 @@ def init_session():
         # ── Solver 선택 (기본값은 반드시 Steady = 기존 동작 100% 유지) ──
         # 형상의 가장 가는 치수 기준으로 정밀화 레벨을 자동 상향(STL 종류 무관)
         "auto_refine":        True,
+        # 임계 최소 치수(격자가 반드시 해상해야 할 치수) — 자동/수동
+        "crit_dim_mode":      "자동",
+        "crit_dim_manual_mm": 0.0,
         "solver_mode":        "Steady (simpleFoam)",
         "tr_end_time":        30.0,    # 물리시간 [s]
         "tr_delta_t":         0.001,
@@ -389,7 +393,7 @@ PROJECT_KEYS = [
     # 기준면적 Aref(자동/직접 입력)
     "aref_mode", "aref_manual_m2",
     # 격자 자동 보정 / Solver 선택 및 비정상 해석 설정
-    "auto_refine",
+    "auto_refine", "crit_dim_mode", "crit_dim_manual_mm",
     "solver_mode", "tr_end_time", "tr_delta_t", "tr_max_co", "tr_max_delta_t",
     "tr_write_interval", "tr_n_outer", "tr_n_corr", "tr_n_non_orth",
     "tr_turbulence", "tr_init_steady", "tr_steady_iters", "tr_perturb",
@@ -2261,6 +2265,90 @@ with tab_input:
             st.caption("⚠️ 꺼져 있습니다. 가는 그물실은 격자가 부족해 Cd 가 "
                        "과대평가될 수 있습니다(로그에 경고가 남습니다).")
 
+        # ─── 임계 최소 치수 · 격자 적정성 ────────────────────────────────
+        # 격자가 반드시 해상해야 하는 건 형상 전체 크기가 아니라 '가장 가는 부분'
+        # (그물실 지름·판재 두께)이다. 이 값으로 표면과 후류를 따로 판정한다.
+        _stl_for_crit = ss.get("stl_net_path")
+        if _stl_for_crit and Path(_stl_for_crit).exists():
+            with st.expander("📏 임계 최소 치수 · 격자 적정성 판정", expanded=False):
+                _cd = critical_dimension(Path(_stl_for_crit))
+                _c1, _c2 = st.columns([1, 1.1])
+                with _c1:
+                    st.radio("임계 치수 결정", ["자동", "직접 입력"],
+                             key="crit_dim_mode", horizontal=True,
+                             help="격자가 해상해야 할 가장 가는 치수입니다. "
+                                  "자동은 STL 바운딩박스의 최소변을 씁니다.")
+                    st.caption(f"자동 산정: **{_cd['bbox_min']:.3f} mm** "
+                               f"({_cd['basis']})")
+                    if _cd.get("thickness"):
+                        st.caption(f"참고 — 체적/표면적 기반 추정 6V/A = "
+                                   f"{_cd['thickness']:.3f} mm")
+                    if ss.crit_dim_mode == "직접 입력":
+                        if not ss.get("crit_dim_manual_mm"):
+                            ss.crit_dim_manual_mm = float(_cd["bbox_min"] or 1.0)
+                        ss.crit_dim_manual_mm = st.number_input(
+                            "임계 치수 [mm]", value=float(ss.crit_dim_manual_mm),
+                            min_value=0.001, step=0.1, format="%.3f",
+                            key="_w_crit_dim")
+                _crit = (float(ss.crit_dim_manual_mm)
+                         if ss.crit_dim_mode == "직접 입력" and ss.get("crit_dim_manual_mm")
+                         else float(_cd["bbox_min"] or 0.0))
+
+                # 배경격자: 단위셀은 a/16, 전체구조는 형상 L/8
+                if mode == "unit_cell":
+                    # 이 블록은 모드 분기보다 앞서므로 위젯 변수(cell_size) 대신
+                    # 세션 값을 쓴다(단위: mm → m).
+                    _base = unit_cell_base_mm(
+                        float(ss.get("cell_size_mm", 20.0)) / 1000.0)
+                else:
+                    _spans = _cd.get("spans") or [1.0]
+                    _base = max(_spans) / 8.0
+                _fam = ("LES" if TRANSIENT_TURBULENCE_MODELS.get(
+                            ss.get("tr_turbulence", "kOmegaSST")) == "LES"
+                        and str(ss.get("solver_mode", "")).startswith("Transient")
+                        else "RAS")
+                # refine_level 위젯도 이 블록보다 뒤에 생성되므로 세션 값 사용
+                _rl = int(ss.get("refine_level_preset", 3))
+                _box_lv = _rl - 1 if _rl <= 3 else 2
+                _ad = mesh_adequacy(_crit, _base, _rl, _box_lv, _fam)
+
+                with _c2:
+                    st.markdown(f"**현재 설정 판정** — 난류 {_ad['model_family']}")
+                    st.write(f"- 임계 치수 **{_crit:.3f} mm** · 배경격자 {_base:.3f} mm")
+                    st.write(f"- 표면 정밀화 lv{_ad['surface_level']} → 셀 "
+                             f"{_ad['surface_cell_mm']:.4f} mm = "
+                             f"**{_ad['surface_cells']:.1f}셀** "
+                             + ("✅" if _ad["surface_ok"] else
+                                f"⚠️ (목표 {SURF_CELLS_TARGET:.0f})"))
+                    if _ad["needs_wake"]:
+                        st.write(f"- 후류 박스 lv{_ad['box_level']} → 셀 "
+                                 f"{_ad['wake_cell_mm']:.4f} mm = "
+                                 f"**{_ad['wake_cells']:.1f}셀** "
+                                 + ("✅" if _ad["wake_ok"] else
+                                    f"⚠️ (목표 {WAKE_CELLS_TARGET:.0f})"))
+                    if not _ad["ok"]:
+                        st.warning(
+                            f"⚠️ 권고: 표면 정밀화 **레벨 {_ad['surface_required']} 이상**"
+                            + (f", 후류 박스 **레벨 {_ad['wake_required']} 이상**"
+                               if _ad["needs_wake"] and not _ad["wake_ok"] else "")
+                            + ".\n\n후류가 부족하면 DES/LES 가 LES 모드로 전환하지 "
+                              "못해 사실상 RANS 로 동작합니다(실측: 3by3 그물에서 "
+                              "DDES 변동 0.02%).")
+                    else:
+                        st.success("✅ 현재 설정으로 충분합니다.")
+
+                st.markdown("**레벨별 적정성**")
+                _rows = []
+                for r in mesh_adequacy_table(_crit, _base):
+                    _rows.append({
+                        "레벨": r["level"],
+                        "셀 크기 [mm]": f"{r['cell_mm']:.4f}",
+                        "임계치수당 셀": f"{r['cells']:.1f}",
+                        f"표면 RANS (≥{SURF_CELLS_TARGET:.0f})": "OK" if r["surface_ok"] else "부족",
+                        f"후류 DES/LES (≥{WAKE_CELLS_TARGET:.0f})": "OK" if r["wake_ok"] else "부족",
+                    })
+                st.dataframe(_rows, use_container_width=True, hide_index=True)
+
         if mode == "unit_cell":
             # ── 유속·영각 범위 (단계수 1×1 = 단일 해석) ──────────────────
             # 단일/배치 해석을 하나의 인터페이스로 통합한다. 단계수를 모두 1로
@@ -2321,7 +2409,7 @@ with tab_input:
             with _pc2:
                 refine_level = st.number_input(
                     "격자 정밀화 레벨",
-                    min_value=1, max_value=7, step=1,
+                    min_value=1, max_value=8, step=1,
                     key="refine_level_preset",
                     help="snappyHexMesh 표면 최대 정밀화 레벨 (min = 레벨-1). "
                          "레벨 3: ~50만 셀(권장), 레벨 4: ~200만 셀(정밀). "
