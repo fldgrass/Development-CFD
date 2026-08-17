@@ -49,7 +49,10 @@ from cfd_manager import (
     mesh_adequacy_table, SURF_CELLS_TARGET, WAKE_CELLS_TARGET,
     net_grid_base_cell, classify_stl, STL_TYPE_LABELS, STL_TYPE_PRESETS,
     FLUID_PRESETS, estimate_mesh_size, unit_cell_base_mm as _uc_base_mm,
-    compute_surface_area,
+    compute_surface_area, unit_cell_base_mm,
+    result_reliability, preflight_checks, steady_force_convergence,
+    run_mesh_independence, mesh_independence_table, REFERENCE_CASES,
+    write_cylinder_stl, reference_comparison, count_mesh_cells,
 )
 from visualizer import CFDVisualizer, AutoRefreshVisualizer, OpenFOAMResultReader
 
@@ -184,6 +187,14 @@ def init_session():
         "stl_type_user":      "자동 판별 결과 사용",
         "re_length_mode":     "자동",
         "re_length_manual_mm": 0.0,
+        # ── Phase 3: 검증 도구 상태 ──
+        "mi_levels":          [3, 4, 5],
+        "mi_rows":            None,
+        "mi_done":            False,
+        "ref_case_key":       "sphere",
+        "ref_speed":          1.0,
+        "ref_result":         None,
+        "ref_done":           False,
         # 임계 최소 치수(격자가 반드시 해상해야 할 치수) — 자동/수동
         "crit_dim_mode":      "자동",
         "crit_dim_manual_mm": 0.0,
@@ -1683,6 +1694,122 @@ def _scan_done_conditions(mode):
     return _done
 
 
+def _start_mesh_independence(mode, levels, n_cores, rho, ti):
+    """격자 독립성 시험을 백그라운드로 실행한다(요구서 §19).
+
+    통상 배치와 같은 실행 경로(BatchAnalysisManager)를 레벨마다 한 번씩 쓴다.
+    """
+    stl_net = Path(ss.stl_net_path) if ss.get("stl_net_path") else None
+    if not stl_net or not stl_net.exists():
+        st.error("STL 을 먼저 업로드하세요."); return
+    stl_paths = {"net": stl_net}
+    if mode == "full_structure" and ss.get("stl_cage_path"):
+        stl_paths["cage"] = Path(ss.stl_cage_path)
+    _speed = float(ss.get("u_min", 1.0))
+    _angle = float(ss.get("a_min", 0.0))
+    params = {
+        "n_cores": n_cores, "nx": ss.get("unit_nx", 1), "ny": ss.get("unit_ny", 1),
+        "end_time": int(ss.get("end_time_preset", 2000)),
+        "residual_control": float(ss.get("residual_preset", "1e-4")),
+        "write_interval": int(ss.get("write_interval_preset", 100)),
+        "aref_override": _effective_aref(),
+        "rho": float(ss.get("rho", 1025.0)), "nu": _nu_si(),
+    }
+    if mode == "full_structure":
+        params["cage_diameter"] = float(ss.get("cage_d", 10.0))
+        params["cage_depth"] = float(ss.get("cage_h", 5.0))
+        if ss.get("net_grid_redesign"):
+            params["net_grid_redesign"] = True
+            params["net_grid_target_cells"] = float(ss.get("net_grid_target_cells", 75.0))
+    ss.log_lines = []
+    ss.job_start_time = time.time()
+    set_status("running", f"격자 독립성 시험 ({len(levels)}개 레벨)")
+    add_log(f"🔬 격자 독립성 시험 시작 — 레벨 {levels}, U={_speed} m/s, α={_angle}°")
+    _root = _results_root(mode) / f"mesh_independence_{datetime.now():%y%m%d_%H%M}"
+
+    def _run():
+        try:
+            rows = run_mesh_independence(
+                mode=mode, stl_paths=stl_paths, speed=_speed, angle=_angle,
+                levels=levels, common_params=params, results_root=_root,
+                log_cb=add_log,
+                progress_cb=lambda p, s, e, label="": (
+                    setattr(ss, "progress", max(0.0, min(100.0, float(p)))),
+                    setattr(ss, "current_step", label or f"레벨 {s}/{e}")))
+            ss["mi_rows"] = rows
+            ss["mi_done"] = any(r.get("Cd") is not None for r in rows)
+            set_status("done", "격자 독립성 시험 완료")
+            add_log("✅ 격자 독립성 시험 완료")
+        except Exception as e:
+            set_status("error", str(e)); add_log(f"❌ 격자 독립성 시험 오류: {e}")
+
+    th = threading.Thread(target=_run, daemon=True)
+    if add_script_run_ctx is not None:
+        add_script_run_ctx(th)
+    ss.job_thread = th
+    th.start()
+
+
+def _start_reference_case(key, speed, n_cores, rho, ti):
+    """문헌값이 있는 기본 형상을 같은 파이프라인으로 실행한다(요구서 §20)."""
+    rc = REFERENCE_CASES[key]
+    stl = None
+    if rc.get("stl") and (APP_DIR / rc["stl"]).exists():
+        stl = APP_DIR / rc["stl"]
+    elif key == "cylinder":
+        stl = STL_UPLOAD_DIR / "reference_cylinder.stl"
+        if not stl.exists():
+            write_cylinder_stl(stl, diameter_mm=rc["length_m"]*1000.0,
+                               length_mm=rc["length_m"]*1000.0*4)
+    if not stl or not Path(stl).exists():
+        st.error(f"검증용 STL 을 찾을 수 없습니다: {rc.get('stl')}"); return
+
+    params = {
+        "n_cores": n_cores,
+        "end_time": int(ss.get("end_time_preset", 2000)),
+        "residual_control": float(ss.get("residual_preset", "1e-4")),
+        "write_interval": int(ss.get("write_interval_preset", 100)),
+        "refine_level": int(ss.get("refine_level_preset", 3)),
+        "auto_refine": True,
+        "rho": float(ss.get("rho", 1025.0)), "nu": _nu_si(),
+    }
+    ss.log_lines = []
+    ss.job_start_time = time.time()
+    set_status("running", f"검증 케이스 실행 — {rc['label']}")
+    add_log(f"🔬 검증 케이스 시작: {rc['label']} · U={speed} m/s")
+    _root = _results_root("full_structure") / f"reference_{key}_{datetime.now():%y%m%d_%H%M}"
+
+    def _run():
+        try:
+            mgr = BatchAnalysisManager(
+                mode="full_structure", stl_paths={"net": Path(stl)},
+                speeds=[float(speed)], angles=[0.0],
+                output_csv=_root / "force_coeffs.csv", common_params=params,
+                progress_cb=lambda p, s, e, label="": (
+                    setattr(ss, "progress", max(0.0, min(100.0, float(p)))),
+                    setattr(ss, "current_step", label or "검증 케이스")),
+                log_cb=add_log, results_root=_root)
+            res = mgr.run_batch()
+            if res and res[-1].get("Cd") is not None:
+                cmp_ = reference_comparison(key, float(res[-1]["Cd"]),
+                                            float(speed), _nu_si())
+                ss["ref_result"] = cmp_
+                ss["ref_done"] = True
+                add_log(f"✅ 검증 완료 — CFD Cd={cmp_['Cd_cfd']:.4f} vs "
+                        f"문헌 {cmp_['Cd_ref']} (오차 {cmp_['error_pct']:+.1f}%)")
+                set_status("done", "검증 케이스 완료")
+            else:
+                set_status("error", "검증 케이스에서 Cd 를 얻지 못했습니다")
+        except Exception as e:
+            set_status("error", str(e)); add_log(f"❌ 검증 케이스 오류: {e}")
+
+    th = threading.Thread(target=_run, daemon=True)
+    if add_script_run_ctx is not None:
+        add_script_run_ctx(th)
+    ss.job_thread = th
+    th.start()
+
+
 def _start_batch_analysis(mode, speeds, angles, csv_path, n_cores, rho, ti, nx=1, ny=1):
     """배치 해석 실행 (백그라운드 스레드)"""
     if ss.job_status == "running":
@@ -1918,6 +2045,18 @@ def why(reason: str, label: str = "왜?") -> None:
     """
     with st.expander(label, expanded=False):
         st.write(reason)
+
+
+def _total_mem_gb() -> Optional[float]:
+    """장비의 총 메모리[GB]. 사전 점검에서 예상 사용량과 비교한다."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return float(line.split()[1]) / 1024.0 / 1024.0
+    except Exception:
+        pass
+    return None
 
 
 def _fmt_len(v_m: float) -> str:
@@ -2991,6 +3130,8 @@ with tab_input:
                     _bg = (_dom[0] / _base_m) * (_dom[1] / _base_m) * (_dom[2] / _base_m)
                 _est = estimate_mesh_size(_bg, _area_m2, _base_m / (2 ** _rl_est))
                 if _est.get("ok"):
+                    ss["_est_cells_max"] = _est["cells_max"]
+                    ss["_est_mem_max_gb"] = _est["mem_max_gb"]
                     st.markdown("### 🧊 예상 격자 규모")
                     _bgs = (f"{_est['background_cells']/1e6:.2f}백만"
                             if _est['background_cells'] >= 1e5
@@ -3134,6 +3275,107 @@ with tab_input:
         _run_label = ("▶️ 해석 시작 (단일)" if _ncase_run == 1
                       else f"🚀 배치 해석 시작 ({_ncase_run}개 · 예상 {fmt_duration(_est_total)})")
 
+        # ── 실행 전 사전 점검 (요구서 §24·§25) ────────────────────────────
+        # 치명적 항목이 하나라도 있으면 실행 버튼을 막는다. 각 항목은
+        # 무엇이/왜/어떻게 세 가지를 함께 보여준다.
+        _pf: List[Dict[str, str]] = []
+        try:
+            _stl_pf = (Path(ss.stl_net_path) if ss.get("stl_net_path")
+                       else (Path(ss.stl_cage_path) if ss.get("stl_cage_path") else None))
+            _pf = preflight_checks(
+                mode, _stl_pf, speed=max(speeds) if speeds else 0.0,
+                rho=float(ss.get("rho", 1025.0)), nu=_nu_si(),
+                aref=(_effective_aref() if ss.get("aref_mode") == "직접 입력" else None),
+                est_cells=ss.get("_est_cells_max"),
+                est_mem_gb=ss.get("_est_mem_max_gb"),
+                mem_limit_gb=_total_mem_gb(),
+                turbulence=(ss.get("tr_turbulence") if str(ss.get("solver_mode", "")).startswith("Transient") else None),
+                solver=("Transient" if str(ss.get("solver_mode", "")).startswith("Transient") else "Steady"))
+        except Exception as _pe:
+            st.caption(f"사전 점검을 수행하지 못했습니다({_pe}).")
+        _pf_crit = [c for c in _pf if c["level"] == "critical"]
+        _pf_warn = [c for c in _pf if c["level"] == "warning"]
+        if _pf_crit or _pf_warn:
+            with st.expander(
+                    ("🚫 실행 전 점검 — 치명적 문제 "
+                     f"{len(_pf_crit)}건, 주의 {len(_pf_warn)}건" if _pf_crit
+                     else f"⚠️ 실행 전 점검 — 주의 {len(_pf_warn)}건"),
+                    expanded=bool(_pf_crit)):
+                for _c in _pf_crit + _pf_warn:
+                    _fn = st.error if _c["level"] == "critical" else st.warning
+                    _fn(f"**{_c['what']}**\n\n· 이유: {_c['why']}\n\n· 조치: {_c['how']}")
+
+        # ── 검증 도구 (요구서 §19·§20) ────────────────────────────────────
+        with st.expander("🔬 검증 도구 — 격자 독립성 · 문헌값 비교", expanded=False):
+            st.markdown("**격자 독립성 시험 (§19)**")
+            st.caption("같은 물리조건에서 정밀화 레벨만 바꿔 연속 실행하고 "
+                       "셀 수·CD·CL 과 변화율을 비교합니다. 레벨 하나당 통상 "
+                       "해석 1회와 같은 시간이 걸립니다.")
+            _mi_lv = st.multiselect(
+                "비교할 정밀화 레벨", [2, 3, 4, 5, 6, 7, 8],
+                default=list(ss.get("mi_levels", [3, 4, 5])), key="_w_mi_levels")
+            ss["mi_levels"] = _mi_lv
+            _mi_disabled = (ss.job_status == "running") or len(_mi_lv) < 2 or bool(_pf_crit)
+            if st.button("격자 독립성 시험 실행", disabled=_mi_disabled,
+                         key="_btn_mi", use_container_width=True):
+                _start_mesh_independence(mode, sorted(_mi_lv), n_cores, rho, ti)
+            if ss.get("mi_rows"):
+                _rows = [{"레벨": r["level"],
+                          "셀 수": f"{r['cells']:,}" if r.get("cells") else "—",
+                          "CD": "—" if r.get("Cd") is None else f"{r['Cd']:.5f}",
+                          "CL": "—" if r.get("Cl") is None else f"{r['Cl']:.5f}",
+                          "CD 변화율": "—" if r.get("dCd_pct") is None else f"{r['dCd_pct']:+.2f}%",
+                          "CL 변화율": "—" if r.get("dCl_pct") is None else f"{r['dCl_pct']:+.2f}%"}
+                         for r in ss["mi_rows"]]
+                st.dataframe(_rows, use_container_width=True, hide_index=True)
+                _last = [r for r in ss["mi_rows"] if r.get("dCd_pct") is not None]
+                if _last:
+                    _d = abs(_last[-1]["dCd_pct"])
+                    if _d < 2.0:
+                        st.success(f"가장 촘촘한 두 격자의 CD 변화가 {_d:.2f}% 로 "
+                                   "격자 독립성이 확보된 것으로 볼 수 있습니다.")
+                    else:
+                        st.warning(f"가장 촘촘한 두 격자의 CD 변화가 {_d:.2f}% 입니다 — "
+                                   "아직 격자에 의존합니다. 레벨을 더 올려 보십시오.")
+                why("격자 독립성은 '격자를 더 촘촘히 해도 값이 바뀌지 않는 상태'를 "
+                    "확인하는 절차입니다. 변화율은 셀 수 오름차순으로 직전 격자 대비 "
+                    "계산합니다. 통상 2% 이내면 독립성이 확보된 것으로 보지만, 절대 "
+                    "기준은 아니며 목적하는 정확도에 따라 달라집니다.",
+                    "왜? (격자 독립성 판정 기준)")
+
+            st.divider()
+            st.markdown("**검증용 Reference case (§20)**")
+            st.caption("문헌값이 있는 기본 형상을 같은 파이프라인으로 돌려 프로그램 "
+                       "자체를 점검합니다. 문헌값은 출처와 함께 저장돼 있습니다.")
+            _rc_key = st.selectbox("검증 형상", list(REFERENCE_CASES.keys()),
+                                   format_func=lambda k: REFERENCE_CASES[k]["label"],
+                                   key="ref_case_key")
+            _rc = REFERENCE_CASES[_rc_key]
+            _lo, _hi = _rc["Re_range"]
+            st.write(f"- 문헌값 **CD = {_rc['Cd_ref']}** · 적용 범위 Re "
+                     f"{_lo:.0e} ~ {_hi:.0e} · 대표 길이 {_rc['length_m']*1000:.0f} mm")
+            st.caption(f"출처: {_rc['source']}")
+            if _rc.get("note"):
+                st.info(_rc["note"])
+            _rc_u = st.number_input("검증 유속 [m/s]", value=float(ss.get("ref_speed", 1.0)),
+                                    min_value=0.01, max_value=10.0, step=0.1,
+                                    key="ref_speed")
+            _rc_re = _rc_u * _rc["length_m"] / _nu_si()
+            st.write(f"- 이 조건의 Reynolds 수 = **{_rc_re:.2e}** "
+                     + ("✅ 문헌값 적용 범위 안" if _lo <= _rc_re <= _hi
+                        else "⚠️ 문헌값 적용 범위 밖 — 비교가 성립하지 않을 수 있습니다"))
+            if st.button("검증 케이스 실행", disabled=(ss.job_status == "running"),
+                         key="_btn_ref", use_container_width=True):
+                _start_reference_case(_rc_key, _rc_u, n_cores, rho, ti)
+            if ss.get("ref_result"):
+                _r = ss["ref_result"]
+                st.dataframe([{"항목": "CFD 결과", "값": f"{_r['Cd_cfd']:.4f}"},
+                              {"항목": "문헌값", "값": f"{_r['Cd_ref']:.4f}"},
+                              {"항목": "상대오차", "값": f"{_r['error_pct']:+.1f}%"},
+                              {"항목": "Reynolds", "값": f"{_r['Re']:.2e}"}],
+                             use_container_width=True, hide_index=True)
+                st.caption(f"출처: {_r['source']}")
+
         btn_col1, btn_col2 = st.columns(2)
 
         # 항목9: 실행 전 이미 완료된 조건과의 중복 검사(덮어쓰기 경고용)
@@ -3142,8 +3384,11 @@ with tab_input:
         _overlap_conds = sorted(_run_conds & _scan_done_conditions(mode))
 
         with btn_col1:
-            if st.button(_run_label, disabled=run_disabled,
-                         use_container_width=True, type="primary"):
+            if st.button(_run_label, disabled=(run_disabled or bool(_pf_crit)),
+                         use_container_width=True, type="primary",
+                         help=("사전 점검에서 치명적 문제가 발견돼 실행이 막혀 "
+                               "있습니다. 위 점검 항목을 해결하십시오."
+                               if _pf_crit else None)):
                 if _overlap_conds:
                     # 완료 조건 중복 → 즉시 실행하지 않고 덮어쓰기 경고 표시
                     ss["_ovw_overlap"] = _overlap_conds
@@ -3363,6 +3608,66 @@ with tab_results:
             pass
 
         # ─── 시각화 탭 ────────────────────────────────────────────────────
+        # 선택한 케이스의 신뢰성 등급 — 어느 하위 탭을 보든 항상 눈에 띄도록
+        # 탭 위에 표시한다.
+        if selected_case_dir is not None:
+            _app_sel = ""
+            try:
+                _ct = (Path(selected_case_dir) / "system" / "controlDict").read_text()
+                _ma = re.search(r"application\s+(\w+);", _ct)
+                _app_sel = _ma.group(1) if _ma else ""
+            except Exception:
+                pass
+            # ── 결과 신뢰성 판정 (요구서 §18) ─────────────────────────
+            # 'Success' 한 마디로 끝내지 않고 무엇이 확인됐고 무엇이 미확인
+            # 인지 등급과 사유로 남긴다.
+            try:
+                _ad_for_grade = None
+                _stl_g = ss.get("stl_net_path") or ss.get("stl_cage_path")
+                if _stl_g and Path(_stl_g).exists():
+                    _cdg = critical_dimension(Path(_stl_g))
+                    _critg = float(_cdg.get("bbox_min") or 0.0)
+                    _spg = _cdg.get("spans") or [1.0]
+                    _rlg = int(ss.get("refine_level_preset", 3))
+                    _baseg = (unit_cell_base_mm(float(ss.get("cell_size_mm", 20.0))/1000.0)
+                              if mode == "unit_cell" else max(_spg) / 8.0)
+                    if mode == "full_structure" and ss.get("net_grid_redesign"):
+                        _Lg = max(_spg) / 1000.0
+                        _baseg = net_grid_base_cell(
+                            _critg, _rlg, float(ss.get("net_grid_target_cells", 75.0)),
+                            domain_m=(7.0*_Lg, 4.0*_Lg, 4.0*_Lg)) * 1000.0
+                    _boxg = (_rlg - 1 if _rlg <= 3 else 2)
+                    if ss.get("wake_box_mode") == "직접 지정":
+                        _boxg = min(_rlg, int(ss.get("wake_box_level", 2)))
+                    _famg = ("LES" if TRANSIENT_TURBULENCE_MODELS.get(
+                                ss.get("tr_turbulence", "kOmegaSST")) == "LES"
+                             and (_app_sel == 'pimpleFoam') else "RAS")
+                    if _critg > 0 and _baseg > 0:
+                        _ad_for_grade = mesh_adequacy(_critg, _baseg, _rlg, _boxg, _famg)
+                _grade = result_reliability(
+                    Path(selected_case_dir), adequacy=_ad_for_grade,
+                    mesh_independence=bool(ss.get("mi_done")),
+                    reference_checked=bool(ss.get("ref_done")))
+                _badge = {"green": st.success, "yellow": st.warning,
+                          "red": st.error}[_grade["grade"]]
+                _badge(f"**Result status: {_grade['label']}**")
+                if _grade["red"] or _grade["yellow"]:
+                    with st.expander("판정 사유", expanded=(_grade["grade"] == "red")):
+                        for _r in _grade["red"]:
+                            st.markdown(f"- 🔴 {_r}")
+                        for _r in _grade["yellow"]:
+                            st.markdown(f"- 🟡 {_r}")
+                st.dataframe(_grade["checks"], use_container_width=True,
+                             hide_index=True)
+                why("등급은 다음을 종합합니다 — 기준면적 기록 여부, 힘 계수 수렴"
+                    "(후반 구간의 표류·진동), 격자 적정성(표면·후류 셀 수), "
+                    "비정상 해석이면 진동 포착 여부, 격자 독립성·문헌 비교 수행 "
+                    "여부. 하나라도 결과를 무의미하게 만드는 항목이 있으면 RED, "
+                    "주의가 필요하면 YELLOW 입니다. 미실시 항목은 '틀렸다'가 "
+                    "아니라 '확인되지 않았다'는 뜻입니다.", "왜? (신뢰성 등급 기준)")
+            except Exception as _ge:
+                st.caption(f"신뢰성 판정을 계산하지 못했습니다({_ge}).")
+
         r_tab1, r_tab2, r_tab3, r_tab5, r_tab4 = st.tabs([
             "🌊 유동장", "📉 수렴 이력", "📊 유속 감쇠",
             "⏱️ 시간이력 (비정상)", "💾 CSV 데이터"

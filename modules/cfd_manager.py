@@ -269,6 +269,255 @@ def replace_in_file(filepath: Path, replacements: Dict[str, str]) -> None:
     filepath.write_text(text, encoding="utf-8")
 
 
+def steady_force_convergence(case_dir: Path,
+                             window: float = 0.2) -> Dict[str, Any]:
+    """정상 해석의 힘 계수가 실제로 수렴했는지 판정한다(요구서 §17).
+
+    잔차만으로 종료를 판단하면 '잔차는 내려갔는데 Cd 는 아직 흐르는' 상태를
+    놓친다. 실측 사례: 전체구조 목표 150 이 잔차 7e-4 로 1000 반복을 마쳤지만
+    Cd 4.09, Cl 2.56(대칭이라 0 이어야 함)으로 미수렴이었다.
+
+    판정: 마지막 window(기본 20%) 구간에서
+      drift  = (후반 절반 평균 − 전반 절반 평균) / |전체 평균|   ← 표류
+      osc    = 표준편차 / |평균|                                  ← 진동
+    반환: verdict(converged/drifting/oscillating/insufficient), drift, osc,
+          hit_iteration_cap(반복 상한에서 끝났는지), Cd/Cl 평균
+    """
+    out: Dict[str, Any] = {"verdict": "insufficient", "drift": None, "osc": None,
+                           "n": 0, "hit_iteration_cap": None,
+                           "mean_Cd": None, "mean_Cl": None}
+    hist = read_force_history(case_dir)
+    t, cd = hist.get("time") or [], hist.get("Cd") or []
+    cl = hist.get("Cl") or []
+    n = min(len(t), len(cd))
+    if n < 20:
+        return out
+    k = max(10, int(n * window))
+    seg_cd = cd[-k:]
+    seg_cl = cl[-k:] if len(cl) >= k else []
+    half = len(seg_cd) // 2
+    m = sum(seg_cd) / len(seg_cd)
+    out["n"] = len(seg_cd)
+    out["mean_Cd"] = m
+    if seg_cl:
+        out["mean_Cl"] = sum(seg_cl) / len(seg_cl)
+    if abs(m) < 1e-12:
+        return out
+    m1 = sum(seg_cd[:half]) / max(1, half)
+    m2 = sum(seg_cd[half:]) / max(1, len(seg_cd) - half)
+    out["drift"] = (m2 - m1) / abs(m)
+    var = sum((v - m) ** 2 for v in seg_cd) / len(seg_cd)
+    out["osc"] = math.sqrt(var) / abs(m)
+
+    # 반복 상한에서 끝났는지 — controlDict endTime 과 마지막 시간 비교
+    try:
+        ctrl = (case_dir / "system" / "controlDict").read_text()
+        mm = re.search(r"^\s*endTime\s+\$?([0-9.eE+-]+)\s*;", ctrl, re.M)
+        if not mm:
+            mm = re.search(r"^endTimeValue\s+([0-9.eE+-]+)\s*;", ctrl, re.M)
+        if mm:
+            out["end_time"] = float(mm.group(1))
+            out["hit_iteration_cap"] = t[-1] >= float(mm.group(1)) - 0.5
+    except Exception:
+        pass
+
+    if abs(out["drift"]) > 0.02:
+        out["verdict"] = "drifting"
+    elif out["osc"] > 0.02:
+        out["verdict"] = "oscillating"
+    else:
+        out["verdict"] = "converged"
+    return out
+
+
+# ── 결과 신뢰성 등급 (요구서 §18) ─────────────────────────────────────────
+RELIABILITY_LABELS = {"green": "GREEN — 주요 검사 통과",
+                      "yellow": "YELLOW — 주의가 필요한 항목 존재",
+                      "red": "RED — 결과 신뢰성에 중대한 문제 가능성"}
+
+
+def result_reliability(case_dir: Path,
+                       adequacy: Optional[Dict[str, Any]] = None,
+                       mesh_independence: Optional[bool] = None,
+                       reference_checked: Optional[bool] = None) -> Dict[str, Any]:
+    """해석 결과를 Green/Yellow/Red 로 등급화하고 사유를 함께 낸다.
+
+    'Success' 한 마디로 끝내지 않고, 무엇이 확인됐고 무엇이 미확인인지 남긴다.
+    판정 재료는 이미 프로그램이 갖고 있는 것들이다 — 힘 계수 수렴, 격자 적정성,
+    비정상성, 기준면적 기록, 격자 독립성·문헌 비교 수행 여부.
+    """
+    checks: List[Dict[str, str]] = []
+    red: List[str] = []
+    yellow: List[str] = []
+
+    ref = read_case_reference(case_dir)
+    if not ref.get("Aref_m2"):
+        red.append("기준면적(Aref)을 확인할 수 없습니다 — CD·CL 값의 의미가 불명확합니다.")
+        checks.append({"항목": "기준면적", "결과": "확인 불가"})
+    else:
+        checks.append({"항목": "기준면적", "결과": f"{ref['Aref_m2']:.6e} m²"})
+
+    is_tr = (case_dir / "transient_meta.json").exists()
+    if is_tr:
+        st = compute_transient_stats(case_dir)
+        if st.get("is_unsteady"):
+            checks.append({"항목": "비정상성", "결과":
+                           f"포착 ({st.get('unsteady_by') or 'Cd 변동'})"})
+        else:
+            yellow.append("비정상 해석인데 진동이 잡히지 않았습니다 — URANS 가 와류를 "
+                          "감쇠시켰거나 후류 격자가 부족할 수 있습니다.")
+            checks.append({"항목": "비정상성", "결과": "미포착"})
+        if st.get("n_samples", 0) < 200:
+            yellow.append("시간평균 표본이 적습니다 — 적분 시간을 늘리십시오.")
+    else:
+        conv = steady_force_convergence(case_dir)
+        v = conv["verdict"]
+        if v == "drifting":
+            red.append(f"힘 계수가 아직 표류 중입니다(후반 구간 변화 "
+                       f"{conv['drift']*100:+.1f}%). 반복을 더 돌려야 합니다.")
+        elif v == "oscillating":
+            yellow.append(f"힘 계수가 진동합니다(변동 {conv['osc']*100:.1f}%). 정상상태 "
+                          "결과로 단정하지 말고 비정상 해석 또는 시간평균 검토가 "
+                          "필요할 수 있습니다.")
+        elif v == "insufficient":
+            yellow.append("힘 계수 이력이 짧아 수렴 여부를 판정하지 못했습니다.")
+        if conv.get("hit_iteration_cap"):
+            yellow.append("수렴 기준이 아니라 반복 상한에서 종료됐습니다.")
+        checks.append({"항목": "힘 계수 수렴", "결과":
+                       {"converged": "수렴", "drifting": "표류", "oscillating": "진동",
+                        "insufficient": "판정 불가"}[v]})
+
+    if adequacy:
+        if not adequacy.get("surface_ok", True):
+            red.append(f"표면 격자가 부족합니다(임계 치수당 "
+                       f"{adequacy.get('surface_cells', 0):.1f}셀, 목표 "
+                       f"{SURF_CELLS_TARGET:.0f}셀). 정밀화 레벨을 올리십시오.")
+        if adequacy.get("needs_wake") and not adequacy.get("wake_ok", True):
+            yellow.append(f"후류 격자가 부족합니다({adequacy.get('wake_cells', 0):.1f}셀, "
+                          f"목표 {WAKE_CELLS_TARGET:.0f}셀) — DES/LES 가 사실상 RANS 로 "
+                          "동작할 수 있습니다.")
+        checks.append({"항목": "격자 적정성",
+                       "결과": "충분" if adequacy.get("ok") else "부족"})
+
+    if mesh_independence is False or mesh_independence is None:
+        yellow.append("격자 독립성 검증이 확인되지 않았습니다.")
+    checks.append({"항목": "격자 독립성",
+                   "결과": "확인됨" if mesh_independence else "미실시/미확인"})
+    if not reference_checked:
+        yellow.append("문헌·실험값과의 비교가 확인되지 않았습니다.")
+    checks.append({"항목": "문헌 비교",
+                   "결과": "수행" if reference_checked else "미실시/미확인"})
+
+    grade = "red" if red else ("yellow" if yellow else "green")
+    return {"grade": grade, "label": RELIABILITY_LABELS[grade],
+            "red": red, "yellow": yellow, "checks": checks,
+            "is_transient": is_tr}
+
+
+# ── 실행 전 사전 점검 (요구서 §24·§25) ────────────────────────────────────
+def preflight_checks(mode: str, stl_path: Optional[Path], speed: float,
+                     rho: float, nu: float, aref: Optional[float] = None,
+                     est_cells: Optional[float] = None,
+                     est_mem_gb: Optional[float] = None,
+                     mem_limit_gb: Optional[float] = None,
+                     turbulence: Optional[str] = None,
+                     solver: str = "Steady") -> List[Dict[str, str]]:
+    """해석 시작 전에 잘못된 설정을 잡아낸다.
+
+    반환 항목마다 무엇이/왜/어떻게 세 가지를 담는다(요구서 §25).
+    level='critical' 이면 실행을 막아야 하고, 'warning' 은 진행 가능하다.
+    """
+    out: List[Dict[str, str]] = []
+
+    def add(level, what, why_, how):
+        out.append({"level": level, "what": what, "why": why_, "how": how})
+
+    if speed is None or speed <= 0:
+        add("critical", "유속이 0 이하입니다.",
+            "유속이 0 이면 유동이 없어 항력·양력이 정의되지 않습니다.",
+            "유속을 0 보다 큰 값으로 입력하십시오.")
+    if rho is None or rho <= 0:
+        add("critical", "밀도가 0 이하입니다.",
+            "밀도는 힘을 무차원화하는 기준이라 0 이하일 수 없습니다.",
+            "물리 조건에서 밀도를 양수로 입력하십시오.")
+    if nu is None or nu <= 0:
+        add("critical", "동점성계수가 0 이하입니다.",
+            "점성이 0 이하이면 Reynolds 수와 경계층이 정의되지 않습니다.",
+            "물리 조건에서 동점성계수를 양수로 입력하십시오.")
+    if aref is not None and aref <= 0:
+        add("critical", "기준면적이 0 이하입니다.",
+            "CD·CL 을 계산하려면 기준면적이 필요합니다.",
+            "자동 계산을 사용하거나 기준면적을 직접 입력하십시오.")
+
+    if stl_path is not None:
+        if not Path(stl_path).exists():
+            add("critical", "STL 파일을 찾을 수 없습니다.",
+                "형상이 없으면 격자를 만들 수 없습니다.",
+                "STL 을 다시 업로드하십시오.")
+        else:
+            f = stl_geometry_features(Path(stl_path))
+            if not f.get("ok"):
+                add("critical", "STL 을 읽지 못했습니다.",
+                    f.get("error", ""), "다른 STL 로 다시 시도하십시오.")
+            else:
+                spans = f["spans"]
+                if max(spans) <= 0:
+                    add("critical", "형상 크기가 0 입니다.",
+                        "바운딩박스가 비어 있어 도메인을 만들 수 없습니다.",
+                        "STL 내보내기 설정을 확인하십시오.")
+                else:
+                    if max(spans) > 1e5 or max(spans) < 0.1:
+                        add("warning", f"형상 크기가 비정상적으로 보입니다"
+                            f"(최대변 {max(spans):.3g} mm).",
+                            "STL 단위가 mm 가 아닐 수 있습니다. 프로그램은 mm 로 "
+                            "가정합니다.",
+                            "STL 단위를 확인하고 필요하면 mm 로 다시 내보내십시오.")
+                    if f["n_open_edges"] > 0:
+                        add("warning", f"STL 표면에 열린 경계가 "
+                            f"{f['n_open_edges']}개 있습니다.",
+                            "닫히지 않은 표면은 내부·외부 구분이 모호해 격자 생성이 "
+                            "실패하거나 기준면적 자동 계산이 절반이 될 수 있습니다.",
+                            "닫힌 형상이어야 한다면 STL 을 수정하고, 얇은 판재라면 "
+                            "기준면적을 직접 입력하십시오.")
+                    if f["n_nonmanifold_edges"] > 0:
+                        add("warning", f"non-manifold 에지가 "
+                            f"{f['n_nonmanifold_edges']}개 있습니다.",
+                            "한 에지를 3개 이상의 면이 공유하면 snappyHexMesh 가 "
+                            "표면을 잘못 인식할 수 있습니다.",
+                            "CAD 에서 형상을 정리한 뒤 다시 내보내십시오.")
+                    if f["n_degenerate"] > 0:
+                        add("warning", f"면적이 0 인 삼각형이 "
+                            f"{f['n_degenerate']}개 있습니다.",
+                            "퇴화 삼각형은 표면 인식과 격자 품질을 해칩니다.",
+                            "STL 을 정리(cleanup)한 뒤 다시 내보내십시오.")
+
+    if est_cells is not None:
+        if est_cells > 3.0e7:
+            add("critical", f"예상 셀 수가 너무 많습니다(약 {est_cells/1e6:.0f}백만).",
+                "이 규모는 현재 장비에서 격자 생성 단계부터 실패하거나 며칠이 "
+                "걸립니다.",
+                "정밀화 레벨을 낮추거나 배경격자 목표 셀 수를 줄이십시오.")
+        elif est_cells > 1.0e7:
+            add("warning", f"예상 셀 수가 많습니다(약 {est_cells/1e6:.0f}백만).",
+                "격자 생성과 해석에 수 시간 이상이 걸릴 수 있습니다.",
+                "먼저 낮은 레벨로 경향을 확인한 뒤 올리는 편이 안전합니다.")
+        elif est_cells < 5000:
+            add("warning", f"예상 셀 수가 매우 적습니다(약 {est_cells:,.0f}개).",
+                "형상을 해상하지 못해 힘 계수가 크게 어긋날 수 있습니다.",
+                "정밀화 레벨을 올리거나 배경격자를 촘촘히 하십시오.")
+    if est_mem_gb and mem_limit_gb and est_mem_gb > mem_limit_gb * 0.9:
+        add("critical", f"예상 메모리({est_mem_gb:.1f} GB)가 가용 메모리"
+            f"({mem_limit_gb:.1f} GB)에 근접합니다.",
+            "격자 생성 중 메모리가 부족하면 프로세스가 강제 종료됩니다.",
+            "정밀화 레벨을 낮추거나 목표 셀 수를 줄이십시오.")
+
+    if solver == "Steady" and turbulence and turbulence != "kOmegaSST":
+        add("critical", f"정상 해석에는 {turbulence} 를 쓸 수 없습니다.",
+            "DES/LES 계열은 시간 전진이 전제입니다.",
+            "Solver 를 Transient 로 바꾸거나 난류모델을 kOmegaSST 로 되돌리십시오.")
+    return out
+
+
 def patch_fluid_properties(case_dir: Path, rho: float, nu: float) -> Dict[str, Any]:
     """사용자가 지정한 유체 물성을 케이스에 반영한다.
 
@@ -2994,6 +3243,190 @@ class ResultExtractor:
 # ═══════════════════════════════════════════════════════════════════════════
 # 배치 해석 관리자 (영각/유속 자동 순환)
 # ═══════════════════════════════════════════════════════════════════════════
+
+def count_mesh_cells(case_dir: Path) -> Optional[int]:
+    """생성된 격자의 셀 수를 읽는다(polyMesh/owner 헤더의 nCells).
+
+    병렬 실행에서는 실제 계산에 쓰인 격자가 processor*/ 에 있다. 케이스 루트의
+    constant/polyMesh 는 재구성 시점·경로에 따라 실제 격자와 다를 수 있으므로
+    processor 격자가 있으면 그 합을 우선한다.
+    """
+    procs = sorted(case_dir.glob("processor*/constant/polyMesh/owner"))
+    if procs:
+        total = 0
+        for p in procs:
+            try:
+                m = re.search(r"nCells:\s*(\d+)", p.read_text(errors="ignore")[:4000])
+                if m:
+                    total += int(m.group(1))
+            except Exception:
+                continue
+        if total > 0:
+            return total
+    try:
+        head = (case_dir / "constant" / "polyMesh" / "owner").read_text(errors="ignore")[:4000]
+        m = re.search(r"nCells:\s*(\d+)", head)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
+def mesh_independence_table(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """격자 독립성 결과에 직전 격자 대비 변화율을 붙인다(요구서 §19)."""
+    out: List[Dict[str, Any]] = []
+    prev_cd = prev_cl = None
+    for r in sorted(rows, key=lambda x: (x.get("cells") or 0)):
+        cd, cl = r.get("Cd"), r.get("Cl")
+        d_cd = (None if (prev_cd in (None, 0) or cd is None)
+                else (cd - prev_cd) / abs(prev_cd) * 100.0)
+        d_cl = (None if (prev_cl in (None, 0) or cl is None)
+                else (cl - prev_cl) / abs(prev_cl) * 100.0)
+        out.append({**r, "dCd_pct": d_cd, "dCl_pct": d_cl})
+        if cd is not None:
+            prev_cd = cd
+        if cl is not None:
+            prev_cl = cl
+    return out
+
+
+def run_mesh_independence(mode: str, stl_paths: Dict[str, Path],
+                          speed: float, angle: float, levels: List[int],
+                          common_params: Dict[str, Any], results_root: Path,
+                          log_cb: Optional[Callable] = None,
+                          progress_cb: Optional[Callable] = None) -> List[Dict[str, Any]]:
+    """같은 물리조건에서 정밀화 레벨만 바꿔 연속 실행한다(요구서 §19).
+
+    기존 BatchAnalysisManager 를 레벨마다 한 번씩 쓰는 방식이라 실행 경로가
+    통상 해석과 완전히 같다. 결과에 셀 수·Cd·Cl 과 직전 대비 변화율을 낸다.
+    """
+    results_root = Path(results_root)
+    results_root.mkdir(parents=True, exist_ok=True)
+    rows: List[Dict[str, Any]] = []
+    for i, lv in enumerate(levels):
+        if log_cb:
+            log_cb(f"▶ 격자 독립성 {i+1}/{len(levels)} — 정밀화 레벨 {lv}")
+        sub = results_root / f"lv{lv}"
+        sub.mkdir(parents=True, exist_ok=True)
+        params = dict(common_params)
+        params["refine_level"] = int(lv)
+        params["auto_refine"] = False      # 레벨을 고정해야 비교가 성립한다
+        mgr = BatchAnalysisManager(
+            mode=mode, stl_paths=stl_paths, speeds=[speed], angles=[angle],
+            output_csv=sub / "force_coeffs.csv", common_params=params,
+            progress_cb=(lambda p, s, e, label="", _i=i:
+                         progress_cb((_i + p / 100.0) / len(levels) * 100.0,
+                                     _i + 1, len(levels), label=f"레벨 {lv} — {label}")
+                         if progress_cb else None),
+            log_cb=log_cb, results_root=sub)
+        try:
+            mgr.run_batch()
+        except Exception as e:
+            if log_cb:
+                log_cb(f"❌ 레벨 {lv} 실패: {e}")
+            rows.append({"level": lv, "cells": None, "Cd": None, "Cl": None,
+                         "error": str(e)})
+            continue
+        # run_batch() 의 반환값은 비어 있다(결과의 정본은 CSV 다). CSV 를 읽는다.
+        cd = cl = None
+        _csv = sub / "force_coeffs.csv"
+        if _csv.exists():
+            try:
+                _rows = list(csv.DictReader(open(_csv)))
+                if _rows:
+                    cd = float(_rows[-1]["Cd"])
+                    cl = float(_rows[-1]["Cl"])
+            except Exception:
+                pass
+        cells = None
+        for c in sorted(sub.glob("해석완료_*")):
+            cells = count_mesh_cells(c) or cells
+        rows.append({"level": lv, "cells": cells, "Cd": cd, "Cl": cl})
+        if log_cb:
+            log_cb(f"  레벨 {lv}: 셀 {cells if cells else '?'} · "
+                   f"Cd={cd if cd is None else round(cd, 5)}")
+    return mesh_independence_table(rows)
+
+
+# ── 검증용 Reference case (요구서 §20) ────────────────────────────────────
+# 문헌값을 프로그램에 담을 때는 출처와 조건을 반드시 함께 남긴다(요구서 §20).
+# 아래 값은 교과서·고전 실험의 표준값이며, 본 프로그램이 재현을 보증하는 값이
+# 아니다. 실제로 구는 정상 RANS 로 재현되지 않는다는 것을 실측으로 확인했다.
+REFERENCE_CASES: Dict[str, Dict[str, Any]] = {
+    "sphere": {
+        "label": "구 (Sphere)",
+        "stl": "Sphere.stl",
+        "length_m": 0.300,
+        "Cd_ref": 0.50,
+        "Re_range": (1.0e4, 3.0e5),   # 항력위기(Re≈3e5) 직전까지 아임계
+        "source": "Achenbach, E. (1972) J. Fluid Mech. 54:565 / "
+                  "Schlichting, Boundary-Layer Theory (8th ed.) — 매끈한 구, "
+                  "아임계 영역 Cd ≈ 0.5 (항력위기 Re≈3e5 이전)",
+        "note": "본 프로그램 실측: simpleFoam Cd=0.228, DDES Cd=0.218 로 문헌값의 "
+                "절반 수준이다. 구는 박리점이 표면 위를 움직여 정상 RANS 로 재현이 "
+                "어려운 형상이며, 이 케이스는 '재현되지 않는다는 사실'을 확인하는 "
+                "용도로 쓴다.",
+    },
+    "cylinder": {
+        "label": "원기둥 (Cylinder, L/D=4)",
+        "stl": None,          # 없으면 생성한다
+        "length_m": 0.050,
+        "Cd_ref": 0.80,
+        "Re_range": (1.0e4, 2.0e5),
+        "source": "Hoerner, S.F. (1965) Fluid-Dynamic Drag, Ch.3 — 유한 길이 "
+                  "원기둥(L/D≈4)의 Cd ≈ 0.8. 무한 길이(2D) 기준값은 "
+                  "Wieselsberger (1921) 의 Cd ≈ 1.2 이며 서로 다른 값이다.",
+        "note": "끝면 효과 때문에 유한 원기둥은 2D 값보다 낮다. 비교할 때 어느 "
+                "기준값을 쓰는지 반드시 맞춰야 한다.",
+    },
+}
+
+
+def write_cylinder_stl(path: Path, diameter_mm: float = 50.0,
+                       length_mm: float = 200.0, n_seg: int = 96) -> Path:
+    """검증용 원기둥 STL 을 생성한다(축 = x). 닫힌 매니폴드."""
+    R, L = diameter_mm / 2.0, length_mm
+    tris = []
+    for i in range(n_seg):
+        a0 = 2 * math.pi * i / n_seg
+        a1 = 2 * math.pi * (i + 1) / n_seg
+        p0 = (0.0, R*math.cos(a0), R*math.sin(a0))
+        p1 = (0.0, R*math.cos(a1), R*math.sin(a1))
+        q0 = (L, R*math.cos(a0), R*math.sin(a0))
+        q1 = (L, R*math.cos(a1), R*math.sin(a1))
+        tris += [(p0, q0, q1), (p0, q1, p1),
+                 ((0.0, 0.0, 0.0), p1, p0), ((L, 0.0, 0.0), q0, q1)]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        f.write("solid cylinder\n")
+        for t in tris:
+            f.write(" facet normal 0 0 0\n  outer loop\n")
+            for v in t:
+                f.write(f"   vertex {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+            f.write("  endloop\n endfacet\n")
+        f.write("endsolid cylinder\n")
+    return path
+
+
+def reference_comparison(name: str, cd_cfd: float, speed: float,
+                         nu: float) -> Dict[str, Any]:
+    """검증 케이스 결과를 문헌값과 비교한다. 출처·조건을 함께 반환한다."""
+    ref = REFERENCE_CASES.get(name)
+    if not ref:
+        return {"ok": False}
+    L = ref["length_m"]
+    re_num = speed * L / nu if nu > 0 else 0.0
+    lo, hi = ref["Re_range"]
+    return {
+        "ok": True, "label": ref["label"], "Cd_ref": ref["Cd_ref"],
+        "Cd_cfd": cd_cfd, "Re": re_num, "Re_in_range": lo <= re_num <= hi,
+        "error_pct": ((cd_cfd - ref["Cd_ref"]) / ref["Cd_ref"] * 100.0
+                      if ref["Cd_ref"] else None),
+        "source": ref["source"], "note": ref["note"],
+        "length_m": L,
+    }
+
 
 class BatchAnalysisManager:
     """
