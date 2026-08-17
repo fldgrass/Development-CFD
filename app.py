@@ -346,6 +346,42 @@ def _restore_job_state_if_detached():
 # ─── 입력(STL 업로드) 상태 영속화 (새로고침 후 업로드·미리보기 복구) ────────
 INPUT_STATE_FILE = RESULTS_DIR / ".input_state.json"
 
+# 새로고침·새 세션에서 복구할 입력 항목.
+# [결함 수정] 종전에는 STL·셀 크기·기준면적 등 일부만 저장해, 새로고침하면
+# 유속·영각 범위와 계산량 프리셋(반복·정밀화·수렴·저장간격), 물리 조건(rho·nu·
+# 난류강도), Solver 설정이 조용히 기본값으로 돌아갔다. 긴 해석 도중 진행 상황을
+# 보려고 새로고침하면 입력이 초기화되는 문제였다.
+# (실측: F5 후 최대유속 2.0→1.0, 유속단계 3→1, 최대영각 45→0, nu 1.05→1.19,
+#  최대반복 5000→2000, 저장간격 200→100 으로 복귀)
+_INPUT_STATE_KEYS = (
+    # 형상·감지 (종전부터 저장하던 항목)
+    "analysis_mode", "stl_net_path", "stl_cage_path",
+    "auto_cell_size_mm", "auto_wire_d_mm", "auto_solidity",
+    "auto_frontal_area", "cell_size_mm", "solidity_input",
+    "unit_nx", "unit_ny", "aref_mode", "aref_manual_m2", "active_project",
+    # 해석 조건
+    "u_min", "u_max", "u_steps", "a_min", "a_max", "a_steps",
+    # 물리 조건
+    "rho", "nu", "ti", "fluid_type", "_fluid_applied",
+    # 계산량 프리셋
+    "calc_preset_name", "end_time_preset", "refine_level_preset",
+    "residual_preset", "write_interval_preset",
+    # 격자 옵션
+    "auto_refine", "crit_dim_mode", "crit_dim_manual_mm",
+    "net_grid_redesign", "net_grid_target_cells",
+    "wake_box_mode", "wake_box_level",
+    # 전체구조 치수
+    "cage_d", "cage_h",
+    # Solver(비정상 포함)
+    "solver_mode", "tr_end_time", "tr_delta_t", "tr_max_co", "tr_max_delta_t",
+    "tr_write_interval", "tr_n_outer", "tr_n_corr", "tr_n_non_orth",
+    "tr_turbulence", "tr_init_steady", "tr_steady_iters", "tr_perturb",
+    "tr_perturb_mag", "tr_avg_start",
+    # 판별·기준 길이
+    "stl_type_user", "re_length_mode", "re_length_manual_mm",
+)
+
+
 def _persist_input_state():
     """업로드한 STL 선택과 자동 감지 정보를 디스크에 기록한다. STL 파일 자체는
     이미 stl_uploads/ 에 저장돼 있으므로, 여기서는 '어떤 파일을 쓰는지'와 감지
@@ -355,15 +391,7 @@ def _persist_input_state():
             or ss.get("active_project")):
         return
     try:
-        state = {k: ss.get(k) for k in (
-            "analysis_mode", "stl_net_path", "stl_cage_path",
-            "auto_cell_size_mm", "auto_wire_d_mm", "auto_solidity",
-            "auto_frontal_area", "cell_size_mm", "solidity_input",
-            "unit_nx", "unit_ny",
-            "aref_mode", "aref_manual_m2",
-            # v13 항목1: 활성 프로젝트도 저장 → 새로고침 후 자동 로드
-            "active_project",
-        )}
+        state = {k: ss.get(k) for k in _INPUT_STATE_KEYS}
         tmp = INPUT_STATE_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(state, ensure_ascii=False, default=str))
         tmp.replace(INPUT_STATE_FILE)
@@ -391,11 +419,7 @@ def _restore_input_state():
         ss.stl_net_path = _net
     if _has_cage:
         ss.stl_cage_path = _cage
-    for k in ("auto_cell_size_mm", "auto_wire_d_mm", "auto_solidity",
-              "auto_frontal_area", "cell_size_mm", "solidity_input",
-              "unit_nx", "unit_ny", "aref_mode", "aref_manual_m2"):
-        if data.get(k) is not None:
-            ss[k] = data[k]
+    # [순서 주의] 활성 프로젝트 로드가 먼저다.
     # v13 항목1: 활성 프로젝트가 있었으면 새로고침 후 자동으로 다시 로드해
     # 조건·결과·매트릭스를 복원한다(프로젝트 폴더가 실제 존재할 때만).
     # _restore_input_state 는 _pending_load_project 처리 지점보다 뒤에서
@@ -406,6 +430,18 @@ def _restore_input_state():
         if (_project_dir(_apmode, _ap) / "project.json").exists():
             _apply_project_load(_apmode, _ap)
             ss["_last_synced_proj_name"] = None
+
+    # 그 다음에 '마지막 화면 값'을 덮어쓴다.
+    # [결함 수정] 종전에는 순서가 반대라, 프로젝트 저장 시점 이후에 사용자가
+    # 바꾼 값(미저장 편집)이 새로고침 때 프로젝트 값으로 되돌아갔다. 실측:
+    # 최대유속 2.0→1.0, 유속단계 3→1, 최대영각 45→0, nu 1.05→1.19,
+    # 최대반복 5000→2000, 저장간격 200→100. 미저장 편집은 그대로 두고,
+    # 저장 여부는 기존 '미저장 변경' 가드가 계속 알려준다.
+    for k in _INPUT_STATE_KEYS:
+        if k in ("stl_net_path", "stl_cage_path", "active_project"):
+            continue
+        if data.get(k) is not None:
+            ss[k] = data[k]
     ss._input_restored = True
 
 # ─── 프로젝트(케이스 묶음) 저장/불러오기/새로 만들기 (항목3·4) ────────────────
