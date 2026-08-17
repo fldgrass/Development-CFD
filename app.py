@@ -589,6 +589,20 @@ def _apply_project_load(_mode, _name):
             ss[k] = _data[k]
     ss.active_project = _name
     ss.res_sel_cond = None          # 결과 선택 초기화(불러온 프로젝트 데이터로)
+    # 불러오기가 실제로 일어났음을 화면에 남긴다. 값이 비슷한 프로젝트끼리
+    # 오가면 화면 변화가 작아 '불러오기가 안 된다'고 오인하기 쉽다.
+    _pd = _project_dir(_mode, _name)
+    _has_csv = any(_pd.glob("*.csv"))
+    _has_case = any(_pd.glob("해석완료_*")) or any(_pd.glob("해석중_*"))
+    ss["_project_loaded_msg"] = {
+        "name": _name,
+        "end_time": _data.get("end_time_preset"),
+        "refine": _data.get("refine_level_preset"),
+        "solver": _data.get("solver_mode"),
+        "u": (_data.get("u_min"), _data.get("u_max"), _data.get("u_steps")),
+        "a": (_data.get("a_min"), _data.get("a_max"), _data.get("a_steps")),
+        "has_results": bool(_has_csv or _has_case),
+    }
     return True
 
 def _apply_project_new():
@@ -1293,6 +1307,19 @@ with st.sidebar:
     # ─── 프로젝트 (항목3·4) ───────────────────────────────────────────────
     st.markdown("### 📁 프로젝트")
     _active_proj = ss.get("active_project")
+    _plm = ss.pop("_project_loaded_msg", None)
+    if _plm:
+        _u = _plm.get("u") or (None, None, None)
+        _a = _plm.get("a") or (None, None, None)
+        st.success(
+            f"✅ 프로젝트 **{_plm['name']}** 을 불러왔습니다\n\n"
+            f"· 유속 {_u[0]} \\~ {_u[1]} m/s ({_u[2]}단계) · "
+            f"영각 {_a[0]} \\~ {_a[1]}° ({_a[2]}단계)\n\n"
+            f"· 최대 반복 {_plm.get('end_time')} · 정밀화 레벨 {_plm.get('refine')} · "
+            f"{_plm.get('solver')}")
+        if not _plm.get("has_results"):
+            st.info("이 프로젝트에는 아직 해석 결과가 없습니다. 결과 분석 탭이 비어 "
+                    "보이는 것은 정상이며, 입력 조건은 위와 같이 반영됐습니다.")
     st.caption(f"현재 프로젝트: **{_active_proj}**" if _active_proj
                else "현재 프로젝트: _(없음 — 임시 작업)_")
     with st.expander("저장 / 불러오기 / 새로 만들기", expanded=True):
