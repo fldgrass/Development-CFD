@@ -349,10 +349,18 @@ def result_reliability(case_dir: Path,
     checks: List[Dict[str, str]] = []
     red: List[str] = []
     yellow: List[str] = []
+    # 판정 사유를 입력 설정에 자동 반영할 수 있도록 기계가 읽는 형태로도 남긴다.
+    # code = 문제 종류, data = 권고값(예: 필요한 정밀화 레벨).
+    issues: List[Dict[str, Any]] = []
+
+    def _issue(level: str, code: str, msg: str, **data):
+        issues.append({"level": level, "code": code, "msg": msg, "data": data})
+        (red if level == "red" else yellow).append(msg)
 
     ref = read_case_reference(case_dir)
     if not ref.get("Aref_m2"):
-        red.append("기준면적(Aref)을 확인할 수 없습니다 — CD·CL 값의 의미가 불명확합니다.")
+        _issue("red", "aref_missing",
+               "기준면적(Aref)을 확인할 수 없습니다 — CD·CL 값의 의미가 불명확합니다.")
         checks.append({"항목": "기준면적", "결과": "확인 불가"})
     else:
         checks.append({"항목": "기준면적", "결과": f"{ref['Aref_m2']:.6e} m²"})
@@ -364,54 +372,68 @@ def result_reliability(case_dir: Path,
             checks.append({"항목": "비정상성", "결과":
                            f"포착 ({st.get('unsteady_by') or 'Cd 변동'})"})
         else:
-            yellow.append("비정상 해석인데 진동이 잡히지 않았습니다 — URANS 가 와류를 "
-                          "감쇠시켰거나 후류 격자가 부족할 수 있습니다.")
+            _issue("yellow", "transient_no_unsteadiness",
+                   "비정상 해석인데 진동이 잡히지 않았습니다 — URANS 가 와류를 "
+                   "감쇠시켰거나 후류 격자가 부족할 수 있습니다.")
             checks.append({"항목": "비정상성", "결과": "미포착"})
         if st.get("n_samples", 0) < 200:
-            yellow.append("시간평균 표본이 적습니다 — 적분 시간을 늘리십시오.")
+            _issue("yellow", "transient_short_sample",
+                   "시간평균 표본이 적습니다 — 적분 시간을 늘리십시오.",
+                   n_samples=st.get("n_samples", 0))
     else:
         conv = steady_force_convergence(case_dir)
         v = conv["verdict"]
         if v == "drifting":
-            red.append(f"힘 계수가 아직 표류 중입니다(후반 구간 변화 "
-                       f"{conv['drift']*100:+.1f}%). 반복을 더 돌려야 합니다.")
+            _issue("red", "force_drift",
+                   f"힘 계수가 아직 표류 중입니다(후반 구간 변화 "
+                   f"{conv['drift']*100:+.1f}%). 반복을 더 돌려야 합니다.",
+                   drift=conv["drift"])
         elif v == "oscillating":
-            yellow.append(f"힘 계수가 진동합니다(변동 {conv['osc']*100:.1f}%). 정상상태 "
-                          "결과로 단정하지 말고 비정상 해석 또는 시간평균 검토가 "
-                          "필요할 수 있습니다.")
+            _issue("yellow", "force_oscillating",
+                   f"힘 계수가 진동합니다(변동 {conv['osc']*100:.1f}%). 정상상태 "
+                   "결과로 단정하지 말고 비정상 해석 또는 시간평균 검토가 "
+                   "필요할 수 있습니다.", osc=conv["osc"])
         elif v == "insufficient":
-            yellow.append("힘 계수 이력이 짧아 수렴 여부를 판정하지 못했습니다.")
+            _issue("yellow", "force_history_short",
+                   "힘 계수 이력이 짧아 수렴 여부를 판정하지 못했습니다.")
         if conv.get("hit_iteration_cap"):
-            yellow.append("수렴 기준이 아니라 반복 상한에서 종료됐습니다.")
+            _issue("yellow", "iteration_cap",
+                   "수렴 기준이 아니라 반복 상한에서 종료됐습니다.",
+                   end_time=conv.get("end_time"))
         checks.append({"항목": "힘 계수 수렴", "결과":
                        {"converged": "수렴", "drifting": "표류", "oscillating": "진동",
                         "insufficient": "판정 불가"}[v]})
 
     if adequacy:
         if not adequacy.get("surface_ok", True):
-            red.append(f"표면 격자가 부족합니다(임계 치수당 "
-                       f"{adequacy.get('surface_cells', 0):.1f}셀, 목표 "
-                       f"{SURF_CELLS_TARGET:.0f}셀). 정밀화 레벨을 올리십시오.")
+            _issue("red", "surface_mesh",
+                   f"표면 격자가 부족합니다(임계 치수당 "
+                   f"{adequacy.get('surface_cells', 0):.1f}셀, 목표 "
+                   f"{SURF_CELLS_TARGET:.0f}셀). 정밀화 레벨을 올리십시오.",
+                   required=adequacy.get("surface_required"))
         if adequacy.get("needs_wake") and not adequacy.get("wake_ok", True):
-            yellow.append(f"후류 격자가 부족합니다({adequacy.get('wake_cells', 0):.1f}셀, "
-                          f"목표 {WAKE_CELLS_TARGET:.0f}셀) — DES/LES 가 사실상 RANS 로 "
-                          "동작할 수 있습니다.")
+            _issue("yellow", "wake_mesh",
+                   f"후류 격자가 부족합니다({adequacy.get('wake_cells', 0):.1f}셀, "
+                   f"목표 {WAKE_CELLS_TARGET:.0f}셀) — DES/LES 가 사실상 RANS 로 "
+                   "동작할 수 있습니다.", required=adequacy.get("wake_required"))
         checks.append({"항목": "격자 적정성",
                        "결과": "충분" if adequacy.get("ok") else "부족"})
 
     if mesh_independence is False or mesh_independence is None:
-        yellow.append("격자 독립성 검증이 확인되지 않았습니다.")
+        _issue("yellow", "mesh_independence_missing",
+               "격자 독립성 검증이 확인되지 않았습니다.")
     checks.append({"항목": "격자 독립성",
                    "결과": "확인됨" if mesh_independence else "미실시/미확인"})
     if not reference_checked:
-        yellow.append("문헌·실험값과의 비교가 확인되지 않았습니다.")
+        _issue("yellow", "reference_missing",
+               "문헌·실험값과의 비교가 확인되지 않았습니다.")
     checks.append({"항목": "문헌 비교",
                    "결과": "수행" if reference_checked else "미실시/미확인"})
 
     grade = "red" if red else ("yellow" if yellow else "green")
     return {"grade": grade, "label": RELIABILITY_LABELS[grade],
             "red": red, "yellow": yellow, "checks": checks,
-            "is_transient": is_tr}
+            "issues": issues, "is_transient": is_tr}
 
 
 # ── 실행 전 사전 점검 (요구서 §24·§25) ────────────────────────────────────

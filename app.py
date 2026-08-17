@@ -240,6 +240,12 @@ if _pending:
     for _k, _v in _pending.items():
         ss[_k] = _v
     ss["_preset_applied_msg"] = _pending.get("_msg", "권장 설정을 적용했습니다.")
+# 자동 반영으로 바뀐 항목의 '이전 값'은 참고치로 화면에 계속 표시한다.
+_pfp = ss.pop("_pending_fix_prev", None)
+if _pfp:
+    ss["_fix_prev"] = _pfp
+    ss["_fix_labels"] = ss.pop("_pending_fix_labels", {})
+    ss["_fix_applied_msg"] = True
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2073,6 +2079,90 @@ def _transient_config() -> Optional[dict]:
     }
 
 
+# ─── 신뢰성 판정 → 입력 설정 자동 반영 (요구서 §18·§25) ────────────────────
+# 판정 사유는 '무엇이 문제인지'만 알려준다. 사용자가 그걸 손으로 옮겨 적지
+# 않도록, 각 사유를 실제 입력값 변경으로 바꿔 한 번에 반영한다.
+# 반영 후에는 이전 값을 참고치로 함께 남겨 무엇이 어떻게 바뀌었는지 보이게 한다.
+def _fixes_from_issues(issues, mode: str):
+    """판정 이슈 목록 → 적용할 입력값 변경 목록.
+
+    반환 항목: {label, key, old, new, why, fmt}
+    자동으로 정할 수 없는 항목(기준면적 확인 등)은 변경 대상에서 제외하고
+    안내만 남긴다(요구서 §27 — 프로그램이 임의값을 정답으로 취급하지 않는다).
+    """
+    fixes, notes = [], []
+
+    def add(label, key, new, why_, fmt=str):
+        old = ss.get(key)
+        if old == new:
+            return
+        fixes.append({"label": label, "key": key, "old": old, "new": new,
+                      "why": why_, "fmt": fmt})
+
+    _rl = int(ss.get("refine_level_preset", 3))
+    for it in issues:
+        code, d = it.get("code"), (it.get("data") or {})
+        if code in ("force_drift", "iteration_cap"):
+            _et = int(ss.get("end_time_preset", 2000))
+            add("최대 반복 횟수", "end_time_preset", min(10000, _et * 2),
+                "힘 계수가 아직 수렴하지 않았거나 반복 상한에서 끝났습니다. "
+                "반복 상한을 2배로 늘립니다(수렴 기준에 먼저 닿으면 더 일찍 끝납니다).",
+                fmt=lambda v: f"{int(v):,}회")
+        elif code == "force_oscillating":
+            add("해석 방식", "solver_mode", "Transient (pimpleFoam)",
+                "정상 해석에서 힘 계수가 진동합니다. 시간 전진으로 풀어 "
+                "시간평균을 내는 편이 적합합니다.")
+        elif code == "surface_mesh" and d.get("required"):
+            add("정밀화 레벨", "refine_level_preset", int(d["required"]),
+                f"표면 격자가 부족해 권고 레벨 {int(d['required'])} 로 올립니다.",
+                fmt=lambda v: f"레벨 {int(v)}")
+        elif code == "wake_mesh" and d.get("required"):
+            if mode == "full_structure":
+                add("후류 박스 레벨 지정", "wake_box_mode", "직접 지정",
+                    "후류 정밀화 레벨을 직접 지정해야 DES/LES 가 LES 로 전환됩니다.")
+                add("후류 박스 레벨", "wake_box_level", int(d["required"]),
+                    f"후류가 임계 치수당 {WAKE_CELLS_TARGET:.0f}셀 이상이 되도록 "
+                    f"레벨 {int(d['required'])} 로 올립니다.",
+                    fmt=lambda v: f"레벨 {int(v)}")
+            else:
+                add("정밀화 레벨", "refine_level_preset",
+                    max(_rl, int(d["required"])),
+                    "단위셀은 후류(거리 영역) 레벨이 정밀화 레벨을 따라가므로 "
+                    "정밀화 레벨을 올려야 후류가 해상됩니다.",
+                    fmt=lambda v: f"레벨 {int(v)}")
+        elif code == "transient_no_unsteadiness":
+            add("난류 모델", "tr_turbulence", "kOmegaSSTDDES",
+                "표준 k-ω SST(URANS)가 와류 방출을 감쇠시켰을 수 있습니다. "
+                "DDES 로 바꿔 재검증합니다.")
+        elif code == "transient_short_sample":
+            _te = float(ss.get("tr_end_time", 30.0))
+            add("비정상 물리시간", "tr_end_time", _te * 2,
+                "시간평균 표본이 적습니다. 적분 시간을 2배로 늘립니다.",
+                fmt=lambda v: f"{v:g} s")
+        elif code == "mesh_independence_missing":
+            _lv = sorted({max(1, _rl - 1), _rl, min(8, _rl + 1)})
+            add("격자 독립성 비교 레벨", "mi_levels", _lv,
+                "격자 독립성이 확인되지 않았습니다. 현재 레벨 주변 3개를 "
+                "비교 대상으로 설정합니다(실행은 검증 도구에서 누르십시오).",
+                fmt=lambda v: "레벨 " + ", ".join(str(x) for x in v))
+        elif code == "aref_missing":
+            notes.append("기준면적을 확인할 수 없습니다 — 자동 계산이 실패한 "
+                         "형상일 수 있습니다. '기준면적 Aref'에서 직접 입력하십시오. "
+                         "(값을 임의로 정하지 않으므로 자동 반영 대상이 아닙니다.)")
+        elif code == "reference_missing":
+            notes.append("문헌 비교가 수행되지 않았습니다 — 검증 도구의 "
+                         "'검증 케이스 실행'으로 확인할 수 있습니다.")
+    return fixes, notes
+
+
+def _prev_hint(key: str) -> None:
+    """자동 반영으로 바뀐 항목 옆에 이전 값을 참고치로 표시한다."""
+    prev = (ss.get("_fix_prev") or {}).get(key)
+    if prev is None:
+        return
+    st.caption(f"↩ 자동 반영됨 · 이전 값 **{prev}** (참고치)")
+
+
 def why(reason: str, label: str = "왜?") -> None:
     """자동 권장값의 근거를 펼쳐 보이는 공통 요소(요구서 §23).
 
@@ -2381,6 +2471,7 @@ with tab_input:
             help="Steady = 정상상태(기존 동작). Transient = 비정상 해석 후 시간평균. "
                  "구·원기둥처럼 후류가 비정상인 형상의 검증용입니다.",
         )
+        _prev_hint("solver_mode")
         _is_tr = ss.solver_mode.startswith("Transient")
 
         if _is_tr:
@@ -2431,6 +2522,8 @@ with tab_input:
                     help="기본 kOmegaSST(URANS)는 구·원기둥의 와류 방출을 억제해 "
                          "정상해와 거의 같은 값을 낼 수 있습니다(보완②). 그럴 때 "
                          "DDES 로 바꿔 재검증하세요.")
+                _prev_hint("tr_turbulence")
+                _prev_hint("tr_end_time")
                 if TRANSIENT_TURBULENCE_MODELS.get(ss.tr_turbulence) == "LES":
                     st.caption("⚠️ DES/LES 는 URANS 보다 격자 요건이 훨씬 엄격합니다 "
                                "(후류 등방 정밀화 필요).")
@@ -2532,6 +2625,23 @@ with tab_input:
 
         # ─── 해석 파라미터 ────────────────────────────────────────────────
         st.markdown("### 🎛️ 해석 파라미터")
+
+        # ─── 신뢰성 판정 자동 반영 결과 요약 ──────────────────────────────
+        if ss.get("_fix_applied_msg") and ss.get("_fix_prev"):
+            _lbl = ss.get("_fix_labels") or {}
+            st.success(
+                "결과 신뢰성 판정을 입력 설정에 반영했습니다. 바뀐 항목 아래에 "
+                "이전 값을 참고치로 표시해 두었습니다.")
+            st.dataframe(
+                [{"항목": _lbl.get(k, k), "이전 값(참고치)": v,
+                  "현재 값": (", ".join(str(x) for x in ss.get(k))
+                            if isinstance(ss.get(k), list) else str(ss.get(k)))}
+                 for k, v in ss["_fix_prev"].items()],
+                use_container_width=True, hide_index=True)
+            if st.button("참고치 표시 지우기", key="_clear_fix_prev"):
+                ss.pop("_fix_prev", None); ss.pop("_fix_labels", None)
+                ss.pop("_fix_applied_msg", None)
+                st.rerun()
 
         # ─── STL 유형 판별 및 권장 설정 (요구서 §3·§4·§13) ────────────────
         # 형상마다 적절한 설정이 다르므로, 먼저 무엇인지 판별한 뒤 권장값을 낸다.
@@ -2674,6 +2784,8 @@ with tab_input:
                              "박스 안 셀이 8배가 됩니다. 표면 레벨을 넘지 않습니다."))
                     st.caption("⚠️ 레벨 1 상승 = 박스 내 셀 8배. 표면 레벨보다 크게 "
                                "잡아도 표면 레벨로 잘립니다.")
+                    _prev_hint("wake_box_level")
+                _prev_hint("wake_box_mode")
 
         # ─── 임계 최소 치수 · 격자 적정성 ────────────────────────────────
         # 격자가 반드시 해상해야 하는 건 형상 전체 크기가 아니라 '가장 가는 부분'
@@ -2843,6 +2955,7 @@ with tab_input:
                          "레벨 3: ~50만 셀(권장), 레벨 4: ~200만 셀(정밀). "
                          "그물실이 가늘면 레벨을 더 올려야 합니다(아래 경고 참조).",
                 )
+                _prev_hint("refine_level_preset")
                 # ── 그물실 해상도 경고 ──────────────────────────────────
                 # 배경격자가 망목 크기에 비례해 정해지므로, 망목이 커지면 실 대비
                 # 격자가 사용자 모르게 거칠어진다. 항상 숫자로 보여주고 부족하면
@@ -2871,6 +2984,7 @@ with tab_input:
                     key="end_time_preset",
                     help="controlDict endTime. 수렴 기준 도달 시 조기 종료됩니다.",
                 )
+                _prev_hint("end_time_preset")
 
             # 대표 조건(목록 첫 값) 속도 벡터 미리보기
             from cfd_manager import compute_velocity_vector
@@ -2965,6 +3079,7 @@ with tab_input:
                 key="end_time_preset",
                 help="controlDict endTime. 수렴 기준 도달 시 조기 종료됩니다.",
             )
+            _prev_hint("end_time_preset")
             _L, _Lb = _re_length_m("full_structure")
             Re = speed_val * _L / _nu_si()
             st.info(f"📐 **Reynolds 수** = {Re:.2e}  |  도메인: {3*cage_d:.0f}D × {3*cage_d:.0f}D × {cage_h:.0f}m")
@@ -3358,6 +3473,7 @@ with tab_input:
                 "비교할 정밀화 레벨", [2, 3, 4, 5, 6, 7, 8],
                 default=list(ss.get("mi_levels", [3, 4, 5])), key="_w_mi_levels")
             ss["mi_levels"] = _mi_lv
+            _prev_hint("mi_levels")
             _mi_disabled = (ss.job_status == "running") or len(_mi_lv) < 2 or bool(_pf_crit)
             if st.button("격자 독립성 시험 실행", disabled=_mi_disabled,
                          key="_btn_mi", use_container_width=True):
@@ -3700,6 +3816,41 @@ with tab_results:
                             st.markdown(f"- 🔴 {_r}")
                         for _r in _grade["yellow"]:
                             st.markdown(f"- 🟡 {_r}")
+
+                        # ── 판정 사유 → 입력 설정 자동 반영 ──────────────────
+                        _fixes, _notes = _fixes_from_issues(
+                            _grade.get("issues", []), mode)
+                        st.divider()
+                        if _fixes:
+                            st.markdown("**입력 설정에 반영할 변경**")
+                            st.dataframe(
+                                [{"항목": f["label"],
+                                  "현재 값": (f["fmt"](f["old"]) if f["old"] is not None else "—"),
+                                  "→ 바꿀 값": f["fmt"](f["new"]),
+                                  "근거": f["why"]} for f in _fixes],
+                                use_container_width=True, hide_index=True)
+                            if st.button("판정 사유를 입력 설정에 반영",
+                                         key="_apply_fixes", type="primary"):
+                                # 위젯 key 는 위젯 생성 뒤 바꿀 수 없으므로 예약해
+                                # 두고 다음 렌더 시작 지점에서 반영한다.
+                                ss["_pending_preset"] = {f["key"]: f["new"] for f in _fixes}
+                                ss["_pending_fix_prev"] = {
+                                    f["key"]: (f["fmt"](f["old"]) if f["old"] is not None else "—")
+                                    for f in _fixes}
+                                ss["_pending_fix_labels"] = {
+                                    f["key"]: f["label"] for f in _fixes}
+                                st.rerun()
+                        else:
+                            st.caption("자동으로 반영할 입력 변경은 없습니다.")
+                        for _n in _notes:
+                            st.info(_n)
+                        why("판정 사유마다 대응하는 입력값이 정해져 있습니다 — 힘 계수 "
+                            "표류·반복 상한 종료 → 최대 반복 2배, 힘 계수 진동 → 비정상 "
+                            "해석 전환, 표면 격자 부족 → 권고 정밀화 레벨, 후류 부족 → "
+                            "후류 박스 레벨(단위셀은 정밀화 레벨), 비정상성 미포착 → "
+                            "DDES, 표본 부족 → 물리시간 2배, 격자 독립성 미확인 → 비교 "
+                            "레벨 3개 설정. 기준면적처럼 프로그램이 임의로 정하면 안 "
+                            "되는 값은 반영하지 않고 안내만 합니다.", "왜? (자동 반영 규칙)")
                 st.dataframe(_grade["checks"], use_container_width=True,
                              hide_index=True)
                 why("등급은 다음을 종합합니다 — 기준면적 기록 여부, 힘 계수 수렴"
