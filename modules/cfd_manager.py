@@ -526,6 +526,289 @@ def critical_dimension(stl_path: Path) -> Dict[str, Any]:
     return out
 
 
+# ── STL 유형 자동 분류 (요구서 §3) ────────────────────────────────────────
+# 형상마다 적절한 해석 설정이 다르므로, 먼저 무엇인지 알아야 권장값을 낼 수 있다.
+# 판별에 쓰는 지표는 모두 STL 삼각형만으로 계산되며, 실측 4종(구·원기둥·카이트·
+# 그물)에서 아래와 같이 뚜렷이 갈린다.
+#
+#            중심반경 CV   축반경 CV(최소)   두께비   채움률   표면적/투영
+#   구           0.000        0.118         1.000    0.785      4.00
+#   원기둥       —            0.000         0.250    1.000      3.53
+#   카이트       0.361        0.387         0.196    0.402      2.35
+#   그물         0.140        0.146         0.075    0.201      3.21
+#
+# 채움률 = (얇은 축 방향 투영면적) / (그 축에 수직인 바운딩박스 단면적)
+#   → 그물은 구멍이 대부분이라 0.2, 판재는 0.4 이상.
+# 표면적/투영 → 판재(양면) ≈ 2, 원통 다발 ≈ π, 구 = 4.
+STL_TYPE_LABELS: Dict[str, str] = {
+    "sphere":    "구 (Sphere)",
+    "cylinder":  "원기둥 (Cylinder)",
+    "kite":      "카이트·판재 (얇은 곡면)",
+    "net_panel": "그물패널 (Net panel)",
+    "complex":   "복잡한 입체물 (Complex 3D solid)",
+    "unknown":   "자동 분류 불가",
+}
+
+
+def stl_geometry_features(stl_path: Path) -> Dict[str, Any]:
+    """STL 한 번만 읽어 분류·검사에 쓰는 기하 지표를 모두 계산한다."""
+    out: Dict[str, Any] = {"ok": False}
+    tris = read_stl_triangles(stl_path)
+    if not tris:
+        out["error"] = "STL 을 읽지 못했습니다"
+        return out
+
+    pts = [v for t in tris for v in t]
+    mn = [min(p[i] for p in pts) for i in range(3)]
+    mx = [max(p[i] for p in pts) for i in range(3)]
+    spans = [mx[i] - mn[i] for i in range(3)]
+
+    area = 0.0
+    vol = 0.0
+    proj = [0.0, 0.0, 0.0]
+    cents: List[Tuple[float, float, float]] = []
+    edges: Dict[Tuple, int] = {}
+    degenerate = 0
+    for p0, p1, p2 in tris:
+        e1 = (p1[0]-p0[0], p1[1]-p0[1], p1[2]-p0[2])
+        e2 = (p2[0]-p0[0], p2[1]-p0[1], p2[2]-p0[2])
+        cx = 0.5*(e1[1]*e2[2] - e1[2]*e2[1])
+        cy = 0.5*(e1[2]*e2[0] - e1[0]*e2[2])
+        cz = 0.5*(e1[0]*e2[1] - e1[1]*e2[0])
+        a = math.sqrt(cx*cx + cy*cy + cz*cz)
+        area += a
+        if a <= 1e-12:
+            degenerate += 1
+        for i, c in enumerate((cx, cy, cz)):
+            proj[i] += abs(c)
+        vol += (p0[0]*(p1[1]*p2[2]-p1[2]*p2[1])
+                - p0[1]*(p1[0]*p2[2]-p1[2]*p2[0])
+                + p0[2]*(p1[0]*p2[1]-p1[1]*p2[0])) / 6.0
+        cents.append(((p0[0]+p1[0]+p2[0])/3.0,
+                      (p0[1]+p1[1]+p2[1])/3.0,
+                      (p0[2]+p1[2]+p2[2])/3.0))
+        vs = [tuple(round(c, 4) for c in v) for v in (p0, p1, p2)]
+        for i in range(3):
+            key = tuple(sorted((vs[i], vs[(i+1) % 3])))
+            edges[key] = edges.get(key, 0) + 1
+
+    proj = [p * 0.5 for p in proj]          # 닫힌 표면 앞/뒷면 중복 제거
+    vol = abs(vol)
+    n_open = sum(1 for n in edges.values() if n == 1)
+    n_nonmanifold = sum(1 for n in edges.values() if n > 2)
+
+    cx0 = sum(c[0] for c in cents) / len(cents)
+    cy0 = sum(c[1] for c in cents) / len(cents)
+    cz0 = sum(c[2] for c in cents) / len(cents)
+
+    def _cv(vals: List[float]) -> float:
+        if not vals:
+            return 9.0
+        m = sum(vals) / len(vals)
+        if m <= 0:
+            return 9.0
+        v = sum((x - m) ** 2 for x in vals) / len(vals)
+        return math.sqrt(v) / m
+
+    r_cv = _cv([math.dist(c, (cx0, cy0, cz0)) for c in cents])
+
+    axis_cv = []
+    ctr = (cx0, cy0, cz0)
+    for ax in range(3):
+        i, j = [k for k in range(3) if k != ax]
+        lo = mn[ax] + 0.1 * spans[ax]
+        hi = mx[ax] - 0.1 * spans[ax]
+        # 원기둥 끝면(캡)은 반경이 작아 분산을 키우므로 중앙 80% 구간만 본다
+        sel = [c for c in cents if lo <= c[ax] <= hi]
+        if len(sel) < 10:
+            sel = cents
+        axis_cv.append(_cv([math.hypot(c[i]-ctr[i], c[j]-ctr[j]) for c in sel]))
+
+    thin = min(range(3), key=lambda i: spans[i])
+    face = [spans[i] for i in range(3) if i != thin]
+    face_area = face[0] * face[1]
+    fill = (proj[thin] / face_area) if face_area > 0 else 0.0
+    max_span = max(spans) or 1.0
+
+    out.update({
+        "ok": True, "n_tri": len(tris), "spans": spans, "bbox_min": mn, "bbox_max": mx,
+        "area_mm2": area, "volume_mm3": vol, "closed": (n_open == 0 and n_nonmanifold == 0),
+        "n_open_edges": n_open, "n_nonmanifold_edges": n_nonmanifold,
+        "n_degenerate": degenerate,
+        "sphericity": ((36*math.pi*vol**2) / area**3) ** (1/3) if area > 0 and vol > 0 else 0.0,
+        "r_cv": r_cv, "axis_cv": axis_cv, "thin_axis": thin,
+        "thin_ratio": spans[thin] / max_span, "fill_ratio": fill,
+        "proj_mm2": proj, "area_per_proj": (area / proj[thin]) if proj[thin] > 0 else 0.0,
+    })
+    return out
+
+
+def classify_stl(stl_path: Path) -> Dict[str, Any]:
+    """STL 유형을 자동 분류한다.
+
+    반환: type, label, confidence(0~1), basis(근거 문장), needs_confirm, features
+    확신이 낮으면(<0.7) type='unknown' 으로 두고 사용자 확인을 요구한다(요구서 §3).
+    임의로 하나를 골라 진행하지 않는다.
+    """
+    f = stl_geometry_features(stl_path)
+    out: Dict[str, Any] = {"type": "unknown", "confidence": 0.0, "basis": "",
+                           "features": f, "needs_confirm": True}
+    if not f.get("ok"):
+        out["basis"] = f.get("error", "STL 을 읽지 못했습니다")
+        out["label"] = STL_TYPE_LABELS["unknown"]
+        return out
+
+    r_cv = f["r_cv"]
+    ax_cv = min(f["axis_cv"])
+    thin_r = f["thin_ratio"]
+    fill = f["fill_ratio"]
+    app = f["area_per_proj"]
+
+    if r_cv < 0.05 and f["sphericity"] > 0.85:
+        out["type"] = "sphere"
+        out["confidence"] = 0.98 if r_cv < 0.02 else 0.85
+        out["basis"] = (f"중심에서 표면까지의 거리가 거의 일정합니다"
+                        f"(변동계수 {r_cv:.3f}, 구형도 {f['sphericity']:.3f}).")
+    elif ax_cv < 0.06:
+        out["type"] = "cylinder"
+        out["confidence"] = 0.95 if ax_cv < 0.02 else 0.80
+        out["basis"] = (f"한 축(#{f['axis_cv'].index(ax_cv)+1}) 주위의 반지름이 거의 "
+                        f"일정합니다(변동계수 {ax_cv:.3f}).")
+    elif thin_r < 0.20 and fill < 0.32:
+        out["type"] = "net_panel"
+        out["confidence"] = 0.90 if fill < 0.25 else 0.70
+        out["basis"] = (f"두께가 매우 얇고(최대변의 {thin_r*100:.1f}%) 투영면의 "
+                        f"{fill*100:.0f}% 만 채워져 있어 구멍이 대부분입니다. "
+                        f"표면적/투영면적 = {app:.2f} 로 원통(π≈3.14) 다발에 가깝습니다.")
+    elif thin_r < 0.30 and app < 2.8:
+        out["type"] = "kite"
+        out["confidence"] = 0.85 if fill > 0.35 else 0.65
+        out["basis"] = (f"두께가 얇고(최대변의 {thin_r*100:.1f}%) 표면적/투영면적 = "
+                        f"{app:.2f} 로 양면 판재(≈2)에 가깝습니다.")
+    else:
+        out["type"] = "complex"
+        out["confidence"] = 0.55
+        out["basis"] = ("구·원기둥·판재·그물 중 어느 특징도 뚜렷하지 않습니다"
+                        f"(중심반경 CV {r_cv:.3f}, 축반경 CV {ax_cv:.3f}, "
+                        f"두께비 {thin_r:.3f}, 채움률 {fill:.3f}).")
+
+    out["needs_confirm"] = out["confidence"] < 0.70
+    if out["needs_confirm"]:
+        out["type_guess"] = out["type"]
+        out["type"] = "unknown"
+    out["label"] = STL_TYPE_LABELS[out["type"]]
+    return out
+
+
+# ── STL 유형별 권장 설정 (요구서 §4·§13) ──────────────────────────────────
+# 값은 '권장'이며 강제하지 않는다(요구서 §27). 근거를 함께 담아 UI 가 '왜?' 로
+# 펼쳐 보일 수 있게 한다.
+STL_TYPE_PRESETS: Dict[str, Dict[str, Any]] = {
+    "sphere": {
+        "analysis_mode": "full_structure", "solver": "Steady",
+        "refine_level": 3, "auto_refine": True, "aref_mode": "자동",
+        "solver_reason":
+            "박리점이 표면 위를 움직이는 형상이라 정상 RANS 가 후류를 과소평가합니다. "
+            "빠른 확인은 Steady 로 하되, 항력을 정량적으로 쓰려면 Transient(DDES)로 "
+            "재검증하십시오.",
+        "warnings": [
+            "본 프로그램 실측: 구(Re=2.5e5)에서 simpleFoam Cd=0.228, DDES Cd=0.218 로 "
+            "실험값 0.5 의 절반 수준입니다. 구는 정상 RANS 검증에 불리한 형상입니다.",
+        ],
+    },
+    "cylinder": {
+        "analysis_mode": "full_structure", "solver": "Transient",
+        "refine_level": 4, "auto_refine": True, "aref_mode": "자동",
+        "solver_reason":
+            "원기둥 후방에서 주기적인 와류 방출이 발생할 가능성이 있으므로 시간에 따른 "
+            "유동 변화를 계산하는 편이 적합합니다. 다만 조건에 따라 다르므로 강제하지 "
+            "않습니다.",
+        "warnings": [
+            "비정상 해석은 후류 격자가 충분해야 의미가 있습니다. 격자 적정성 판정에서 "
+            "후류 셀 수를 확인하십시오.",
+        ],
+    },
+    "kite": {
+        "analysis_mode": "full_structure", "solver": "Steady",
+        "refine_level": 3, "auto_refine": True, "aref_mode": "직접 입력",
+        "solver_reason":
+            "받음각이 작아 유동이 붙어 있으면 Steady 로 충분하고, 큰 받음각에서 대규모 "
+            "박리가 생기면 Transient 가 필요합니다. 받음각 조건에 따라 선택하십시오.",
+        "warnings": [
+            "열린 곡면이면 기준면적 자동 계산(닫힌 표면 가정)이 실제의 절반이 됩니다. "
+            "기준면적을 직접 입력하십시오.",
+            "받음각 40° 이상 구간은 대규모 박리라 정상 해석 결과를 보수적으로 보십시오.",
+        ],
+    },
+    "net_panel": {
+        "analysis_mode": "unit_cell", "solver": "Steady",
+        "refine_level": 6, "auto_refine": True, "aref_mode": "자동",
+        "net_grid_redesign": True, "net_grid_target_cells": 75.0,
+        "solver_reason":
+            "그물은 다수의 가는 실에 힘이 분산돼 개별 후류의 위상이 상쇄되므로 정상 "
+            "해석으로도 항력이 잘 잡힙니다. 실측에서 정상해와 DDES 시간평균의 차이는 "
+            "6% 였습니다.",
+        "warnings": [
+            "그물실 직경이 2~3 mm 인 실제 형상을 직접 해석하면 실 직경을 충분히 "
+            "해상하기 위한 매우 작은 격자가 필요하며, 계산시간과 메모리 사용량이 크게 "
+            "증가할 수 있습니다.",
+            "실측: 실 지름당 40셀 Cd=0.776 → 75셀 0.936 으로 해상도에 크게 좌우됩니다. "
+            "배경격자 재설계를 켜고 목표 셀 수를 확인하십시오.",
+        ],
+    },
+    "complex": {
+        "analysis_mode": "full_structure", "solver": "Steady",
+        "refine_level": 4, "auto_refine": True, "aref_mode": "자동",
+        "solver_reason":
+            "복잡한 후류가 예상되므로 결과의 시간 변화를 확인하십시오. 정상 해석으로 "
+            "먼저 경향을 보고, 힘 계수가 진동하면 Transient 로 재검증하는 순서를 "
+            "권합니다.",
+        "warnings": [
+            "형상이 복잡하면 표면 정밀화 셀이 급증합니다. 예상 셀 수를 확인한 뒤 "
+            "실행하십시오.",
+        ],
+    },
+}
+
+
+# ── 유체 프리셋 (요구서 §7) ───────────────────────────────────────────────
+# 기본값은 종전 템플릿과 같은 해수 값이라, 프리셋을 쓰지 않으면 동작이 바뀌지 않는다.
+FLUID_PRESETS: Dict[str, Dict[str, float]] = {
+    "해수 (20℃)":  {"rho": 1025.0, "nu_e6": 1.19},
+    "담수 (20℃)":  {"rho": 998.2,  "nu_e6": 1.004},
+    "공기 (20℃)":  {"rho": 1.204,  "nu_e6": 15.11},
+}
+
+
+def estimate_mesh_size(background_cells: float, surface_area_m2: float,
+                       finest_cell_m: float) -> Dict[str, Any]:
+    """격자 생성 전에 최종 셀 수와 메모리를 개략 추정한다(요구서 §14).
+
+    정밀화 셀은 표면 주위 껍질에 생기므로 (표면적 / 최소셀²) 에 비례한다.
+    비례계수 C 는 본 프로그램 실측 2건으로 보정했다.
+        목표 75  : 배경 418,996 → 최종 1,958,719 (C = 2.4)
+        목표 150 : 배경 1,695,573 → 최종 6,465,852 (C = 3.0)
+    메모리는 snappyHexMesh 최대 사용량 실측(1,189만 셀에서 19 GB)에서 환산했다.
+
+    반환값은 범위다. 형상·정밀화 설정에 따라 달라지므로 단일값으로 쓰지 않는다.
+    """
+    out: Dict[str, Any] = {"ok": False}
+    if finest_cell_m <= 0 or surface_area_m2 <= 0:
+        return out
+    shell = surface_area_m2 / (finest_cell_m ** 2)
+    lo = background_cells + 2.4 * shell
+    hi = background_cells + 3.0 * shell
+    out.update({
+        "ok": True,
+        "background_cells": background_cells,
+        "cells_min": lo, "cells_max": hi,
+        # 실측 19 GB / 11.89e6 셀 = 1.6 GB/백만셀 (snappy 최대). 범위로 제시.
+        "mem_min_gb": lo / 1e6 * 1.3,
+        "mem_max_gb": hi / 1e6 * 1.9,
+    })
+    return out
+
+
 def mesh_adequacy(critical_mm: float, base_mm: float,
                   surface_level: int, box_level: int,
                   model_family: str = "RAS") -> Dict[str, Any]:

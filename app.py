@@ -19,7 +19,7 @@ import subprocess
 import numpy as np
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 
 import streamlit as st
 from streamlit import session_state as ss
@@ -47,7 +47,9 @@ from cfd_manager import (
     twine_resolution, unit_cell_base_mm, TWINE_CELLS_TARGET,
     validate_unit_cell_stl, critical_dimension, mesh_adequacy,
     mesh_adequacy_table, SURF_CELLS_TARGET, WAKE_CELLS_TARGET,
-    net_grid_base_cell,
+    net_grid_base_cell, classify_stl, STL_TYPE_LABELS, STL_TYPE_PRESETS,
+    FLUID_PRESETS, estimate_mesh_size, unit_cell_base_mm as _uc_base_mm,
+    compute_surface_area,
 )
 from visualizer import CFDVisualizer, AutoRefreshVisualizer, OpenFOAMResultReader
 
@@ -176,6 +178,12 @@ def init_session():
         "net_grid_target_cells": 75.0,
         "wake_box_mode":      "자동",
         "wake_box_level":     2,
+        # ── Phase 2: 유체 프리셋 · STL 유형 · Reynolds 대표 길이 ──
+        "fluid_type":         "해수 (20℃)",
+        "_fluid_applied":     "해수 (20℃)",   # 프리셋 재적용 방지(기본값과 동일)
+        "stl_type_user":      "자동 판별 결과 사용",
+        "re_length_mode":     "자동",
+        "re_length_manual_mm": 0.0,
         # 임계 최소 치수(격자가 반드시 해상해야 할 치수) — 자동/수동
         "crit_dim_mode":      "자동",
         "crit_dim_manual_mm": 0.0,
@@ -211,6 +219,16 @@ def init_session():
             ss[k] = v
 
 init_session()
+
+# ─── 권장 설정(프리셋) 지연 적용 ─────────────────────────────────────────
+# Streamlit 은 위젯이 만들어진 뒤 그 key 의 session_state 를 바꾸는 것을 막는다
+# (StreamlitAPIException). 그래서 프리셋 적용 버튼은 값을 바로 쓰지 않고
+# _pending_preset 에 담아 rerun 하고, 위젯이 만들어지기 전인 여기서 반영한다.
+_pending = ss.pop("_pending_preset", None)
+if _pending:
+    for _k, _v in _pending.items():
+        ss[_k] = _v
+    ss["_preset_applied_msg"] = _pending.get("_msg", "권장 설정을 적용했습니다.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -402,6 +420,8 @@ PROJECT_KEYS = [
     # 격자 자동 보정 / Solver 선택 및 비정상 해석 설정
     "auto_refine", "crit_dim_mode", "crit_dim_manual_mm",
     "net_grid_redesign", "net_grid_target_cells", "wake_box_mode", "wake_box_level",
+    # Phase 2: 유체 프리셋·STL 유형·대표 길이
+    "fluid_type", "stl_type_user", "re_length_mode", "re_length_manual_mm",
     "solver_mode", "tr_end_time", "tr_delta_t", "tr_max_co", "tr_max_delta_t",
     "tr_write_interval", "tr_n_outer", "tr_n_corr", "tr_n_non_orth",
     "tr_turbulence", "tr_init_steady", "tr_steady_iters", "tr_perturb",
@@ -1297,10 +1317,22 @@ with st.sidebar:
 
     # ─── 공통 물리 조건 ───────────────────────────────────────────────────
     st.markdown("### 🌊 물리 조건")
-    rho = st.number_input("해수 밀도 ρ [kg/m³]", value=1025.0,
-                          min_value=1000.0, max_value=1100.0, step=1.0, key="rho")
+    # 유체 프리셋(요구서 §7) — 선택 시 ρ·ν 를 채운다. '사용자 정의'면 손대지 않는다.
+    _fl = st.selectbox("유체 종류", ["해수 (20℃)", "담수 (20℃)", "공기 (20℃)", "사용자 정의"],
+                       key="fluid_type",
+                       help="선택하면 밀도와 동점성계수가 자동으로 채워집니다. "
+                            "값을 직접 바꾸려면 '사용자 정의'를 고르십시오.")
+    if _fl in FLUID_PRESETS and ss.get("_fluid_applied") != _fl:
+        ss["rho"] = float(FLUID_PRESETS[_fl]["rho"])
+        ss["nu"]  = float(FLUID_PRESETS[_fl]["nu_e6"])
+        ss["_fluid_applied"] = _fl
+    elif _fl == "사용자 정의":
+        ss["_fluid_applied"] = _fl
+    # 범위: 담수·공기까지 담기 위해 넓힌다(기본값은 종전과 동일한 해수 값).
+    rho = st.number_input("밀도 ρ [kg/m³]", value=1025.0,
+                          min_value=0.5, max_value=1200.0, step=1.0, key="rho")
     nu  = st.number_input("동점성계수 ν [×10⁻⁶ m²/s]",
-                          value=1.19, min_value=0.5, max_value=2.0, step=0.01, key="nu")
+                          value=1.19, min_value=0.05, max_value=30.0, step=0.01, key="nu")
     ti  = st.slider("난류 강도 I [%]", 1, 20, 5, key="ti")
     st.divider()
 
@@ -1878,6 +1910,47 @@ def _transient_config() -> Optional[dict]:
     }
 
 
+def why(reason: str, label: str = "왜?") -> None:
+    """자동 권장값의 근거를 펼쳐 보이는 공통 요소(요구서 §23).
+
+    권장·경고를 표시하는 곳마다 같은 모양으로 붙여, 초보자가 '어디를 눌러야
+    이유를 볼 수 있는지' 예측 가능하게 한다.
+    """
+    with st.expander(label, expanded=False):
+        st.write(reason)
+
+
+def _fmt_len(v_m: float) -> str:
+    """길이를 사람이 읽기 쉬운 단위로 (1 m 이상은 m, 그 미만은 mm)."""
+    return f"{v_m:.3f} m" if v_m >= 1.0 else f"{v_m*1000:.2f} mm"
+
+
+def _re_length_m(mode: str) -> Tuple[float, str]:
+    """Reynolds 수의 대표 길이[m]와 그 근거 문장(요구서 §8).
+
+    사용자가 대표 길이를 바꿀 수 있어야 하므로 선택 결과를 반영한다.
+    """
+    _mode_sel = ss.get("re_length_mode", "자동")
+    _stl = ss.get("stl_net_path") or ss.get("stl_cage_path")
+    _spans = None
+    if _stl and Path(_stl).exists():
+        try:
+            _spans = critical_dimension(Path(_stl)).get("spans")
+        except Exception:
+            _spans = None
+    if _mode_sel == "직접 입력":
+        v = float(ss.get("re_length_manual_mm", 0.0) or 0.0) / 1000.0
+        if v > 0:
+            return v, "사용자가 직접 입력한 값"
+    if _mode_sel == "바운딩박스 최대변" and _spans:
+        return max(_spans) / 1000.0, "STL 바운딩박스의 최대변"
+    if _mode_sel == "임계 최소 치수" and _spans:
+        return min(s for s in _spans if s > 0) / 1000.0, "STL 바운딩박스의 최소변(그물실 지름·판재 두께)"
+    if mode == "unit_cell":
+        return float(ss.get("cell_size_mm", 20.0)) / 1000.0, "단위 셀 한 변(망목)"
+    return float(ss.get("cage_d", 10.0)), "가두리 직경"
+
+
 def _nu_si() -> float:
     """물리 조건에서 입력한 동점성계수 ν [m²/s]. UI 단위는 ×10⁻⁶ m²/s.
 
@@ -2285,6 +2358,88 @@ with tab_input:
         # ─── 해석 파라미터 ────────────────────────────────────────────────
         st.markdown("### 🎛️ 해석 파라미터")
 
+        # ─── STL 유형 판별 및 권장 설정 (요구서 §3·§4·§13) ────────────────
+        # 형상마다 적절한 설정이 다르므로, 먼저 무엇인지 판별한 뒤 권장값을 낸다.
+        # 자동 분류가 확실하지 않으면 임의로 고르지 않고 사용자에게 확인받는다.
+        _stl_for_type = ss.get("stl_net_path") or ss.get("stl_cage_path")
+        if _stl_for_type and Path(_stl_for_type).exists():
+            with st.expander("🔎 STL 유형 판별 · 권장 설정", expanded=False):
+                if ss.get("_cls_path") != _stl_for_type:
+                    ss["_cls"] = classify_stl(Path(_stl_for_type))
+                    ss["_cls_path"] = _stl_for_type
+                    ss["stl_type_user"] = "자동 판별 결과 사용"
+                _cls = ss.get("_cls") or {}
+                _feat = _cls.get("features", {})
+
+                if _cls.get("needs_confirm"):
+                    st.warning(
+                        f"STL 형상을 자동으로 분류하기 어렵습니다"
+                        f"(가장 가까운 후보: **{STL_TYPE_LABELS.get(_cls.get('type_guess',''), '—')}**, "
+                        f"신뢰도 {_cls.get('confidence',0)*100:.0f}%). 아래에서 직접 선택하십시오.")
+                else:
+                    st.success(f"자동 판별: **{_cls.get('label','—')}** "
+                               f"(신뢰도 {_cls.get('confidence',0)*100:.0f}%)")
+                why(_cls.get("basis", "") + "\n\n측정값 — " + (
+                    f"삼각형 {_feat.get('n_tri',0):,}개 · "
+                    f"바운딩박스 {' × '.join(f'{s:.1f}' for s in _feat.get('spans',[0,0,0]))} mm · "
+                    f"표면적 {_feat.get('area_mm2',0):,.0f} mm² · "
+                    f"닫힌 표면 {'예' if _feat.get('closed') else '아니오'}"))
+
+                _opts = ["자동 판별 결과 사용"] + [STL_TYPE_LABELS[k] for k in
+                                                 ("sphere", "cylinder", "kite",
+                                                  "net_panel", "complex")]
+                ss["stl_type_user"] = st.radio(
+                    "형상 유형", _opts, index=_opts.index(ss.get("stl_type_user", _opts[0]))
+                    if ss.get("stl_type_user") in _opts else 0,
+                    key="_w_stl_type_user",
+                    help="자동 판별이 틀렸다고 판단되면 직접 지정하십시오. "
+                         "선택한 유형에 맞춰 아래 권장 설정이 바뀝니다.")
+
+                _rev = {v: k for k, v in STL_TYPE_LABELS.items()}
+                _eff_type = (_cls.get("type") if ss["stl_type_user"] == _opts[0]
+                             else _rev.get(ss["stl_type_user"], "unknown"))
+                if _eff_type in ("unknown", None):
+                    st.info("유형이 정해지지 않아 권장 설정을 제시하지 않습니다. "
+                            "위에서 형상을 선택하십시오.")
+                else:
+                    _pre = STL_TYPE_PRESETS[_eff_type]
+                    st.markdown(f"**{STL_TYPE_LABELS[_eff_type]} 권장 설정**")
+                    _rows = [
+                        {"항목": "해석 모드", "권장": ("단위 셀" if _pre["analysis_mode"] == "unit_cell"
+                                                  else "전체 구조")},
+                        {"항목": "Solver", "권장": _pre["solver"]},
+                        {"항목": "정밀화 레벨", "권장": str(_pre["refine_level"])},
+                        {"항목": "격자 자동 보정", "권장": "켬" if _pre["auto_refine"] else "끔"},
+                        {"항목": "기준면적", "권장": _pre["aref_mode"]},
+                    ]
+                    if _pre.get("net_grid_redesign"):
+                        _rows.append({"항목": "배경격자 재설계",
+                                      "권장": f"켬 · 목표 {_pre['net_grid_target_cells']:.0f} 셀"})
+                    st.dataframe(_rows, use_container_width=True, hide_index=True)
+                    why(f"Solver 권장 근거 — {_pre['solver_reason']}", "왜? (Solver)")
+                    for _w in _pre.get("warnings", []):
+                        st.warning(_w)
+
+                    if ss.pop("_preset_applied_msg", None):
+                        st.success("권장 설정을 적용했습니다. 값은 언제든 직접 바꿀 수 "
+                                   "있습니다(권장일 뿐 강제가 아닙니다).")
+                    if st.button("권장 설정 적용", key="_apply_preset"):
+                        _pp = {
+                            "analysis_mode":      _pre["analysis_mode"],
+                            "solver_mode":        ("Transient (pimpleFoam)"
+                                                   if _pre["solver"] == "Transient"
+                                                   else "Steady (simpleFoam)"),
+                            "refine_level_preset": int(_pre["refine_level"]),
+                            "auto_refine":        bool(_pre["auto_refine"]),
+                            "aref_mode":          _pre["aref_mode"],
+                        }
+                        if _pre.get("net_grid_redesign"):
+                            _pp["net_grid_redesign"] = True
+                            _pp["net_grid_target_cells"] = float(_pre["net_grid_target_cells"])
+                        # 위젯 생성 전 단계에서 반영해야 하므로 예약만 하고 rerun
+                        ss["_pending_preset"] = _pp
+                        st.rerun()
+
         # 격자 자동 보정 — 두 모드 공통. 배경격자는 형상 전체 크기 기준으로
         # 정해지므로, 그물처럼 큰 영역에 가는 요소가 흩어진 형상은 기본 레벨에서
         # 실 지름당 1~2 셀밖에 안 걸린다(3by3 실측: 레벨3 1.5셀 → Cd 43% 과대).
@@ -2541,11 +2696,20 @@ with tab_input:
             st.info(
                 f"📐 **대표 속도 벡터** (U={speed_val:.2f} m/s, α={angle_val:.1f}°) "
                 f"= ({Ux:.3f}, 0, {Uz:.3f}) m/s  "
-                f"| Reynolds = {speed_val * cell_size / _nu_si():.1f}"
+                f"| Reynolds = {speed_val * _re_length_m('unit_cell')[0] / _nu_si():.1f}"
             )
+            _L, _Lb = _re_length_m("unit_cell")
             st.caption(
-                f"Reynolds = ρUL/μ = U·L/ν · 대표 길이 L = **{cell_size*1000:.1f} mm** "
-                f"(단위 셀 한 변) · ν = **{_nu_si():.3g} m²/s** (물리 조건 입력값)")
+                f"Reynolds = ρUL/μ = U·L/ν · 대표 길이 L = **{_fmt_len(_L)}** "
+                f"({_Lb}) · ν = **{_nu_si():.4g} m²/s** (물리 조건 입력값)")
+            st.radio("대표 길이 기준", ["자동", "바운딩박스 최대변", "임계 최소 치수", "직접 입력"],
+                     key="re_length_mode", horizontal=True,
+                     help="Reynolds 수의 대표 길이를 무엇으로 볼지 정합니다. "
+                          "형상에 따라 관례가 다르므로 프로그램이 하나로 강제하지 않습니다.")
+            if ss.get("re_length_mode") == "직접 입력":
+                ss["re_length_manual_mm"] = st.number_input(
+                    "대표 길이 [mm]", value=float(ss.get("re_length_manual_mm") or cell_size*1000),
+                    min_value=0.001, step=1.0, key="_w_re_len_uc")
 
             # 주기 경계조건 반복 수 (보고용 — 메시/Cd/계산시간에 영향 없음)
             st.markdown("#### 🔁 주기 반복 수 (Nx×Ny) — 보고용")
@@ -2619,11 +2783,20 @@ with tab_input:
                 key="end_time_preset",
                 help="controlDict endTime. 수렴 기준 도달 시 조기 종료됩니다.",
             )
-            Re = speed_val * cage_d / _nu_si()
-            st.info(f"📐 **가두리 Reynolds 수** = {Re:.2e}  |  도메인: {3*cage_d:.0f}D × {3*cage_d:.0f}D × {cage_h:.0f}m")
+            _L, _Lb = _re_length_m("full_structure")
+            Re = speed_val * _L / _nu_si()
+            st.info(f"📐 **Reynolds 수** = {Re:.2e}  |  도메인: {3*cage_d:.0f}D × {3*cage_d:.0f}D × {cage_h:.0f}m")
             st.caption(
-                f"Reynolds = ρUL/μ = U·L/ν · 대표 길이 L = **{cage_d:.2f} m** "
-                f"(가두리 직경) · ν = **{_nu_si():.3g} m²/s** (물리 조건 입력값)")
+                f"Reynolds = ρUL/μ = U·L/ν · 대표 길이 L = **{_fmt_len(_L)}** "
+                f"({_Lb}) · ν = **{_nu_si():.4g} m²/s** (물리 조건 입력값)")
+            st.radio("대표 길이 기준", ["자동", "바운딩박스 최대변", "임계 최소 치수", "직접 입력"],
+                     key="re_length_mode", horizontal=True,
+                     help="Reynolds 수의 대표 길이를 무엇으로 볼지 정합니다. "
+                          "형상에 따라 관례가 다르므로 프로그램이 하나로 강제하지 않습니다.")
+            if ss.get("re_length_mode") == "직접 입력":
+                ss["re_length_manual_mm"] = st.number_input(
+                    "대표 길이 [mm]", value=float(ss.get("re_length_manual_mm") or cage_d*1000),
+                    min_value=0.001, step=1.0, key="_w_re_len_fs")
 
     with col_right:
         # ─── STL 미리보기 (인터랙티브 3D) ────────────────────────────────
@@ -2781,13 +2954,60 @@ with tab_input:
         _est_per = _est_total / _n_cases
         st.markdown("### ⏱️ 예상 소요 시간")
         _ec1, _ec2 = st.columns([1, 1.4])
-        _ec1.metric("총 예상 시간", fmt_duration(_est_total))
+        # 요구서 §14: 정확히 예측할 수 없으면 단일값으로 표시하지 않는다.
+        # 실측 보정을 거쳐도 수렴 반복 수는 사전 확정이 불가능하므로 범위로 낸다.
+        _ec1.metric("총 예상 시간", f"{fmt_duration(_est_total*0.6)}~{fmt_duration(_est_total*1.8)}")
         _ec2.caption(
-            f"케이스 **{_n_cases}개 × 약 {fmt_duration(_est_per)}/케이스** "
-            f"(전처리+솔버 포함) = 총 **{fmt_duration(_est_total)}**. "
+            f"중앙 추정 **{fmt_duration(_est_total)}** "
+            f"(케이스 {_n_cases}개 × 약 {fmt_duration(_est_per)}/케이스, 전처리+솔버 포함). "
             f"반복 {int(end_time)} · 정밀화 {int(_rl_e)} · {n_cores}코어. "
-            f"실측 보정 반영 · 수렴 먼저 도달 시 더 빨리 끝납니다."
+            f"수렴 반복 수는 사전에 확정할 수 없어 **범위로 표시**합니다 — "
+            f"수렴이 먼저 오면 하한보다 짧고, 미수렴이면 상한을 넘을 수 있습니다."
         )
+
+        # ─── 예상 격자 규모·메모리 (요구서 §14) ────────────────────────────
+        _stl_est = ss.get("stl_net_path") or ss.get("stl_cage_path")
+        if _stl_est and Path(_stl_est).exists():
+            try:
+                _cdm = critical_dimension(Path(_stl_est))
+                _spans_m = [s / 1000.0 for s in (_cdm.get("spans") or [0, 0, 0])]
+                _area_m2 = compute_surface_area(Path(_stl_est))
+                _rl_est = int(ss.get("refine_level_preset", 3))
+                if mode == "unit_cell":
+                    _a = float(ss.get("cell_size_mm", 20.0)) / 1000.0
+                    _base_m = _uc_base_mm(_a) / 1000.0
+                    _bg = (_a / _base_m) ** 2 * (2 * _a / _base_m)
+                else:
+                    _L = max(_spans_m) or 1.0
+                    if ss.get("net_grid_redesign"):
+                        _base_m = net_grid_base_cell(
+                            (_cdm.get("bbox_min") or 1.0), _rl_est,
+                            float(ss.get("net_grid_target_cells", 75.0)),
+                            domain_m=(7.0 * _L, 4.0 * _L, 4.0 * _L))
+                        _dom = (7.0 * _L, 4.0 * _L, 4.0 * _L)
+                    else:
+                        _base_m = _L / 8.0
+                        _dom = (10.0 * _L, 6.0 * _L, 6.0 * _L)
+                    _bg = (_dom[0] / _base_m) * (_dom[1] / _base_m) * (_dom[2] / _base_m)
+                _est = estimate_mesh_size(_bg, _area_m2, _base_m / (2 ** _rl_est))
+                if _est.get("ok"):
+                    st.markdown("### 🧊 예상 격자 규모")
+                    _bgs = (f"{_est['background_cells']/1e6:.2f}백만"
+                            if _est['background_cells'] >= 1e5
+                            else f"{_est['background_cells']:,.0f}개")
+                    st.write(f"- 예상 셀 수: 약 **{_est['cells_min']/1e6:.2f} ~ "
+                             f"{_est['cells_max']/1e6:.2f} 백만** (배경 "
+                             f"{_bgs} + 표면 정밀화)")
+                    st.write(f"- 예상 메모리: 약 **{_est['mem_min_gb']:.1f} ~ "
+                             f"{_est['mem_max_gb']:.1f} GB** (격자 생성 시 최대)")
+                    why("표면 정밀화 셀은 표면 주위 껍질에 생기므로 (표면적 ÷ 최소셀²)에 "
+                        "비례합니다. 비례계수는 본 프로그램 실측 2건으로 보정했습니다 — "
+                        "목표 75(배경 41.9만 → 최종 195.9만), 목표 150(배경 169.6만 → "
+                        "최종 646.6만). 메모리는 1,189만 셀에서 19 GB 를 쓴 실측에서 "
+                        "환산했습니다. 형상·정밀화 설정에 따라 달라지므로 범위로 냅니다.",
+                        "왜? (셀 수 추정 근거)")
+            except Exception as _ee:
+                st.caption(f"예상 격자 규모를 계산하지 못했습니다({_ee}).")
         # 입력값(반복·정밀화·코어·nx/ny) 변경 시점 상태 저장
         _persist_input_state()
 
