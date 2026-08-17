@@ -152,7 +152,18 @@ def display_convention(angle_deg: float) -> Dict:
             "relative_angle_deg": rel, "frame": "display"}
 
 
-def solver_to_display_rotation(mode: str, angle_deg: float) -> List[List[float]]:
+# 통일 표시 프레임의 기본 시점·축 비율.
+# [결함 수정] 미리보기(입력 설정)와 유동장(결과 분석)이 서로 다른 카메라
+# (1.62,1.16,1.04) vs (1,1,1) 와 축 비율(data vs cube)을 써서, 같은 형상이 두
+# 화면에서 다른 자세·비율로 보였다. 좌표 변환 자체는 이미 일치한다(실측 차이 0.0).
+# aspectmode 는 'data'(실제 비율)로 통일한다 — 'cube' 는 각 축을 정육면체에
+# 맞춰 늘여 얇은 판재·긴 도메인의 형상을 왜곡한다.
+DISPLAY_CAMERA_EYE: Dict[str, float] = {"x": 1.62, "y": 1.16, "z": 1.04}
+DISPLAY_ASPECTMODE = "data"
+
+
+def solver_to_display_rotation(mode: str, angle_deg: float,
+                               geometry_rotated: bool = True) -> List[List[float]]:
     """모드별 솔버 좌표 → 통일 표시 좌표 회전행렬 R(3×3, 행 우선).
 
     v_display = R · v_solver. 시각화에서 형상·벡터장을 통일 프레임으로 표시하거나
@@ -165,11 +176,19 @@ def solver_to_display_rotation(mode: str, angle_deg: float) -> List[List[float]]
     """
     a = math.radians(angle_deg)
     ca, sa = math.cos(a), math.sin(a)
+    _C = [[0.0, 0.0, 1.0],
+          [-1.0, 0.0, 0.0],
+          [0.0, -1.0, 0.0]]
     if mode == "unit_cell":
-        return [[0.0, 0.0, 1.0],
-                [-1.0, 0.0, 0.0],
-                [0.0, -1.0, 0.0]]
+        return _C
     # full_structure
+    # [결함 수정] 전체구조는 '그물만' 있을 때만 형상을 Y축 α 회전한다
+    # (_write_rotated_netSurface). 가두리 STL 이 함께 있으면 형상은 그대로 두고
+    # 유속을 회전하므로 솔버 프레임이 단위셀과 같아진다. 종전에는 두 경우를
+    # 구분하지 않고 항상 α 의존 행렬을 써서, 가두리 케이스의 유동장이 실제보다
+    # α 만큼 더 돌아간 자세로 그려지고 입력 미리보기와 어긋났다.
+    if not geometry_rotated:
+        return _C
     return [[sa, 0.0, ca],
             [-ca, 0.0, sa],
             [0.0, -1.0, 0.0]]
@@ -377,9 +396,15 @@ def result_reliability(case_dir: Path,
                    "감쇠시켰거나 후류 격자가 부족할 수 있습니다.")
             checks.append({"항목": "비정상성", "결과": "미포착"})
         if st.get("n_samples", 0) < 200:
+            _tr_end = None
+            try:
+                _tr_end = float(json.loads(
+                    (case_dir / "transient_meta.json").read_text()).get("end_time"))
+            except Exception:
+                pass
             _issue("yellow", "transient_short_sample",
                    "시간평균 표본이 적습니다 — 적분 시간을 늘리십시오.",
-                   n_samples=st.get("n_samples", 0))
+                   n_samples=st.get("n_samples", 0), end_time=_tr_end)
     else:
         conv = steady_force_convergence(case_dir)
         v = conv["verdict"]
@@ -387,7 +412,7 @@ def result_reliability(case_dir: Path,
             _issue("red", "force_drift",
                    f"힘 계수가 아직 표류 중입니다(후반 구간 변화 "
                    f"{conv['drift']*100:+.1f}%). 반복을 더 돌려야 합니다.",
-                   drift=conv["drift"])
+                   drift=conv["drift"], end_time=conv.get("end_time"))
         elif v == "oscillating":
             _issue("yellow", "force_oscillating",
                    f"힘 계수가 진동합니다(변동 {conv['osc']*100:.1f}%). 정상상태 "

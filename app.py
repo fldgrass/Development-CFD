@@ -48,6 +48,7 @@ from cfd_manager import (
     validate_unit_cell_stl, critical_dimension, mesh_adequacy,
     mesh_adequacy_table, SURF_CELLS_TARGET, WAKE_CELLS_TARGET,
     net_grid_base_cell, classify_stl, STL_TYPE_LABELS, STL_TYPE_PRESETS,
+    DISPLAY_CAMERA_EYE, DISPLAY_ASPECTMODE,
     FLUID_PRESETS, estimate_mesh_size, unit_cell_base_mm as _uc_base_mm,
     compute_surface_area, unit_cell_base_mm,
     result_reliability, preflight_checks, steady_force_convergence,
@@ -1170,13 +1171,13 @@ def render_stl_interactive_plotly(
         xaxis=_axis(_ax_t[0], "#f4f9fd"),
         yaxis=_axis(_ax_t[1], "#f4f9fd"),
         zaxis=_axis(_ax_t[2], "#e9f1f9"),
-        aspectmode='data',
+        aspectmode=DISPLAY_ASPECTMODE,
         bgcolor='rgba(250,253,255,1)',
     )
     if init_camera:
         # 종전 (1.4,1.0,0.9) 은 플롯 박스가 씬을 가득 채워 축 제목이 잘렸다.
         # 시점을 약간 뒤로 물려 가장자리에 제목이 들어갈 여유를 만든다.
-        _scene['camera'] = dict(eye=dict(x=1.62, y=1.16, z=1.04))
+        _scene['camera'] = dict(eye=dict(**DISPLAY_CAMERA_EYE))
 
     fig.update_layout(
         showlegend=False,
@@ -2103,11 +2104,18 @@ def _fixes_from_issues(issues, mode: str):
     for it in issues:
         code, d = it.get("code"), (it.get("data") or {})
         if code in ("force_drift", "iteration_cap"):
-            _et = int(ss.get("end_time_preset", 2000))
-            add("최대 반복 횟수", "end_time_preset", min(10000, _et * 2),
-                "힘 계수가 아직 수렴하지 않았거나 반복 상한에서 끝났습니다. "
-                "반복 상한을 2배로 늘립니다(수렴 기준에 먼저 닿으면 더 일찍 끝납니다).",
-                fmt=lambda v: f"{int(v):,}회")
+            # [중요] 기준은 '현재 입력값'이 아니라 '그 해석이 실제로 돈 반복 수'다.
+            # 현재값 기준으로 2배 하면 버튼을 누를 때마다 2000→4000→8000 처럼
+            # 계속 늘어난다(사용자 보고). 케이스 기준이면 몇 번을 눌러도 같은 값이라
+            # 한 번 반영된 뒤에는 변경 목록에서 사라진다.
+            _case_et = d.get("end_time") or int(ss.get("end_time_preset", 2000))
+            _target = min(10000, int(_case_et) * 2)
+            if int(ss.get("end_time_preset", 2000)) < _target:
+                add("최대 반복 횟수", "end_time_preset", _target,
+                    f"이 해석은 {int(_case_et):,}회에서 끝났는데 힘 계수가 아직 "
+                    "수렴하지 않았습니다. 그 2배로 올립니다(수렴 기준에 먼저 "
+                    "닿으면 더 일찍 끝납니다).",
+                    fmt=lambda v: f"{int(v):,}회")
         elif code == "force_oscillating":
             add("해석 방식", "solver_mode", "Transient (pimpleFoam)",
                 "정상 해석에서 힘 계수가 진동합니다. 시간 전진으로 풀어 "
@@ -2135,10 +2143,14 @@ def _fixes_from_issues(issues, mode: str):
                 "표준 k-ω SST(URANS)가 와류 방출을 감쇠시켰을 수 있습니다. "
                 "DDES 로 바꿔 재검증합니다.")
         elif code == "transient_short_sample":
-            _te = float(ss.get("tr_end_time", 30.0))
-            add("비정상 물리시간", "tr_end_time", _te * 2,
-                "시간평균 표본이 적습니다. 적분 시간을 2배로 늘립니다.",
-                fmt=lambda v: f"{v:g} s")
+            # 여기도 케이스가 실제로 적분한 물리시간 기준(반복 클릭 방지)
+            _case_te = d.get("end_time") or float(ss.get("tr_end_time", 30.0))
+            _target_te = float(_case_te) * 2
+            if float(ss.get("tr_end_time", 30.0)) < _target_te:
+                add("비정상 물리시간", "tr_end_time", _target_te,
+                    f"이 해석은 {float(_case_te):g}s 를 적분했는데 표본이 "
+                    "부족합니다. 2배로 늘립니다.",
+                    fmt=lambda v: f"{v:g} s")
         elif code == "mesh_independence_missing":
             _lv = sorted({max(1, _rl - 1), _rl, min(8, _rl + 1)})
             add("격자 독립성 비교 레벨", "mi_levels", _lv,

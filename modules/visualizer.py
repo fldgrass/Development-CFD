@@ -19,6 +19,13 @@ import numpy as np
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Any
 
+# 표시 프레임 기본 시점·축 비율은 입력 미리보기와 공유한다(자세 불일치 방지).
+try:
+    from cfd_manager import DISPLAY_CAMERA_EYE, DISPLAY_ASPECTMODE
+except Exception:      # 단독 임포트 등 예외 상황의 안전 기본값
+    DISPLAY_CAMERA_EYE = {"x": 1.62, "y": 1.16, "z": 1.04}
+    DISPLAY_ASPECTMODE = "data"
+
 logger = logging.getLogger("visualizer")
 logger.setLevel(logging.INFO)
 
@@ -240,7 +247,11 @@ class CFDVisualizer:
         ang = self.angle_deg if self.angle_deg is not None else 0.0
         try:
             from cfd_manager import solver_to_display_rotation
-            return solver_to_display_rotation(self.mode, ang)
+            # 가두리 STL 이 함께 있는 전체구조 케이스는 형상을 회전하지 않는다
+            # (유속을 회전) → 표시 변환도 단위셀과 같은 상수 행렬을 써야 한다.
+            _cage = (self.case_dir / "constant" / "triSurface" / "cageSurface.stl")
+            return solver_to_display_rotation(
+                self.mode, ang, geometry_rotated=not _cage.exists())
         except Exception:
             return None
 
@@ -972,12 +983,12 @@ class CFDVisualizer:
                            visible=True, showticklabels=True, tickfont=_axtck,
                            backgroundcolor="rgba(0,0,0,0)",
                            gridcolor="#b9c6d6", showbackground=False),
-                aspectmode='cube',
+                aspectmode=DISPLAY_ASPECTMODE,
                 bgcolor='rgba(255,255,255,1)',
                 uirevision='flowfield',
             )
             if init_camera:
-                scene['camera'] = dict(eye=dict(x=1.0, y=1.0, z=1.0))
+                scene['camera'] = dict(eye=dict(**DISPLAY_CAMERA_EYE))
             _ann_init = (f"Slice {slice_normal.upper()} = {pos:.4f} m  ({pct:.1f}%)"
                          + (f"   |  타일 {tile_nx}×{tile_ny}"
                             if tile_nx * tile_ny > 1 else ""))
@@ -1236,7 +1247,7 @@ class CFDVisualizer:
                        showticklabels=True, tickfont=_axtck,
                        backgroundcolor="rgba(0,0,0,0)",
                        gridcolor="#b9c6d6", showbackground=False),
-            aspectmode='cube', bgcolor='rgba(255,255,255,1)',
+            aspectmode=DISPLAY_ASPECTMODE, bgcolor='rgba(255,255,255,1)',
         )
         # 슬라이스·등치면 모두 동일한 uirevision으로 모드 전환 시 카메라 보존.
         # 등치면 스윕 재생 중 카메라 복원은 JS 핸들러(plotly_buttonclicked)가 담당.
@@ -1249,11 +1260,7 @@ class CFDVisualizer:
             scene.setdefault(
                 'camera',
                 dict(
-                    eye=dict(
-                        x=1.0,
-                        y=1.0,
-                        z=1.0
-                    )
+                    eye=dict(**DISPLAY_CAMERA_EYE)
                 )
             )
         return scene
