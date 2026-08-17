@@ -269,6 +269,81 @@ def replace_in_file(filepath: Path, replacements: Dict[str, str]) -> None:
     filepath.write_text(text, encoding="utf-8")
 
 
+def patch_fluid_properties(case_dir: Path, rho: float, nu: float) -> Dict[str, Any]:
+    """사용자가 지정한 유체 물성을 케이스에 반영한다.
+
+    종전에는 UI 가 밀도 ρ 와 동점성계수 ν 를 입력받고도 케이스에 전달하지 않아,
+    템플릿 값(nu 1.19e-6, rhoInf 1025)이 항상 쓰였다. ν 를 바꿔도 Reynolds 수와
+    Cd 가 달라지지 않는 상태였다.
+
+    - constant/transportProperties : nu      (동점성계수 [m²/s])
+    - system/controlDict           : rhoInf  (forceCoeffs·forces 의 기준 밀도)
+
+    값이 파일의 기존 값과 같으면 파일을 건드리지 않는다(기본값 경로의 산출물이
+    종전과 바이트 단위로 같아야 하기 때문이다).
+    반환: 실제로 바뀐 항목과 값.
+    """
+    out: Dict[str, Any] = {"nu": None, "rhoInf": None, "changed": []}
+
+    def _same(a: float, b: float) -> bool:
+        return abs(a - b) <= max(1e-12, abs(b) * 1e-9)
+
+    tp = case_dir / "constant" / "transportProperties"
+    if tp.exists() and nu and nu > 0:
+        t = tp.read_text(encoding="utf-8")
+        m = re.search(r"^(\s*nu\s+)([0-9.eE+-]+)(\s*;)", t, re.M)
+        if m:
+            out["nu"] = float(m.group(2))
+            if not _same(float(nu), float(m.group(2))):
+                t = t[:m.start()] + f"{m.group(1)}{nu:.6g}{m.group(3)}" + t[m.end():]
+                tp.write_text(t, encoding="utf-8")
+                out["nu"] = float(nu)
+                out["changed"].append("nu")
+
+    ctrl = case_dir / "system" / "controlDict"
+    if ctrl.exists() and rho and rho > 0:
+        t = ctrl.read_text(encoding="utf-8")
+        vals = [float(x) for x in re.findall(r"^\s*rhoInf\s+([0-9.eE+-]+)\s*;", t, re.M)]
+        if vals:
+            out["rhoInf"] = vals[0]
+            if not all(_same(float(rho), v) for v in vals):
+                t = re.sub(r"^(\s*rhoInf\s+)[0-9.eE+-]+(\s*;)",
+                           lambda mm: f"{mm.group(1)}{rho:g}{mm.group(2)}", t, flags=re.M)
+                ctrl.write_text(t, encoding="utf-8")
+                out["rhoInf"] = float(rho)
+                out["changed"].append("rhoInf")
+    return out
+
+
+def read_case_reference(case_dir: Path) -> Dict[str, Optional[float]]:
+    """케이스가 실제로 사용한 기준값을 controlDict 에서 읽는다.
+
+    결과 파일에는 '계산에 실제로 쓰인' Aref·lRef·rhoInf·magUInf 가 남아야 한다.
+    UI 설정이 아니라 케이스 파일을 읽는 이유는, 자동 계산·사용자 입력·재실행이
+    섞여도 산출물과 항상 일치시키기 위해서다.
+    """
+    out: Dict[str, Optional[float]] = {"Aref_m2": None, "lRef_m": None,
+                                       "rhoInf": None, "magUInf": None}
+    ctrl = case_dir / "system" / "controlDict"
+    if not ctrl.exists():
+        return out
+    try:
+        t = ctrl.read_text(encoding="utf-8")
+    except Exception:
+        return out
+    for key, pat in (("Aref_m2", r"^\s*Aref\s+([0-9.eE+-]+)\s*;"),
+                     ("lRef_m", r"^\s*lRef\s+([0-9.eE+-]+)\s*;"),
+                     ("rhoInf", r"^\s*rhoInf\s+([0-9.eE+-]+)\s*;"),
+                     ("magUInf", r"^\s*magUInf\s+([0-9.eE+-]+)\s*;")):
+        m = re.search(pat, t, re.M)
+        if m:
+            try:
+                out[key] = float(m.group(1))
+            except ValueError:
+                pass
+    return out
+
+
 def read_stl_triangles(stl_path: Path) -> List[Tuple[Tuple[float, float, float], ...]]:
     """STL(ASCII/binary)을 읽어 삼각형 꼭짓점 목록을 반환.
 
@@ -991,10 +1066,16 @@ class UnitCellCaseBuilder:
                  refine_level: int = 3,
                  solidity: float = None,
                  aref_override: Optional[float] = None,
-                 strict_mesh_quality: bool = False):
+                 strict_mesh_quality: bool = False,
+                 rho: float = 1025.0,
+                 nu: float = 1.19e-6):
         # 슬리버 셀 억제(비정상 해석의 시간간격 붕괴 방지). 기본 False 라
         # 기존 호출부는 종전과 동일한 격자를 만든다.
         self.strict_mesh_quality = bool(strict_mesh_quality)
+        # 유체 물성. 기본값은 템플릿과 같으므로 지정하지 않으면 산출물이 종전과
+        # 동일하다(patch_fluid_properties 가 같은 값이면 파일을 건드리지 않는다).
+        self.rho              = float(rho)
+        self.nu               = float(nu)
         self.case_dir         = case_dir
         self.stl_path         = stl_path
         # 사용자가 UI 에서 직접 지정한 기준면적[m²]. None/0 이하면 자동 계산 사용.
@@ -1052,6 +1133,10 @@ class UnitCellCaseBuilder:
         self._patch_controlDict()
         self._patch_snappyLevel()
         self._patch_decomposePar()
+        _fp = patch_fluid_properties(self.case_dir, self.rho, self.nu)
+        if _fp["changed"]:
+            logger.info(f"[UnitCell] 유체 물성 반영: nu={_fp['nu']:.4g} m²/s, "
+                        f"rhoInf={_fp['rhoInf']:g} kg/m³ ({', '.join(_fp['changed'])})")
 
         logger.info(f"[UnitCell] 케이스 생성 완료: {self.case_dir}")
         return self.case_dir
@@ -1262,7 +1347,9 @@ class FullStructureCaseBuilder:
                  net_grid_redesign: bool = False,
                  net_grid_target_cells: float = 75.0,
                  net_grid_max_base_cells: int = 3_000_000,
-                 wake_box_level: Optional[int] = None):
+                 wake_box_level: Optional[int] = None,
+                 rho: float = 1025.0,
+                 nu: float = 1.19e-6):
         # 격자 옵션(보완④: DDES 등에서 격자 민감도를 확인하기 위한 노브).
         # 기본값 refine_level=3 / n_layers=0 은 종전 하드코딩 값과 완전히 동일한
         # snappyHexMeshDict 를 만든다(회귀 방지).
@@ -1280,6 +1367,9 @@ class FullStructureCaseBuilder:
         # 권고 레벨을 내놓아도 종전에는 그것을 적용할 수단이 없었다.
         self.wake_box_level   = (None if wake_box_level is None
                                  else max(0, min(8, int(wake_box_level))))
+        # 유체 물성(기본값 = 템플릿 값이므로 미지정 시 산출물 동일)
+        self.rho              = float(rho)
+        self.nu               = float(nu)
         self.case_dir         = case_dir
         # 사용자가 UI 에서 직접 지정한 기준면적[m²]. None/0 이하면 자동 계산 사용.
         self.aref_override    = (float(aref_override)
@@ -1331,6 +1421,10 @@ class FullStructureCaseBuilder:
         self._patch_snappyHexMesh()
         self._patch_controlDict()
         self._patch_decomposePar()
+        _fp = patch_fluid_properties(self.case_dir, self.rho, self.nu)
+        if _fp["changed"]:
+            logger.info(f"[FullStructure] 유체 물성 반영: nu={_fp['nu']:.4g} m²/s, "
+                        f"rhoInf={_fp['rhoInf']:g} kg/m³ ({', '.join(_fp['changed'])})")
 
         logger.info(f"[FullStructure] 케이스 생성 완료: {self.case_dir}")
         return self.case_dir
@@ -2389,7 +2483,11 @@ class ResultExtractor:
         "speed_m_s", "angle_deg",
         "Cd", "Cl", "Cm",
         "Fx_N", "Fy_N", "Fz_N",
-        "rho_kg_m3", "case_name", "timestamp"
+        "rho_kg_m3", "case_name", "timestamp",
+        # 요구서 §10·§21: CD/CL 계산에 '실제로 쓰인' 기준값을 결과에 남긴다.
+        # 하위 C++ 모델이 열 이름으로 파싱하므로 기존 열 순서는 건드리지 않고
+        # 뒤에 덧붙인다.
+        "Aref_m2", "lRef_m", "nu_m2_s",
     ]
 
     def __init__(self, case_dir: Path, speed: float, angle_deg: float,
@@ -2565,6 +2663,20 @@ class ResultExtractor:
             "timestamp":  datetime.now().isoformat(),
         }
 
+        # 케이스가 실제로 사용한 기준값(자동 계산·직접 입력·재실행 무관하게 일치)
+        _ref = read_case_reference(self.case_dir)
+        row["Aref_m2"] = _ref.get("Aref_m2")
+        row["lRef_m"]  = _ref.get("lRef_m")
+        try:
+            _tp = (self.case_dir / "constant" / "transportProperties").read_text()
+            _m = re.search(r"^\s*nu\s+([0-9.eE+-]+)\s*;", _tp, re.M)
+            row["nu_m2_s"] = float(_m.group(1)) if _m else None
+        except Exception:
+            row["nu_m2_s"] = None
+        # rhoInf 는 케이스 값이 우선(요구서 §21 — 계산에 쓰인 값을 남긴다)
+        if _ref.get("rhoInf"):
+            row["rho_kg_m3"] = _ref["rhoInf"]
+
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         # 항목9(덮어쓰기): 같은 (유속, 영각) 조건의 기존 행은 제거하고 새 행으로 교체한다.
@@ -2672,7 +2784,7 @@ class BatchAnalysisManager:
                            if k in ["cell_size", "n_cores", "nx", "ny",
                                     "residual_control", "end_time",
                                     "write_interval", "refine_level", "solidity",
-                                    "aref_override"]}
+                                    "aref_override", "rho", "nu"]}
                     )
                 else:
                     builder = FullStructureCaseBuilder(
@@ -2689,7 +2801,8 @@ class BatchAnalysisManager:
                                     "end_time", "residual_control", "write_interval",
                                     "aref_override", "refine_level", "n_layers",
                                     "auto_refine", "net_grid_redesign",
-                                    "net_grid_target_cells", "wake_box_level"]}
+                                    "net_grid_target_cells", "wake_box_level",
+                                    "rho", "nu"]}
                     )
 
                 builder.build()
@@ -2750,7 +2863,10 @@ class BatchAnalysisManager:
                         self._log(f"⚠️ 완료 rename 실패({_re}) — '해석중_' 유지")
                     # transient 면 UI 에서 지정한 TavgStart 를 넘겨 시간평균으로 기록.
                     _avg0 = (self.params.get("transient") or {}).get("avg_start")
-                    _ex = ResultExtractor(final_dir, speed, angle)
+                    # 사용자가 지정한 밀도를 결과에도 반영한다(종전에는 배치
+                    # 경로가 rho 를 넘기지 않아 CSV 에 기본값 1025 가 박혔다).
+                    _ex = ResultExtractor(final_dir, speed, angle,
+                                          rho=float(self.params.get("rho", 1025.0)))
                     _ex.save_csv(self.output_csv, t_avg_start=_avg0)
                     self.n_success += 1
                     if _ex.is_transient_case():

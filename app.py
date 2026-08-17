@@ -1553,6 +1553,8 @@ def _start_single_analysis(
                     refine_level=refine_level,
                     solidity=solidity,
                     aref_override=_aref_ovr,
+                    rho=float(ss.get("rho", 1025.0)),
+                    nu=float(ss.get("nu", 1.19)) * 1e-6,
                 )
             else:
                 builder = FullStructureCaseBuilder(
@@ -1567,6 +1569,8 @@ def _start_single_analysis(
                     end_time=end_time,
                     write_interval=write_interval,
                     aref_override=_aref_ovr,
+                    rho=float(ss.get("rho", 1025.0)),
+                    nu=float(ss.get("nu", 1.19)) * 1e-6,
                 )
             builder.build()
             add_log("✅ 케이스 빌드 완료")
@@ -1675,6 +1679,10 @@ def _start_batch_analysis(mode, speeds, angles, csv_path, n_cores, rho, ti, nx=1
         "write_interval":   int(ss.get("write_interval_preset", 100)),
         # 사용자 지정 기준면적(0 이면 빌더가 자동 계산)
         "aref_override":    _effective_aref(),
+        # 유체 물성 — 종전에는 UI 입력이 케이스에 전혀 전달되지 않아
+        # 템플릿 값(nu 1.19e-6, rhoInf 1025)이 항상 쓰였다.
+        "rho":              float(ss.get("rho", 1025.0)),
+        "nu":               float(ss.get("nu", 1.19)) * 1e-6,
     }
     # 가두리 치수: 전달하지 않으면 FullStructureCaseBuilder 기본값(10 m × 5 m)이
     # 쓰여 UI 입력이 무시된다 → 도메인 크기·lRef·Aref(D×H)가 모두 어긋난다.
@@ -1868,6 +1876,18 @@ def _transient_config() -> Optional[dict]:
         "perturb_magnitude": float(ss.get("tr_perturb_mag", 0.01)),
         "avg_start":        float(ss.get("tr_avg_start", 0.0)) or None,
     }
+
+
+def _nu_si() -> float:
+    """물리 조건에서 입력한 동점성계수 ν [m²/s]. UI 단위는 ×10⁻⁶ m²/s.
+
+    종전에는 Reynolds 수 표시가 1.19e-6 을 하드코딩해 사용자 입력을 무시했다.
+    """
+    try:
+        v = float(ss.get("nu", 1.19)) * 1e-6
+    except (TypeError, ValueError):
+        return 1.19e-6
+    return v if v > 0 else 1.19e-6
 
 
 def _effective_aref() -> float:
@@ -2521,8 +2541,11 @@ with tab_input:
             st.info(
                 f"📐 **대표 속도 벡터** (U={speed_val:.2f} m/s, α={angle_val:.1f}°) "
                 f"= ({Ux:.3f}, 0, {Uz:.3f}) m/s  "
-                f"| Reynolds = {speed_val * cell_size / 1.19e-6:.1f}"
+                f"| Reynolds = {speed_val * cell_size / _nu_si():.1f}"
             )
+            st.caption(
+                f"Reynolds = ρUL/μ = U·L/ν · 대표 길이 L = **{cell_size*1000:.1f} mm** "
+                f"(단위 셀 한 변) · ν = **{_nu_si():.3g} m²/s** (물리 조건 입력값)")
 
             # 주기 경계조건 반복 수 (보고용 — 메시/Cd/계산시간에 영향 없음)
             st.markdown("#### 🔁 주기 반복 수 (Nx×Ny) — 보고용")
@@ -2596,8 +2619,11 @@ with tab_input:
                 key="end_time_preset",
                 help="controlDict endTime. 수렴 기준 도달 시 조기 종료됩니다.",
             )
-            Re = speed_val * cage_d / 1.19e-6
+            Re = speed_val * cage_d / _nu_si()
             st.info(f"📐 **가두리 Reynolds 수** = {Re:.2e}  |  도메인: {3*cage_d:.0f}D × {3*cage_d:.0f}D × {cage_h:.0f}m")
+            st.caption(
+                f"Reynolds = ρUL/μ = U·L/ν · 대표 길이 L = **{cage_d:.2f} m** "
+                f"(가두리 직경) · ν = **{_nu_si():.3g} m²/s** (물리 조건 입력값)")
 
     with col_right:
         # ─── STL 미리보기 (인터랙티브 3D) ────────────────────────────────
