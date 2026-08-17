@@ -1076,6 +1076,18 @@ FLUID_PRESETS: Dict[str, Dict[str, float]] = {
 }
 
 
+def domain_blockage(frontal_area_m2: float, side_mult: float, L_m: float) -> Optional[float]:
+    """도메인 막힘률 = 형상 정면적 / 도메인 단면적.
+
+    측방 ±side_mult·L 도메인의 단면적은 (2·side_mult·L)² 이다.
+    통상 5% 미만이면 보정 없이 쓰고, 5~10% 는 주의, 10% 이상이면 Cd 가 뚜렷이
+    과대평가된다(벽면이 유동을 형상 쪽으로 밀기 때문).
+    """
+    if L_m <= 0 or side_mult <= 0 or frontal_area_m2 <= 0:
+        return None
+    return frontal_area_m2 / ((2.0 * side_mult * L_m) ** 2)
+
+
 def estimate_mesh_size(background_cells: float, surface_area_m2: float,
                        finest_cell_m: float) -> Dict[str, Any]:
     """격자 생성 전에 최종 셀 수와 메모리를 개략 추정한다(요구서 §14).
@@ -1943,7 +1955,10 @@ class FullStructureCaseBuilder:
                  net_grid_max_base_cells: int = 3_000_000,
                  wake_box_level: Optional[int] = None,
                  rho: float = 1025.0,
-                 nu: float = 1.19e-6):
+                 nu: float = 1.19e-6,
+                 domain_up: Optional[float] = None,
+                 domain_down: Optional[float] = None,
+                 domain_side: Optional[float] = None):
         # 격자 옵션(보완④: DDES 등에서 격자 민감도를 확인하기 위한 노브).
         # 기본값 refine_level=3 / n_layers=0 은 종전 하드코딩 값과 완전히 동일한
         # snappyHexMeshDict 를 만든다(회귀 방지).
@@ -1964,6 +1979,13 @@ class FullStructureCaseBuilder:
         # 유체 물성(기본값 = 템플릿 값이므로 미지정 시 산출물 동일)
         self.rho              = float(rho)
         self.nu               = float(nu)
+        # 도메인 크기(형상 대표길이 L 의 배수). None 이면 종전 자동값을 쓴다.
+        # 계산시간은 대체로 셀 수에 비례하고 배경 셀은 도메인 부피에 비례하므로
+        # 도메인을 줄이면 시간이 준다. 다만 막힘(blockage)이 커지면 Cd 가 왜곡되므로
+        # 무작정 줄이면 안 된다 — UI 가 막힘률을 함께 보여준다.
+        self.domain_up        = (None if domain_up is None else max(0.3, float(domain_up)))
+        self.domain_down      = (None if domain_down is None else max(0.5, float(domain_down)))
+        self.domain_side      = (None if domain_side is None else max(0.3, float(domain_side)))
         self.case_dir         = case_dir
         # 사용자가 UI 에서 직접 지정한 기준면적[m²]. None/0 이하면 자동 계산 사용.
         self.aref_override    = (float(aref_override)
@@ -2098,6 +2120,15 @@ class FullStructureCaseBuilder:
             _u, _d, _s = 2.0, 5.0, 2.0
         else:
             _u, _d, _s = 3.0, 7.0, 3.0
+        # 사용자가 지정하면 그 값을 쓴다(미지정 항목은 위 자동값 유지).
+        if getattr(self, "domain_up", None) is not None:
+            _u = float(self.domain_up)
+        if getattr(self, "domain_down", None) is not None:
+            _d = float(self.domain_down)
+        if getattr(self, "domain_side", None) is not None:
+            _s = float(self.domain_side)
+        logger.info(f"[FullStructure] 도메인: 상류 {_u:g}L · 하류 {_d:g}L · 측방 ±{_s:g}L "
+                    f"(L={L*1000:.1f}mm)")
         self._dom_min = (cx-_u*L, cy-_s*L, cz-_s*L)
         self._dom_max = (cx+_d*L, cy+_s*L, cz+_s*L)
         # 정밀화 박스: net + 근접 후류
@@ -3580,7 +3611,8 @@ class BatchAnalysisManager:
                                     "aref_override", "refine_level", "n_layers",
                                     "auto_refine", "net_grid_redesign",
                                     "net_grid_target_cells", "wake_box_level",
-                                    "rho", "nu"]}
+                                    "rho", "nu",
+                                    "domain_up", "domain_down", "domain_side"]}
                     )
 
                 builder.build()

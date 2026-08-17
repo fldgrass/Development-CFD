@@ -59,6 +59,7 @@ try:
         result_reliability, preflight_checks, steady_force_convergence,
         run_mesh_independence, mesh_independence_table, REFERENCE_CASES,
         write_cylinder_stl, reference_comparison, count_mesh_cells,
+        domain_blockage,
     )
 except ImportError as _imp_err:
     st.error(
@@ -192,6 +193,12 @@ def init_session():
         # ── Solver 선택 (기본값은 반드시 Steady = 기존 동작 100% 유지) ──
         # 형상의 가장 가는 치수 기준으로 정밀화 레벨을 자동 상향(STL 종류 무관)
         "auto_refine":        True,
+        "refine_mode":        "자동",     # 표면 정밀화 레벨 결정 방식(자동/수동)
+        # 도메인 크기(형상 대표길이 L 배수) — "자동"이면 프로그램 기본값 사용
+        "domain_mode":        "자동",
+        "domain_up":          2.0,
+        "domain_down":        5.0,
+        "domain_side":        2.0,
         # ── 전체구조 격자 설계(그물처럼 가는 요소가 흩어진 형상용) ──
         # 기본값은 종전 동작과 완전히 동일하다(재설계 꺼짐 · 후류 자동).
         "net_grid_redesign":  False,
@@ -390,9 +397,10 @@ _INPUT_STATE_KEYS = (
     "calc_preset_name", "end_time_preset", "refine_level_preset",
     "residual_preset", "write_interval_preset",
     # 격자 옵션
-    "auto_refine", "crit_dim_mode", "crit_dim_manual_mm",
+    "auto_refine", "refine_mode", "crit_dim_mode", "crit_dim_manual_mm",
     "net_grid_redesign", "net_grid_target_cells",
     "wake_box_mode", "wake_box_level",
+    "domain_mode", "domain_up", "domain_down", "domain_side",
     # 전체구조 치수
     "cage_d", "cage_h",
     # Solver(비정상 포함)
@@ -488,8 +496,9 @@ PROJECT_KEYS = [
     # 기준면적 Aref(자동/직접 입력)
     "aref_mode", "aref_manual_m2",
     # 격자 자동 보정 / Solver 선택 및 비정상 해석 설정
-    "auto_refine", "crit_dim_mode", "crit_dim_manual_mm",
+    "auto_refine", "refine_mode", "crit_dim_mode", "crit_dim_manual_mm",
     "net_grid_redesign", "net_grid_target_cells", "wake_box_mode", "wake_box_level",
+    "domain_mode", "domain_up", "domain_down", "domain_side",
     # Phase 2: 유체 프리셋·STL 유형·대표 길이
     "fluid_type", "stl_type_user", "re_length_mode", "re_length_manual_mm",
     "solver_mode", "tr_end_time", "tr_delta_t", "tr_max_co", "tr_max_delta_t",
@@ -1920,6 +1929,12 @@ def _start_batch_analysis(mode, speeds, angles, csv_path, n_cores, rho, ti, nx=1
         if ss.get("wake_box_mode") == "직접 지정":
             _bp["wake_box_level"] = int(ss.get("wake_box_level", 2))
             add_log(f"후류 정밀화 박스 레벨 직접 지정: {_bp['wake_box_level']}")
+        if ss.get("domain_mode") == "직접 지정":
+            _bp["domain_up"] = float(ss.get("domain_up", 2.0))
+            _bp["domain_down"] = float(ss.get("domain_down", 5.0))
+            _bp["domain_side"] = float(ss.get("domain_side", 2.0))
+            add_log(f"도메인 직접 지정: 상류 {_bp['domain_up']:g}L · "
+                    f"하류 {_bp['domain_down']:g}L · 측방 ±{_bp['domain_side']:g}L")
         add_log(f"가두리 치수: 직경 {_bp['cage_diameter']:.2f} m × "
                 f"수심 {_bp['cage_depth']:.2f} m")
 
@@ -2743,7 +2758,7 @@ with tab_input:
                                                    if _pre["solver"] == "Transient"
                                                    else "Steady (simpleFoam)"),
                             "refine_level_preset": int(_pre["refine_level"]),
-                            "auto_refine":        bool(_pre["auto_refine"]),
+                            "refine_mode":        ("자동" if _pre["auto_refine"] else "수동"),
                             "aref_mode":          _pre["aref_mode"],
                         }
                         if _pre.get("net_grid_redesign"):
@@ -2756,19 +2771,21 @@ with tab_input:
         # 격자 자동 보정 — 두 모드 공통. 배경격자는 형상 전체 크기 기준으로
         # 정해지므로, 그물처럼 큰 영역에 가는 요소가 흩어진 형상은 기본 레벨에서
         # 실 지름당 1~2 셀밖에 안 걸린다(3by3 실측: 레벨3 1.5셀 → Cd 43% 과대).
-        st.checkbox(
-            "🔧 형상 최소두께 기준으로 정밀화 레벨 자동 보정 (권장)",
-            key="auto_refine",
-            help="STL 의 가장 가는 치수(그물실 지름·판재 두께)를 읽어 셀이 "
-                 "10개 이상 걸리도록 정밀화 레벨을 자동으로 올립니다. "
-                 "STL 종류와 무관하게 동작하며, 굵은 형상(구·카이트)처럼 이미 "
-                 "충분하면 레벨을 올리지 않습니다. 계산시간이 크게 늘 수 있습니다.")
-        if ss.get("auto_refine"):
-            st.caption("적용 예 — 그물 3by3(실 3mm): 레벨 3 → **6** 자동 상향 · "
-                       "카이트(두께 78mm)·구(300mm): 레벨 3 유지")
+        # 표면 정밀화 레벨: 자동(형상 최소두께 기준 자동 상향) / 수동(입력값 고정)
+        st.radio("표면 정밀화 레벨 결정", ["자동", "수동"], key="refine_mode",
+                 horizontal=True,
+                 help="자동: STL 의 가장 가는 치수(그물실 지름·판재 두께)에 셀이 "
+                      "10개 이상 걸리도록 레벨을 자동으로 올립니다. "
+                      "수동: 아래 '격자 정밀화 레벨' 입력값을 그대로 씁니다.")
+        ss["auto_refine"] = (ss.get("refine_mode", "자동") == "자동")
+        if ss["auto_refine"]:
+            st.caption("자동 — 적용 예: 그물 3by3(실 3mm) 레벨 3 → **6** 상향 · "
+                       "카이트(두께 78mm)·구(300mm)는 레벨 3 유지. 계산시간이 크게 "
+                       "늘 수 있습니다.")
         else:
-            st.caption("⚠️ 꺼져 있습니다. 가는 그물실은 격자가 부족해 Cd 가 "
-                       "과대평가될 수 있습니다(로그에 경고가 남습니다).")
+            st.caption("⚠️ 수동 — 입력한 레벨이 그대로 쓰입니다. 가는 그물실은 격자가 "
+                       "부족해 Cd 가 과대평가될 수 있습니다(로그에 경고가 남습니다).")
+        _prev_hint("refine_mode")
 
         # ─── 전체구조 격자 설계 (배경격자 재설계 · 후류 박스 레벨) ──────────
         # 조건부로 그려지는 위젯은 key 를 그대로 저장소로 쓰면 패널이 닫힐 때
@@ -2796,6 +2813,103 @@ with tab_input:
                                "목표 150: 647만 셀 · 정상해 280분")
                 else:
                     st.caption("꺼져 있으면 종전 배경격자(형상 L/8)를 씁니다.")
+
+                # ── 도메인 크기 ────────────────────────────────────────
+                st.markdown("**계산 도메인 크기**")
+                st.radio("도메인 크기 결정", ["자동", "직접 지정"],
+                         key="domain_mode", horizontal=True,
+                         help="형상 대표길이 L(바운딩박스 최대변)의 배수로 정합니다. "
+                              "도메인을 줄이면 배경 셀이 줄어 계산이 빨라지지만, "
+                              "막힘(blockage)이 커지면 Cd 가 과대평가됩니다.")
+                _dcd = critical_dimension(Path(_stl_for_type)) if (
+                    _stl_for_type and Path(_stl_for_type).exists()) else {}
+                _Lm = (max(_dcd.get("spans") or [0.0]) / 1000.0) or 0.0
+                if ss.get("domain_mode") == "직접 지정":
+                    _d1, _d2, _d3 = st.columns(3)
+                    with _d1:
+                        ss["domain_up"] = st.number_input(
+                            "상류 [×L]", value=float(ss.get("domain_up", 2.0)),
+                            min_value=0.3, max_value=10.0, step=0.5, key="_w_dom_up")
+                    with _d2:
+                        ss["domain_down"] = st.number_input(
+                            "하류 [×L]", value=float(ss.get("domain_down", 5.0)),
+                            min_value=0.5, max_value=20.0, step=0.5, key="_w_dom_dn")
+                    with _d3:
+                        ss["domain_side"] = st.number_input(
+                            "측방 ±[×L]", value=float(ss.get("domain_side", 2.0)),
+                            min_value=0.3, max_value=10.0, step=0.5, key="_w_dom_sd")
+                else:
+                    st.caption("자동 — 배경격자 재설계 켬: 상류 2L·하류 5L·측방 ±2L / "
+                               "끔: 상류 3L·하류 7L·측방 ±3L")
+                # 선택값 기준 도메인·막힘률·배경셀 안내
+                _u = float(ss.get("domain_up", 2.0)); _dn = float(ss.get("domain_down", 5.0))
+                _sd = float(ss.get("domain_side", 2.0))
+                if ss.get("domain_mode") != "직접 지정":
+                    _u, _dn, _sd = ((2.0, 5.0, 2.0) if ss.get("net_grid_redesign")
+                                    else (3.0, 7.0, 3.0))
+                if _Lm > 0:
+                    _fa = float(ss.get("auto_frontal_area") or 0.0)
+                    _blk = domain_blockage(_fa, _sd, _Lm) if _fa > 0 else None
+                    st.write(f"- 도메인: **{(_u+_dn)*_Lm:.3f} × {2*_sd*_Lm:.3f} × "
+                             f"{2*_sd*_Lm:.3f} m** (L = {_Lm*1000:.1f} mm)")
+                    if _blk is not None:
+                        _msg = (f"- 막힘률(정면적/도메인 단면적) = **{_blk*100:.1f}%**")
+                        if _blk < 0.05:
+                            st.write(_msg + " ✅ 보정 없이 사용 가능")
+                        elif _blk < 0.10:
+                            st.warning(_msg + " — 주의 구간입니다. Cd 가 다소 "
+                                       "과대평가될 수 있습니다.")
+                        else:
+                            st.error(_msg + " — 벽면이 유동을 형상 쪽으로 밀어 Cd 가 "
+                                     "뚜렷이 과대평가됩니다. 측방을 늘리십시오.")
+                    # 자동값 대비 실제 효과를 숫자로 보여준다(오해 방지).
+                    try:
+                        _auto_u, _auto_d, _auto_s = ((2.0, 5.0, 2.0)
+                                                     if ss.get("net_grid_redesign")
+                                                     else (3.0, 7.0, 3.0))
+                        _crit_mm = float(_dcd.get("bbox_min") or 0.0)
+                        _lv_now = int(ss.get("refine_level_preset", 3))
+
+                        def _bg_of(uu, dd, sscale):
+                            _dm = ((uu + dd) * _Lm, 2 * sscale * _Lm, 2 * sscale * _Lm)
+                            if ss.get("net_grid_redesign") and _crit_mm > 0:
+                                _bs = net_grid_base_cell(
+                                    _crit_mm, _lv_now,
+                                    float(ss.get("net_grid_target_cells", 75.0)),
+                                    domain_m=_dm)
+                            else:
+                                _bs = _Lm / 8.0
+                            return ((_dm[0] / _bs) * (_dm[1] / _bs) * (_dm[2] / _bs), _bs)
+
+                        _bg_a, _bs_a = _bg_of(_auto_u, _auto_d, _auto_s)
+                        _bg_n, _bs_n = _bg_of(_u, _dn, _sd)
+                        if _bg_a > 0:
+                            _chg = (_bg_n - _bg_a) / _bg_a * 100.0
+                            st.write(f"- 자동값 대비 배경 셀: {_bg_a:,.0f} → "
+                                     f"**{_bg_n:,.0f}** ({_chg:+.0f}%) · "
+                                     f"배경 셀 크기 {_bs_a*1000:.1f} → {_bs_n*1000:.1f} mm")
+                            if ss.get("net_grid_redesign") and abs(_chg) < 10:
+                                st.info(
+                                    "배경격자 재설계가 켜져 있으면 배경 셀 크기가 "
+                                    "'임계 치수 기준 + 셀 수 상한'으로 정해집니다. "
+                                    "그래서 도메인을 줄여도 **셀 수(=계산시간)는 거의 "
+                                    "그대로이고 대신 배경 해상도가 좋아집니다.** "
+                                    "계산시간을 줄이려면 목표 셀 수나 정밀화 레벨을 "
+                                    "낮추십시오.")
+                    except Exception:
+                        pass
+                    why("계산시간은 대체로 셀 수에 비례하고, 셀 수는 '배경격자(도메인 "
+                        "부피에 비례) + 표면 정밀화(도메인과 무관)'로 나뉩니다. "
+                        "실측에서 배경 비중은 재설계 목표 75 기준 21%(41.9만/195.9만), "
+                        "종전 도메인 기준 14% 였습니다. 따라서 도메인을 절반으로 줄이면 "
+                        "배경은 1/8 이 되지만 전체 셀은 15~20% 감소에 그칩니다. "
+                        "막힘률은 형상의 정면적에 따라 달라집니다 — 실측 예(그물 "
+                        "onemesh3, 정면적 3.21 cm²): 측방 ±3L 0.6% · ±2L 1.3% · "
+                        "±1L 5.0%. 정면적이 큰 판재는 같은 도메인에서도 막힘률이 "
+                        "훨씬 커지므로 위에 표시되는 실제 값을 보고 정하십시오.",
+                        "왜? (도메인과 계산시간)")
+                _prev_hint("domain_up")
+                st.divider()
 
                 st.radio("후류 정밀화 박스 레벨", ["자동", "직접 지정"],
                          key="wake_box_mode", horizontal=True,
@@ -3304,15 +3418,23 @@ with tab_input:
                     _bg = (_a / _base_m) ** 2 * (2 * _a / _base_m)
                 else:
                     _L = max(_spans_m) or 1.0
+                    # 도메인 배수: 사용자가 정했으면 그 값(계산시간 추정에 직결)
+                    if ss.get("domain_mode") == "직접 지정":
+                        _mu = float(ss.get("domain_up", 2.0))
+                        _md = float(ss.get("domain_down", 5.0))
+                        _msd = float(ss.get("domain_side", 2.0))
+                    elif ss.get("net_grid_redesign"):
+                        _mu, _md, _msd = 2.0, 5.0, 2.0
+                    else:
+                        _mu, _md, _msd = 3.0, 7.0, 3.0
+                    _dom = ((_mu + _md) * _L, 2 * _msd * _L, 2 * _msd * _L)
                     if ss.get("net_grid_redesign"):
                         _base_m = net_grid_base_cell(
                             (_cdm.get("bbox_min") or 1.0), _rl_est,
                             float(ss.get("net_grid_target_cells", 75.0)),
-                            domain_m=(7.0 * _L, 4.0 * _L, 4.0 * _L))
-                        _dom = (7.0 * _L, 4.0 * _L, 4.0 * _L)
+                            domain_m=_dom)
                     else:
                         _base_m = _L / 8.0
-                        _dom = (10.0 * _L, 6.0 * _L, 6.0 * _L)
                     _bg = (_dom[0] / _base_m) * (_dom[1] / _base_m) * (_dom[2] / _base_m)
                 _est = estimate_mesh_size(_bg, _area_m2, _base_m / (2 ** _rl_est))
                 if _est.get("ok"):
