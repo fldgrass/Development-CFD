@@ -357,6 +357,28 @@ def compute_projected_area(stl_path: Path, flow_dir: Tuple[float, float, float])
 TWINE_CELLS_TARGET = 10.0
 
 
+def net_grid_base_cell(crit_mm: float, level: int, target: float,
+                       domain_m: Optional[Tuple[float, float, float]] = None,
+                       max_base_cells: int = 3_000_000) -> float:
+    """배경격자 재설계의 배경 셀 크기[m].
+
+    빌더와 UI 판정이 같은 식을 쓰도록 분리한 것이며, 계산 내용은 종전 빌더
+    코드와 동일하다. domain_m 을 주면 배경 셀 총수 상한까지 반영한다.
+    """
+    cell = (float(crit_mm) / 1000.0) * (2 ** int(level)) / float(target)
+    cap_cell = float(crit_mm) / 1000.0
+    capped = cell > cap_cell
+    if capped:
+        cell = cap_cell
+    if domain_m:
+        for _ in range(12):
+            n = (domain_m[0] / cell) * (domain_m[1] / cell) * (domain_m[2] / cell)
+            if n <= max_base_cells:
+                break
+            cell *= 1.26
+    return cell
+
+
 def twine_resolution(base_mm: float, wire_d_mm: float,
                      refine_level: int,
                      target: float = TWINE_CELLS_TARGET) -> Dict[str, Any]:
@@ -918,6 +940,31 @@ def compute_transient_stats(case_dir: Path,
     if m is not None and s is not None and abs(m) > 1e-12:
         res["unsteadiness_Cd"] = s / abs(m)
         res["is_unsteady"] = bool(res["unsteadiness_Cd"] >= 0.01)
+
+    # 항력 변동만으로 판정하면 그물 형상에서 오판한다. 그물은 다수의 가는 실에
+    # 힘이 분산돼 각 실의 방출 위상이 상쇄되므로 합력 항력의 변동이 원래 작다.
+    # 실측(재설계 목표 75 + DDES): St=0.192 로 와류 방출을 명확히 잡았는데도
+    # 변동/평균은 0.41~0.80% 라 종전 기준(≥1%)으로는 '미포착'이 됐다.
+    # → 양력의 규칙적 진동(평균선 교차 횟수 + 진폭)을 함께 본다. 이 블록은
+    #   is_unsteady 를 True 로 올리기만 하므로 기존 판정이 뒤집히지 않는다.
+    _t = [t for t in hist["time"] if t >= t_avg_start]
+    _cl = [v for t, v in zip(hist["time"], hist["Cl"]) if t >= t_avg_start]
+    if len(_cl) > 10 and len(_t) == len(_cl):
+        _mcl = sum(_cl) / len(_cl)
+        _cross = sum(1 for i in range(1, len(_cl))
+                     if (_cl[i - 1] - _mcl) * (_cl[i] - _mcl) < 0)
+        _amp = (max(_cl) - min(_cl)) / 2.0
+        res["n_cross_Cl"] = _cross
+        res["amp_Cl"] = _amp
+        if _cross >= 4 and _t[-1] > _t[0]:
+            # 평균선을 한 주기에 두 번 지나므로 주기 = 2 x 구간 / 교차 횟수
+            res["period_Cl"] = 2.0 * (_t[-1] - _t[0]) / _cross
+            res["freq_Cl"] = 1.0 / res["period_Cl"]
+        if m is not None and abs(m) > 1e-12:
+            res["unsteadiness_Cl"] = _amp / abs(m)
+            if _cross >= 4 and res["unsteadiness_Cl"] >= 0.01:
+                res["is_unsteady"] = True
+                res["unsteady_by"] = "Cl 진동"
     return res
 
 
@@ -1214,7 +1261,8 @@ class FullStructureCaseBuilder:
                  auto_refine: bool = False,
                  net_grid_redesign: bool = False,
                  net_grid_target_cells: float = 75.0,
-                 net_grid_max_base_cells: int = 3_000_000):
+                 net_grid_max_base_cells: int = 3_000_000,
+                 wake_box_level: Optional[int] = None):
         # 격자 옵션(보완④: DDES 등에서 격자 민감도를 확인하기 위한 노브).
         # 기본값 refine_level=3 / n_layers=0 은 종전 하드코딩 값과 완전히 동일한
         # snappyHexMeshDict 를 만든다(회귀 방지).
@@ -1226,6 +1274,12 @@ class FullStructureCaseBuilder:
         self.net_grid_redesign = bool(net_grid_redesign)
         self.net_grid_target_cells = float(net_grid_target_cells)
         self.net_grid_max_base_cells = int(net_grid_max_base_cells)
+        # 후류(정밀화 박스) 레벨 직접 지정. None 이면 종전 자동 규칙 그대로.
+        # DES/LES 는 후류가 임계치수당 5셀 이상이어야 LES 모드로 전환되는데,
+        # 자동 규칙은 셀 폭발을 막으려 레벨 2 로 묶어둔다. mesh_adequacy() 가
+        # 권고 레벨을 내놓아도 종전에는 그것을 적용할 수단이 없었다.
+        self.wake_box_level   = (None if wake_box_level is None
+                                 else max(0, min(8, int(wake_box_level))))
         self.case_dir         = case_dir
         # 사용자가 UI 에서 직접 지정한 기준면적[m²]. None/0 이하면 자동 계산 사용.
         self.aref_override    = (float(aref_override)
@@ -1459,6 +1513,8 @@ class FullStructureCaseBuilder:
                 _crit_mm = self._thin_dimension_mm() or (L * 1000 / 8)
                 _target = float(getattr(self, "net_grid_target_cells", 75.0))
                 _lvl = int(self.refine_level)
+                # 산식은 net_grid_base_cell() 로 분리했다(UI 격자 적정성 판정이
+                # 같은 값을 쓰기 위해서다). 아래 로그는 종전 그대로 남긴다.
                 _cell = (_crit_mm / 1000.0) * (2 ** _lvl) / _target
                 # [필수 제약] 배경 셀이 임계 치수보다 크면 snappyHexMesh 가 표면을
                 # 애초에 찾지 못해 정밀화가 시작조차 안 된다(실측: 배경 9.6mm /
@@ -1473,11 +1529,10 @@ class FullStructureCaseBuilder:
                         f"(그렇지 않으면 표면 정밀화가 시작되지 않음)")
                     _cell = _cap_cell
                 _cap = int(getattr(self, "net_grid_max_base_cells", 3_000_000))
-                for _ in range(12):
-                    _n = ((x_max-x_min)/_cell) * ((y_max-y_min)/_cell) * ((z_max-z_min)/_cell)
-                    if _n <= _cap:
-                        break
-                    _cell *= 1.26          # 셀 수 2배씩 줄이며 완화
+                _cell = net_grid_base_cell(
+                    _crit_mm, _lvl, _target,
+                    domain_m=(x_max-x_min, y_max-y_min, z_max-z_min),
+                    max_base_cells=_cap)
                 _got = _crit_mm / (_cell * 1000 / (2 ** _lvl))
                 logger.info(
                     f"[FullStructure] 배경격자 재설계: 임계치수 {_crit_mm:.2f}mm, "
@@ -1545,6 +1600,9 @@ class FullStructureCaseBuilder:
         # 따라가면 셀이 폭발한다. 그물처럼 가는 형상은 표면만 깊게 파고 박스는
         # 얕게 둬야 한다(레벨 3 까지는 종전대로 _lmin 을 써서 회귀 없음).
         _lbox = _lmin if _lmax <= 3 else min(_lmin, 2)
+        # 사용자가 후류 레벨을 직접 지정하면 그 값을 쓴다(DES/LES 후류 요건).
+        if self.wake_box_level is not None:
+            _lbox = min(_lmax, self.wake_box_level)
         _add  = "true" if self.n_layers > 0 else "false"
         # n_layers=0 이면 종전 출력('layers {}')과 바이트까지 동일해야 하므로
         # 공백을 넣지 않는다.
@@ -1923,11 +1981,15 @@ class OpenFOAMRunner:
             float(applied.get("delta_t", 1e-3)), float(applied.get("max_co", 0.8)),
             float(duration))
         if _pr["ok"]:
-            _h = _pr["steps"] * 0.4 / 3600.0   # 스텝당 0.4초 가정(대략치)
+            # 스텝당 소요시간은 프로브가 실측한다. 실측에 실패한 경우에만 0.4초를
+            # 가정하고, 가정임을 로그에 명시한다(종전에는 항상 가정값이었다).
+            _spc = _pr.get("sec_per_step")
+            _h = _pr["steps"] * (_spc if _spc else 0.4) / 3600.0
+            _how = (f"실측 {_spc:.2f}초/스텝" if _spc else "스텝당 0.4초 가정")
             self._emit_log(
                 f"🔎 사전 진단: Co_max={_pr['co_max']:.3g} → 실제 deltaT "
                 f"{_pr['delta_t']:.3g}s → 필요 스텝 {_pr['steps']:,.0f}개 "
-                f"(대략 {_h:.1f}시간)")
+                f"(대략 {_h:.1f}시간, {_how})")
             if _pr["steps"] > _max_steps:
                 self._emit_log(
                     f"❌ 실행 중단 — 필요 스텝 {_pr['steps']:,.0f}개가 한계 "
@@ -2004,6 +2066,28 @@ class OpenFOAMRunner:
             out["delta_t"] = dt
             out["steps"] = duration / dt if dt > 0 else float("inf")
             out["ok"] = True
+
+            # ── 스텝당 실측 소요시간 ──────────────────────────────────────
+            # 종전에는 호출부가 0.4초/스텝 을 가정해 소요시간을 알렸는데, 실제와
+            # 최대 8배까지 어긋났다(196만 셀 실측 3.5초/스텝 → '2.2시간' 안내가
+            # 실제로는 17시간). 몇 스텝만 실제로 돌려 ExecutionTime 증가분의
+            # 중앙값으로 잰다(시작 오버헤드는 증가분을 쓰므로 제외된다).
+            # 실패해도 진단 자체는 유효하므로 조용히 넘어간다(호출부가 fallback).
+            try:
+                probe2 = re.sub(r"^endTimeValue\s+[0-9.eE+-]+;",
+                                f"endTimeValue        {dt * 4:.12g};",
+                                backup, count=1, flags=re.M)
+                ctrl.write_text(probe2)
+                res2 = subprocess.run(full, shell=True, capture_output=True,
+                                      text=True, timeout=600)
+                txt2 = (res2.stdout or "") + (res2.stderr or "")
+                ex = [float(x) for x in
+                      re.findall(r"^ExecutionTime = ([0-9.eE+-]+) s", txt2, re.M)]
+                if len(ex) >= 3:
+                    dd = sorted(ex[i] - ex[i - 1] for i in range(1, len(ex)))
+                    out["sec_per_step"] = dd[len(dd) // 2]
+            except Exception:
+                pass
             return out
         except subprocess.TimeoutExpired:
             out["reason"] = "프로브 실행 시간 초과"
@@ -2605,7 +2689,7 @@ class BatchAnalysisManager:
                                     "end_time", "residual_control", "write_interval",
                                     "aref_override", "refine_level", "n_layers",
                                     "auto_refine", "net_grid_redesign",
-                                    "net_grid_target_cells"]}
+                                    "net_grid_target_cells", "wake_box_level"]}
                     )
 
                 builder.build()

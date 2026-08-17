@@ -47,6 +47,7 @@ from cfd_manager import (
     twine_resolution, unit_cell_base_mm, TWINE_CELLS_TARGET,
     validate_unit_cell_stl, critical_dimension, mesh_adequacy,
     mesh_adequacy_table, SURF_CELLS_TARGET, WAKE_CELLS_TARGET,
+    net_grid_base_cell,
 )
 from visualizer import CFDVisualizer, AutoRefreshVisualizer, OpenFOAMResultReader
 
@@ -169,6 +170,12 @@ def init_session():
         # ── Solver 선택 (기본값은 반드시 Steady = 기존 동작 100% 유지) ──
         # 형상의 가장 가는 치수 기준으로 정밀화 레벨을 자동 상향(STL 종류 무관)
         "auto_refine":        True,
+        # ── 전체구조 격자 설계(그물처럼 가는 요소가 흩어진 형상용) ──
+        # 기본값은 종전 동작과 완전히 동일하다(재설계 꺼짐 · 후류 자동).
+        "net_grid_redesign":  False,
+        "net_grid_target_cells": 75.0,
+        "wake_box_mode":      "자동",
+        "wake_box_level":     2,
         # 임계 최소 치수(격자가 반드시 해상해야 할 치수) — 자동/수동
         "crit_dim_mode":      "자동",
         "crit_dim_manual_mm": 0.0,
@@ -394,6 +401,7 @@ PROJECT_KEYS = [
     "aref_mode", "aref_manual_m2",
     # 격자 자동 보정 / Solver 선택 및 비정상 해석 설정
     "auto_refine", "crit_dim_mode", "crit_dim_manual_mm",
+    "net_grid_redesign", "net_grid_target_cells", "wake_box_mode", "wake_box_level",
     "solver_mode", "tr_end_time", "tr_delta_t", "tr_max_co", "tr_max_delta_t",
     "tr_write_interval", "tr_n_outer", "tr_n_corr", "tr_n_non_orth",
     "tr_turbulence", "tr_init_steady", "tr_steady_iters", "tr_perturb",
@@ -1677,6 +1685,15 @@ def _start_batch_analysis(mode, speeds, angles, csv_path, n_cores, rho, ti, nx=1
         _bp["auto_refine"]   = bool(ss.get("auto_refine", True))
         if _bp["auto_refine"]:
             add_log("격자 자동 보정: 형상 최소두께 기준으로 정밀화 레벨을 상향합니다")
+        # 그물 격자 설계 — 기본값(재설계 꺼짐 · 후류 자동)이면 종전 경로와 동일
+        _bp["net_grid_redesign"] = bool(ss.get("net_grid_redesign", False))
+        if _bp["net_grid_redesign"]:
+            _bp["net_grid_target_cells"] = float(ss.get("net_grid_target_cells", 75.0))
+            add_log(f"배경격자 재설계: 목표 {_bp['net_grid_target_cells']:.0f} "
+                    "셀/임계치수 · 도메인 상류 2L·하류 5L·횡 ±2L")
+        if ss.get("wake_box_mode") == "직접 지정":
+            _bp["wake_box_level"] = int(ss.get("wake_box_level", 2))
+            add_log(f"후류 정밀화 박스 레벨 직접 지정: {_bp['wake_box_level']}")
         add_log(f"가두리 치수: 직경 {_bp['cage_diameter']:.2f} m × "
                 f"수심 {_bp['cage_depth']:.2f} m")
 
@@ -2265,6 +2282,49 @@ with tab_input:
             st.caption("⚠️ 꺼져 있습니다. 가는 그물실은 격자가 부족해 Cd 가 "
                        "과대평가될 수 있습니다(로그에 경고가 남습니다).")
 
+        # ─── 전체구조 격자 설계 (배경격자 재설계 · 후류 박스 레벨) ──────────
+        # 조건부로 그려지는 위젯은 key 를 그대로 저장소로 쓰면 패널이 닫힐 때
+        # 값이 사라지므로, 위젯 key(_w_*)와 저장 key 를 분리한다(v18 과 동일).
+        if mode == "full_structure":
+            with st.expander("🕸️ 그물 격자 설계 (전체구조)", expanded=False):
+                ss["net_grid_redesign"] = st.checkbox(
+                    "배경격자 재설계 — 임계 치수 기준으로 배경 셀을 정한다",
+                    value=bool(ss.get("net_grid_redesign")),
+                    key="_w_net_grid_redesign",
+                    help="종전 배경격자는 '형상 전체 크기 L/8' 기준이라 그물처럼 "
+                         "가는 요소가 흩어진 형상은 실 지름당 1~2 셀에 그칩니다. "
+                         "재설계는 base = 임계치수 × 2^레벨 / 목표 로 잡아 지정한 "
+                         "레벨에서 곧바로 목표 해상도가 나오게 합니다. 도메인도 "
+                         "상류 2L·하류 5L·횡 ±2L 로 축소됩니다(부피 1/2.7).")
+                if ss["net_grid_redesign"]:
+                    ss["net_grid_target_cells"] = st.number_input(
+                        "목표 셀 수 / 임계치수(그물실 지름)",
+                        value=float(ss.get("net_grid_target_cells", 75.0)),
+                        min_value=10.0, max_value=300.0, step=5.0,
+                        key="_w_net_grid_target",
+                        help="실측: 40셀 Cd=0.776 / 75셀 0.936 (같은 격자 DDES 0.993). "
+                             "값이 클수록 셀 수와 계산시간이 급격히 늘어납니다.")
+                    st.caption("실측 — 목표 75: 196만 셀 · 정상해 74분 / "
+                               "목표 150: 647만 셀 · 정상해 280분")
+                else:
+                    st.caption("꺼져 있으면 종전 배경격자(형상 L/8)를 씁니다.")
+
+                st.radio("후류 정밀화 박스 레벨", ["자동", "직접 지정"],
+                         key="wake_box_mode", horizontal=True,
+                         help="자동은 셀 폭발을 막기 위해 표면 레벨이 4 이상이면 "
+                              "박스를 레벨 2 로 묶습니다. DES/LES 는 후류가 임계 "
+                              "치수당 5셀 이상이어야 LES 모드로 전환되므로, 위 "
+                              "'격자 적정성 판정'에서 후류 부족이 뜨면 여기서 "
+                              "권고 레벨로 올리십시오.")
+                if ss.get("wake_box_mode") == "직접 지정":
+                    ss["wake_box_level"] = int(st.number_input(
+                        "후류 박스 레벨", value=int(ss.get("wake_box_level", 2)),
+                        min_value=0, max_value=8, step=1, key="_w_wake_box_level",
+                        help="박스는 체적을 통째로 세분하므로 레벨을 1 올릴 때마다 "
+                             "박스 안 셀이 8배가 됩니다. 표면 레벨을 넘지 않습니다."))
+                    st.caption("⚠️ 레벨 1 상승 = 박스 내 셀 8배. 표면 레벨보다 크게 "
+                               "잡아도 표면 레벨로 잘립니다.")
+
         # ─── 임계 최소 치수 · 격자 적정성 ────────────────────────────────
         # 격자가 반드시 해상해야 하는 건 형상 전체 크기가 아니라 '가장 가는 부분'
         # (그물실 지름·판재 두께)이다. 이 값으로 표면과 후류를 따로 판정한다.
@@ -2303,6 +2363,14 @@ with tab_input:
                 else:
                     _spans = _cd.get("spans") or [1.0]
                     _base = max(_spans) / 8.0
+                    if ss.get("net_grid_redesign"):
+                        # 재설계를 켜면 배경격자 산식이 바뀐다. 빌더와 같은 함수를
+                        # 써서 판정이 실제 생성 격자와 어긋나지 않게 한다.
+                        _L = max(_spans) / 1000.0          # mm → m (도메인 단위 통일)
+                        _base = net_grid_base_cell(
+                            _crit, int(ss.get("refine_level_preset", 3)),
+                            float(ss.get("net_grid_target_cells", 75.0)),
+                            domain_m=(7.0 * _L, 4.0 * _L, 4.0 * _L)) * 1000.0
                 _fam = ("LES" if TRANSIENT_TURBULENCE_MODELS.get(
                             ss.get("tr_turbulence", "kOmegaSST")) == "LES"
                         and str(ss.get("solver_mode", "")).startswith("Transient")
@@ -2310,6 +2378,9 @@ with tab_input:
                 # refine_level 위젯도 이 블록보다 뒤에 생성되므로 세션 값 사용
                 _rl = int(ss.get("refine_level_preset", 3))
                 _box_lv = _rl - 1 if _rl <= 3 else 2
+                if (mode == "full_structure"
+                        and ss.get("wake_box_mode") == "직접 지정"):
+                    _box_lv = min(_rl, int(ss.get("wake_box_level", 2)))
                 _ad = mesh_adequacy(_crit, _base, _rl, _box_lv, _fam)
 
                 with _c2:
@@ -3165,11 +3236,31 @@ with tab_results:
 
                     # ── 보완②: 비정상성 포착 판정 ──
                     _uns = _stats.get("unsteadiness_Cd")
+                    # 양력 진동 정보(그물처럼 항력 변동이 상쇄되는 형상의 판정 근거)
+                    _fcl = _stats.get("freq_Cl")
+                    _ucl = _stats.get("unsteadiness_Cl")
+                    if _fcl:
+                        st.caption(
+                            f"양력 진동: 주파수 **{_fcl:.1f} Hz** "
+                            f"(주기 {_stats.get('period_Cl', 0):.4g} s) · "
+                            f"평균선 교차 {_stats.get('n_cross_Cl', 0)}회 · "
+                            f"진폭/Cd평균 {(_ucl or 0)*100:.2f}%")
                     if _uns is not None:
                         if _stats.get("is_unsteady"):
-                            st.success(
-                                f"✅ 비정상성 포착됨 — Cd 변동/평균 = **{_uns*100:.2f}%** (≥1%). "
-                                "시간평균값을 정상해와 비교할 수 있습니다.")
+                            _by = _stats.get("unsteady_by")
+                            if _by == "Cl 진동":
+                                st.success(
+                                    f"✅ 비정상성 포착됨 — **양력 진동**으로 판정 "
+                                    f"(주파수 {_fcl:.1f} Hz, 진폭/Cd평균 "
+                                    f"{(_ucl or 0)*100:.2f}%). Cd 변동/평균은 "
+                                    f"{_uns*100:.2f}% 로 작지만, 그물처럼 다수의 가는 "
+                                    "요소로 된 형상은 각 요소의 방출 위상이 상쇄돼 "
+                                    "합력 항력의 변동이 원래 작습니다. 이 경우 항력 "
+                                    "변동이 아니라 양력 주파수로 판정하는 것이 맞습니다.")
+                            else:
+                                st.success(
+                                    f"✅ 비정상성 포착됨 — Cd 변동/평균 = **{_uns*100:.2f}%** (≥1%). "
+                                    "시간평균값을 정상해와 비교할 수 있습니다.")
                         else:
                             st.error(
                                 f"⚠️ **비정상성 미포착** — Cd 변동/평균 = {_uns*100:.2f}% (<1%).\n\n"
