@@ -2785,6 +2785,22 @@ with tab_input:
         else:
             st.caption("⚠️ 수동 — 입력한 레벨이 그대로 쓰입니다. 가는 그물실은 격자가 "
                        "부족해 Cd 가 과대평가될 수 있습니다(로그에 경고가 남습니다).")
+        # 정밀화 레벨 입력 — 두 모드 공통으로 라디오 바로 아래에 둔다.
+        # (종전에는 단위셀 모드에만 있어 전체구조에서 '수동'을 골라도 입력할 곳이
+        #  없었다.) 자동일 때는 비활성으로 두되 값은 보이게 한다.
+        refine_level = st.number_input(
+            "격자 정밀화 레벨",
+            min_value=1, max_value=8, step=1,
+            key="refine_level_preset",
+            disabled=bool(ss.get("auto_refine")),
+            help="snappyHexMesh 표면 최대 정밀화 레벨 (min = 레벨-1). "
+                 "레벨 3: ~50만 셀(권장), 레벨 4: ~200만 셀(정밀). "
+                 "레벨 1 상승마다 표면 근처 셀이 약 8배가 됩니다.")
+        if ss.get("auto_refine"):
+            st.caption("자동 모드라 이 값은 시작점으로만 쓰이고, 형상 최소두께에 "
+                       "따라 프로그램이 더 높은 레벨로 올릴 수 있습니다. 직접 정하려면 "
+                       "위에서 **수동**을 선택하십시오.")
+        _prev_hint("refine_level_preset")
         _prev_hint("refine_mode")
 
         # ─── 전체구조 격자 설계 (배경격자 재설계 · 후류 박스 레벨) ──────────
@@ -3089,15 +3105,12 @@ with tab_input:
                     help="Sn = 그물실 투영 면적 / 패널 전체 면적. STL 업로드 시 자동 추정 (≈ 2d/a).",
                 )
             with _pc2:
-                refine_level = st.number_input(
-                    "격자 정밀화 레벨",
-                    min_value=1, max_value=8, step=1,
-                    key="refine_level_preset",
-                    help="snappyHexMesh 표면 최대 정밀화 레벨 (min = 레벨-1). "
-                         "레벨 3: ~50만 셀(권장), 레벨 4: ~200만 셀(정밀). "
-                         "그물실이 가늘면 레벨을 더 올려야 합니다(아래 경고 참조).",
-                )
-                _prev_hint("refine_level_preset")
+                # 정밀화 레벨 입력은 '표면 정밀화 레벨 결정' 라디오 바로 아래로
+                # 옮겼다(두 모드 공통). 여기서는 현재 값만 참조한다.
+                refine_level = int(ss.get("refine_level_preset", 3))
+                st.caption(f"격자 정밀화 레벨: **{refine_level}** "
+                           f"({'자동' if ss.get('auto_refine') else '수동'}) — "
+                           "위 '해석 파라미터'에서 변경")
                 # ── 그물실 해상도 경고 ──────────────────────────────────
                 # 배경격자가 망목 크기에 비례해 정해지므로, 망목이 커지면 실 대비
                 # 격자가 사용자 모르게 거칠어진다. 항상 숫자로 보여주고 부족하면
