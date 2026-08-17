@@ -39,22 +39,38 @@ except Exception:  # pragma: no cover - 구버전 호환
 APP_DIR  = Path(__file__).resolve().parent
 sys.path.insert(0, str(APP_DIR / "modules"))
 
-from cfd_manager import (
-    UnitCellCaseBuilder, FullStructureCaseBuilder,
-    OpenFOAMRunner, ResultExtractor, BatchAnalysisManager,
-    get_cpu_count, RESULTS_DIR, STL_UPLOAD_DIR, LOGS_DIR, BASE_DIR,
-    TRANSIENT_TURBULENCE_MODELS, compute_transient_stats, read_force_history,
-    twine_resolution, unit_cell_base_mm, TWINE_CELLS_TARGET,
-    validate_unit_cell_stl, critical_dimension, mesh_adequacy,
-    mesh_adequacy_table, SURF_CELLS_TARGET, WAKE_CELLS_TARGET,
-    net_grid_base_cell, classify_stl, STL_TYPE_LABELS, STL_TYPE_PRESETS,
-    DISPLAY_CAMERA_EYE, DISPLAY_ASPECTMODE,
-    FLUID_PRESETS, estimate_mesh_size, unit_cell_base_mm as _uc_base_mm,
-    compute_surface_area, unit_cell_base_mm,
-    result_reliability, preflight_checks, steady_force_convergence,
-    run_mesh_independence, mesh_independence_table, REFERENCE_CASES,
-    write_cylinder_stl, reference_comparison, count_mesh_cells,
-)
+# [주의] 실행 중인 앱은 modules/cfd_manager.py 를 이미 임포트한 상태로 남아 있다.
+# 소스를 고치면 Streamlit 이 app.py 는 다시 실행하지만, 이미 적재된 모듈 객체는
+# 그대로여서 '새로 추가한 이름'을 찾지 못해 ImportError 로 앱이 죽는다.
+# 원시 트레이스백 대신 무엇을 해야 하는지 알려준다(요구서 §25 — 무엇이·왜·어떻게).
+try:
+    from cfd_manager import (
+        UnitCellCaseBuilder, FullStructureCaseBuilder,
+        OpenFOAMRunner, ResultExtractor, BatchAnalysisManager,
+        get_cpu_count, RESULTS_DIR, STL_UPLOAD_DIR, LOGS_DIR, BASE_DIR,
+        TRANSIENT_TURBULENCE_MODELS, compute_transient_stats, read_force_history,
+        twine_resolution, unit_cell_base_mm, TWINE_CELLS_TARGET,
+        validate_unit_cell_stl, critical_dimension, mesh_adequacy,
+        mesh_adequacy_table, SURF_CELLS_TARGET, WAKE_CELLS_TARGET,
+        net_grid_base_cell, classify_stl, STL_TYPE_LABELS, STL_TYPE_PRESETS,
+        DISPLAY_CAMERA_EYE, DISPLAY_ASPECTMODE,
+        FLUID_PRESETS, estimate_mesh_size, unit_cell_base_mm as _uc_base_mm,
+        compute_surface_area,
+        result_reliability, preflight_checks, steady_force_convergence,
+        run_mesh_independence, mesh_independence_table, REFERENCE_CASES,
+        write_cylinder_stl, reference_comparison, count_mesh_cells,
+    )
+except ImportError as _imp_err:
+    st.error(
+        f"**모듈이 갱신되어 실행 중인 앱과 맞지 않습니다** — `{_imp_err}`\n\n"
+        "· 이유: 프로그램 소스(modules/cfd_manager.py)가 앱 실행 이후에 바뀌었습니다. "
+        "Streamlit 은 app.py 만 다시 실행하고, 이미 메모리에 올라간 모듈은 "
+        "그대로 두기 때문에 새로 추가된 항목을 찾지 못합니다.\n\n"
+        "· 조치: 터미널에서 앱을 종료(Ctrl+C)한 뒤 다시 실행하십시오.\n\n"
+        "```\nstreamlit run app.py --server.port 8501\n```\n\n"
+        "해석 중이었다면 백그라운드 계산은 계속 진행되며, 재시작 후 결과 탭에서 "
+        "이어서 확인할 수 있습니다.")
+    st.stop()
 from visualizer import CFDVisualizer, AutoRefreshVisualizer, OpenFOAMResultReader
 
 # ═══════════════════════════════════════════════════════════════════════════
