@@ -579,11 +579,21 @@ def _apply_project_load(_mode, _name):
     """프로젝트 project.json 을 세션 상태에 반영(위젯 생성 전 호출돼야 안전)."""
     _p = _project_dir(_mode, _name) / "project.json"
     if not _p.exists():
+        # 왜 안 되는지 화면에서 알 수 있어야 한다(요구서 §25).
+        ss["_project_load_error"] = (
+            f"'{_name}' 을 불러오지 못했습니다 — 설정 파일이 없습니다.\n\n"
+            f"· 찾은 경로: `{_p}`\n\n"
+            f"· 이유: 현재 해석 모드({_mode})의 프로젝트 폴더에서 찾습니다. "
+            f"다른 모드에서 저장한 프로젝트라면 그 모드로 바꾼 뒤 불러오십시오.")
         return False
     try:
         _data = json.loads(_p.read_text())
-    except Exception:
+    except Exception as _e:
+        ss["_project_load_error"] = (
+            f"'{_name}' 의 설정 파일을 읽지 못했습니다 — `{_e}`\n\n"
+            f"· 경로: `{_p}`\n\n· 조치: 파일이 손상됐다면 프로젝트를 다시 저장하십시오.")
         return False
+    ss.pop("_project_load_error", None)
     for k in PROJECT_KEYS:
         if k in _data and _data[k] is not None:
             ss[k] = _data[k]
@@ -1307,6 +1317,9 @@ with st.sidebar:
     # ─── 프로젝트 (항목3·4) ───────────────────────────────────────────────
     st.markdown("### 📁 프로젝트")
     _active_proj = ss.get("active_project")
+    _ple = ss.pop("_project_load_error", None)
+    if _ple:
+        st.error(_ple)
     _plm = ss.pop("_project_loaded_msg", None)
     if _plm:
         _u = _plm.get("u") or (None, None, None)
