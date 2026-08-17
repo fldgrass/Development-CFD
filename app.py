@@ -2691,10 +2691,17 @@ with tab_input:
                         else "RAS")
                 # refine_level 위젯도 이 블록보다 뒤에 생성되므로 세션 값 사용
                 _rl = int(ss.get("refine_level_preset", 3))
-                _box_lv = _rl - 1 if _rl <= 3 else 2
-                if (mode == "full_structure"
-                        and ss.get("wake_box_mode") == "직접 지정"):
-                    _box_lv = min(_rl, int(ss.get("wake_box_level", 2)))
+                # 근접(후류) 정밀화 레벨은 모드마다 규칙이 다르다.
+                #   단위셀   : 거리 2mm 이내 영역 = min(3, 레벨)
+                #   전체구조 : refineBox = 레벨 3 이하면 레벨-1, 아니면 2
+                # 종전에는 두 모드 모두 전체구조 규칙으로 표시해 단위셀 판정이
+                # 실제 격자와 어긋났다.
+                if mode == "unit_cell":
+                    _box_lv = min(3, _rl)
+                else:
+                    _box_lv = _rl - 1 if _rl <= 3 else 2
+                    if ss.get("wake_box_mode") == "직접 지정":
+                        _box_lv = min(_rl, int(ss.get("wake_box_level", 2)))
                 _ad = mesh_adequacy(_crit, _base, _rl, _box_lv, _fam)
 
                 with _c2:

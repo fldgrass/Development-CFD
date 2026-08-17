@@ -1775,13 +1775,28 @@ class UnitCellCaseBuilder:
         })
 
     def _patch_snappyLevel(self):
-        """격자 세분화 레벨 주입"""
+        """격자 세분화 레벨 주입.
+
+        [결함 수정] 종전에는 refinementSurfaces 만 레벨을 따라갔고, 피처 에지
+        (level 2)와 거리 기반 정밀화 영역(2mm 이내 level 3)이 템플릿에 고정돼
+        있었다. 그래서 요청 레벨이 3 이하이면 고정된 영역 레벨 3 이 그 위를
+        덮어써, 레벨을 낮춰도 격자가 거의 그대로였다.
+            실측: 레벨 2 → 161,514 셀 / 레벨 4 → 165,328 셀 (+2.4%)
+        요청 레벨이 템플릿 고정값보다 낮을 때만 함께 낮춘다. 레벨 3 이상에서는
+        종전과 완전히 동일한 dict 가 나오므로 기존 결과(lv5~lv8)는 그대로
+        유효하다.
+        """
         level_min = max(1, self.refine_level - 1)
         level_max = self.refine_level
+        # 피처 에지·거리 영역은 '표면보다 촘촘해지지 않도록' 상한을 건다.
+        feature_level = min(2, level_min)
+        region_level = min(3, level_max)
         snappy = self.case_dir / "system" / "snappyHexMeshDict"
         replace_in_file(snappy, {
             "refineLevelMin  2;": f"refineLevelMin  {level_min};",
             "refineLevelMax  3;": f"refineLevelMax  {level_max};",
+            "level   2;":         f"level   {feature_level};",
+            "levels  ((2e-3 3));": f"levels  ((2e-3 {region_level}));",
         })
         if self.strict_mesh_quality:
             tighten_mesh_quality(snappy)
