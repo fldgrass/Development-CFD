@@ -753,8 +753,16 @@ class CFDVisualizer:
             g1 = np.linspace(_vc[in_ax[0]]-_vh, _vc[in_ax[0]]+_vh, _N)
             g2 = np.linspace(_vc[in_ax[1]]-_vh, _vc[in_ax[1]]+_vh, _N)
             G1, G2 = np.meshgrid(g1, g2, indexing="ij")
+            # 초기 슬라이스 위치: 형상 중심을 지나도록 잡는다(50% 는 유동 방향
+            # 비대칭 도메인에서 물체를 비껴간다).
+            _obj_fr = self._object_center_fraction(mesh, bounds, n_ax)
+            if _obj_fr is not None and abs(float(slice_fraction) - 0.5) < 1e-6:
+                slice_fraction = float(_obj_fr)
             if n_frames > 1:
                 _fracs = self._adaptive_fracs(mesh, slice_normal, bounds, n_frames)
+                # 초기 표시 프레임도 형상 중심에 가장 가까운 것으로
+                _fracs = np.unique(np.concatenate(
+                    [_fracs, np.array([float(slice_fraction)])]))
             else:
                 _fracs = np.array([min(max(float(slice_fraction), 0.0), 1.0)])
             _npts = _N * _N
@@ -847,9 +855,14 @@ class CFDVisualizer:
                     _first_t = False
                 return _traces, _pos, frac*100.0
 
-            # ── 초기 표시용 슬라이스 (프레임 목록의 중앙 위치) ────────────────
-            _init_frac = float(_fracs[len(_fracs)//2]) if n_frames > 1 \
-                else float(_fracs[0])
+            # ── 초기 표시용 슬라이스 ─────────────────────────────────────────
+            # 형상 중심에 가장 가까운 분율을 쓴다. 종전에는 '프레임 목록의 중앙'
+            # 이라 유동 방향 축(표시 Y)에서 물체를 비껴간 위치가 처음 보였다.
+            if n_frames > 1:
+                _tgt_fr = float(slice_fraction)
+                _init_frac = float(min(_fracs, key=lambda f: abs(float(f) - _tgt_fr)))
+            else:
+                _init_frac = float(_fracs[0])
             _init_slice_traces, pos, pct = _make_slice_traces(_init_frac)
             if not _init_slice_traces:
                 return None
@@ -918,7 +931,10 @@ class CFDVisualizer:
                         name=f"{_fpct:.1f}",
                     ))
                 fig.frames = _frames
-                _active_idx = len(_frames) // 2
+                _tgt = float(slice_fraction) * 100.0
+                _active_idx = min(range(len(_frames)),
+                                  key=lambda i: abs(float(_frames[i].name) - _tgt)) \
+                    if _frames else 0
                 _plotly_sliders = [dict(
                     active=_active_idx,
                     pad=dict(b=10, t=10), len=0.9, x=0.05, y=0,
@@ -1483,6 +1499,46 @@ class CFDVisualizer:
         except Exception:
             return []
         return out
+
+    def _object_center_fraction(self, mesh, bounds, ax):
+        """형상(도메인에 닿지 않는 내부 벽 패치) 중심의 슬라이스 분율.
+
+        [결함 수정] 종전에는 슬라이스 초기 위치가 '구간의 50%' 였다. 통일 표시
+        프레임에서 Y 축은 '유동 방향'이고 도메인은 상류 2L·하류 5L 로 비대칭이라,
+        50% 는 형상보다 한참 하류를 지난다. 그 결과 STL 형상만 덩그러니 보이고
+        슬라이스는 물체를 비껴가, 형상과 유동장이 어긋난 것처럼 보였다.
+        형상 중심을 지나도록 초기 위치를 잡는다.
+        """
+        try:
+            boundary = (mesh["boundary"] if mesh is not None
+                        and "boundary" in mesh.keys() else None)
+            if boundary is None:
+                return None
+            lo, hi = bounds[2*ax], bounds[2*ax+1]
+            span = max(hi - lo, 1e-12)
+            ex = [max(bounds[1]-bounds[0], 1e-9), max(bounds[3]-bounds[2], 1e-9),
+                  max(bounds[5]-bounds[4], 1e-9)]
+            diag = math.sqrt(ex[0]**2 + ex[1]**2 + ex[2]**2)
+            tol = 1e-3 * diag
+            c_lo, c_hi = None, None
+            for key in boundary.keys():
+                blk = boundary[key]
+                if blk is None or blk.n_points == 0:
+                    continue
+                b = blk.bounds
+                # 도메인 경계에 닿는 패치(inlet/outlet/top/…)는 제외
+                touches = any(abs(b[2*i] - bounds[2*i]) < tol
+                              or abs(b[2*i+1] - bounds[2*i+1]) < tol
+                              for i in range(3))
+                if touches:
+                    continue
+                c_lo = b[2*ax] if c_lo is None else min(c_lo, b[2*ax])
+                c_hi = b[2*ax+1] if c_hi is None else max(c_hi, b[2*ax+1])
+            if c_lo is None:
+                return None
+            return min(0.98, max(0.02, ((c_lo + c_hi) / 2.0 - lo) / span))
+        except Exception:
+            return None
 
     def _adaptive_fracs(self, mesh, slice_normal, bounds, n_frames):
         """v10 항목2·3: 슬라이스 위치 분율 — 형상 주변 세밀 + 원방 성김.
